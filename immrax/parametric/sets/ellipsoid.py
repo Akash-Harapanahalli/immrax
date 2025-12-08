@@ -48,19 +48,20 @@ class Ellipsoid(hParametope):
 
     def plot_projection(self, ax, xi=0, yi=1, rescale=False, **kwargs):
         P = self.P / self.y[1]
-        n = P.shape[0]
-        if n == 2:
-            _plot_ellipse(P, self.ox, ax, rescale, **kwargs)
-            return
-        ind = [k for k in range(n) if k not in [xi, yi]]
-        Phat = P[ind, :]
-        N = null_space(Phat)
-        M = N[(xi, yi), :]  # Since M is guaranteed 2x2,
-        Minv = (1 / (M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0])) * jnp.array(
-            [[M[1, 1], -M[0, 1]], [-M[1, 0], M[0, 0]]]
-        )
-        Q = Minv.T @ N.T @ P @ N @ Minv
-        _plot_ellipse(Q, self.ox[(xi, yi),], ax, rescale, **kwargs)
+        # n = P.shape[0]
+        # if n == 2:
+        #     _plot_ellipse(P, self.ox, ax, rescale, **kwargs)
+        #     return
+        # ind = [k for k in range(n) if k not in [xi, yi]]
+        # Phat = P[ind, :]
+        # N = null_space(Phat)
+        # M = N[(xi, yi), :]  # Since M is guaranteed 2x2,
+        # Minv = (1 / (M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0])) * jnp.array(
+        #     [[M[1, 1], -M[0, 1]], [-M[1, 0], M[0, 0]]]
+        # )
+        # Q = Minv.T @ N.T @ P @ N @ Minv
+        Q = self.get_projection_mtx(P, xi, yi)
+        _plot_ellipse(Q, self.ox[(xi, yi),], ax, rescale, **kwargs) 
 
     @staticmethod
     def get_projection_mtx(P, xi=0, yi=1):
