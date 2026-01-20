@@ -10,12 +10,13 @@ from .sets import (
 )
 
 from .reachability import (
-    ZonotopeReachTube,
-    ZonotopeReachability,
+    ZonotopeReachSets,
     LohnerReachability,
     AlthoffGirardReachability,
+    AlthoffTaylorReachability,
     lohner_reachtube,
     althoff_girard_reachtube,
+    althoff_taylor_reachtube,
 )
 
 __all__ = [
@@ -27,9 +28,11 @@ __all__ = [
     "zonotope_concatenate",
     # Reachability
     "ZonotopeReachTube",
-    "ZonotopeReachability",
+    "ZonotopeReachSets",
     "LohnerReachability",
     "AlthoffGirardReachability",
+    "AlthoffTaylorReachability",
     "lohner_reachtube",
     "althoff_girard_reachtube",
+    "althoff_taylor_reachtube",
 ]
