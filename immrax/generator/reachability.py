@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 from jax import lax
-from jax.experimental import jet
+from jax.experimental.jet import jet
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, List, Union
@@ -38,7 +38,7 @@ def prolongation(f: Callable, p: int) -> Callable:
     @jax.jit
     def f_prolonged(t, x, *args):
         # Any remaining args at this stage are treated as constants for the Taylor series
-        def _f(t, x): f(t, x, *args)
+        def _f(t, x): return f(t, x, *args)
         
         t_series = [t, 1.]
         x_series = [x, _f(t, x)]
@@ -79,6 +79,12 @@ class ZonotopeReachSets(ReachableSets):
 
     def __call__(self, t):
         return super().__call__(t)
+
+    def __len__(self):
+        return len(self.sets)
+
+    def __getitem__(self, i):
+        return self.sets[i]
 
 # class PolyReachableTube(ReachableTube):
 #     ts: jax.Array
@@ -250,7 +256,8 @@ class LohnerReachability(BaseZonotopeGenerator):
         def get_highest_derivative_norm(x):
             series = self._get_series(t, x, *f_args)
             t_series = [1.] + [0.] * (len(series) - 1)
-            next_term = jet(self.sys.f, (t, x), (t_series, series))[-1]
+            _, out_series = jet(self.sys.f, (t, x), (t_series, series))
+            next_term = out_series[-1]  # Get last element of output series
             return jnp.abs(next_term)
 
         max_deriv = natif(get_highest_derivative_norm)(R).upper
@@ -319,7 +326,9 @@ class AlthoffGirardReachability(BaseZonotopeGenerator):
         for i in range(n):
             def hessian_norm(x):
                 return jnp.max(jnp.abs(jax.hessian(lambda s: self.sys.f(t, s, *f_args)[i])(x)))
-            H_max = natif(hessian_norm)(R).upper
+            H_result = natif(hessian_norm)(R)
+            # natif returns Interval for interval inputs, but handle both cases
+            H_max = H_result.upper if hasattr(H_result, 'upper') else H_result
             L_bounds.append(0.5 * H_max * dx_sq_sum)
         
         L_bound = jnp.array(L_bounds)
@@ -413,7 +422,8 @@ class AlthoffTaylorReachability(BaseZonotopeGenerator):
         def get_highest_derivative_norm(x):
             series = self._get_series(t, x, *f_args)
             t_series = [1.] + [0.] * (len(series) - 1)
-            next_term = jet(self.sys.f, (t, x), (t_series, series))[-1]
+            _, out_series = jet(self.sys.f, (t, x), (t_series, series))
+            next_term = out_series[-1]  # Get last element of output series
             return jnp.abs(next_term)
 
         max_deriv = natif(get_highest_derivative_norm)(R).upper
