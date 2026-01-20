@@ -1,227 +1,227 @@
 """Example: Plotting reachable sets for a pendulum system.
-
-This script demonstrates zonotope-based reachability analysis using
-both Lohner's algorithm and the Althoff-Girard algorithm.
+Demonstrates Method-Level JIT compilation with static loop bounds.
 """
 
+import time
+import jax
 import jax.numpy as jnp
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
-import numpy as np
+from matplotlib.collections import PatchCollection
+from functools import partial
 
+# Adjust imports to match your package structure
 from immrax.system import System
-from immrax.generator import (
-    Zonotope,
-    lohner_reachtube,
-    althoff_girard_reachtube,
+from immrax.generator import Zonotope
+from immrax.generator.reachability import (
+    LohnerReachability,
+    AlthoffGirardReachability,
+    AlthoffTaylorReachability,
 )
 
 
 # --- Define the Pendulum System ---
 
-
 class PendulumSystem(System):
-    """Simple pendulum: dθ/dt = ω, dω/dt = -sin(θ) - b*ω
-
-    State: x = [θ, ω] where θ is angle and ω is angular velocity
-    """
-
+    """Simple pendulum."""
     def __init__(self, damping: float = 0.1):
         super().__init__("continuous", 2)
         self.b = damping
 
     def f(self, t, x):
         theta, omega = x[0], x[1]
-        dtheta = omega
-        domega = -jnp.sin(theta) - self.b * omega
-        return jnp.array([dtheta, domega])
+        return jnp.array([omega, -jnp.sin(theta) - self.b * omega])
+
+    def tree_flatten(self):
+        return ((self.b,), None)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(damping=children[0])
+
+
+# --- Benchmarking Logic ---
+
+def benchmark_full_method(name, generator_cls, sys, t0, num_steps, dt, Z0, **kwargs):
+    """JIT compiles the entire compute_reach_sets method using static num_steps."""
+    print(f"\n--- Benchmarking {name} ---")
+    
+    # Initialize generator
+    gen = generator_cls(sys, dt, **kwargs)
+    
+    # Define the JIT-able function
+    # num_steps is arg 1. We mark it static so JAX unrolls/scans correctly.
+    @partial(jax.jit, static_argnums=(1,))
+    def run_all(t0, num_steps, Z0):
+        return gen.compute_reach_sets(t0, num_steps, Z0)
+
+    # 1. Compilation (Warmup)
+    print("  Compiling (entire horizon)...", end="", flush=True)
+    start_time = time.perf_counter()
+    
+    # Run once to trigger JIT
+    res_warmup = run_all(t0, num_steps, Z0)
+    res_warmup.center_stack.block_until_ready()
+    
+    compile_time = time.perf_counter() - start_time
+    print(f" Done. (Total warm-up: {compile_time:.4f} s)")
+
+    # 2. Execution (Cached)
+    print("  Running execution...", end="", flush=True)
+    start_time = time.perf_counter()
+    
+    res = run_all(t0, num_steps, Z0)
+    res.center_stack.block_until_ready()
+    
+    exec_time = time.perf_counter() - start_time
+    print(f" Done. (Time: {exec_time:.4f} s)")
+    
+    actual_steps = len(res)
+    print(f"  > Steps: {actual_steps}")
+    print(f"  > Throughput: {actual_steps / exec_time:.1f} steps/sec")
+
+    return res
 
 
 # --- Plotting Utilities ---
 
+def plot_reachtube(ax, tube, color='blue', alpha=0.3, stride=1, label=None):
+    patches = []
+    centers = tube.center_stack[::stride]
+    gens = tube.gen_stack[::stride]
+    
+    for c, G in zip(centers, gens):
+        Z = Zonotope(c, G)
+        G_arr = np.array(Z.G)
+        c_arr = np.array(Z.ox)
+        
+        # 1. Filter small generators
+        norms = np.linalg.norm(G_arr, axis=0)
+        G_arr = G_arr[:, norms > 1e-9]
+        
+        if G_arr.shape[1] > 0:
+            # 2. ALIGN GENERATORS (The Fix)
+            # Ensure all generators point into the right half-plane (x > 0)
+            # If x == 0, ensure y > 0.
+            # This makes all angles lie in [-pi/2, pi/2]
+            
+            # Find columns where the first component is negative
+            neg_x = G_arr[0, :] < 0
+            # Or if x is zero, where y is negative
+            neg_y = (G_arr[0, :] == 0) & (G_arr[1, :] < 0)
+            
+            # Flip those generators
+            flip_mask = neg_x | neg_y
+            G_arr[:, flip_mask] *= -1
+            
+            # 3. Sort by angle
+            angles = np.arctan2(G_arr[1, :], G_arr[0, :])
+            idx = np.argsort(angles)
+            G_sorted = G_arr[:, idx]
+            
+            # 4. Trace Boundary
+            # Start at the "bottom-left" extreme: center minus sum of all aligned generators
+            current = c_arr - np.sum(G_sorted, axis=1)
+            verts = [current.copy()]
+            
+            # Walk "forward" (add 2*g)
+            for i in range(G_sorted.shape[1]):
+                current += 2 * G_sorted[:, i]
+                verts.append(current.copy())
+            
+            # Walk "backward" (subtract 2*g) - completes the loop
+            for i in range(G_sorted.shape[1]):
+                current -= 2 * G_sorted[:, i]
+                verts.append(current.copy())
+                
+            patches.append(Polygon(np.array(verts[:-1]), closed=True))
 
-def zonotope_vertices(Z: Zonotope) -> np.ndarray:
-    """Compute vertices of a 2D zonotope for plotting.
-
-    Uses the standard algorithm: sort generators by angle and traverse.
-    """
-    c = np.array(Z.ox)
-    G = np.array(Z.G)
-    n, m = G.shape
-
-    if n != 2:
-        raise ValueError("Can only plot 2D zonotopes")
-
-    if m == 0:
-        return c.reshape(1, 2)
-
-    # Remove zero generators
-    norms = np.linalg.norm(G, axis=0)
-    nonzero_mask = norms > 1e-10
-    G = G[:, nonzero_mask]
-    m = G.shape[1]
-
-    if m == 0:
-        return c.reshape(1, 2)
-
-    # Sort generators by angle
-    angles = np.arctan2(G[1, :], G[0, :])
-    sorted_idx = np.argsort(angles)
-    G_sorted = G[:, sorted_idx]
-
-    # Traverse the zonotope boundary
-    # Start from center - sum of all generators
-    vertex = c - np.sum(G_sorted, axis=1)
-    vertices = [vertex.copy()]
-
-    # Add each generator twice (forward and backward traversal)
-    for i in range(m):
-        vertex = vertex + 2 * G_sorted[:, i]
-        vertices.append(vertex.copy())
-
-    for i in range(m):
-        vertex = vertex - 2 * G_sorted[:, i]
-        vertices.append(vertex.copy())
-
-    return np.array(vertices[:-1])  # Last vertex equals first
-
-
-def plot_zonotope(ax, Z: Zonotope, **kwargs):
-    """Plot a 2D zonotope as a filled polygon."""
-    vertices = zonotope_vertices(Z)
-    polygon = Polygon(vertices, **kwargs)
-    ax.add_patch(polygon)
-    return polygon
-
-
-def plot_reachtube(ax, tube, color='blue', alpha=0.3, label=None):
-    """Plot a reachable tube as a sequence of zonotopes."""
-    for i in range(len(tube)):
-        Z = tube[i]
-        kwargs = {'facecolor': color, 'edgecolor': color, 'alpha': alpha, 'linewidth': 0.5}
-        if i == 0 and label:
-            kwargs['label'] = label
-        plot_zonotope(ax, Z, **kwargs)
+    p = PatchCollection(patches, facecolor=color, alpha=alpha, edgecolor=(0,0,0,0.5), linewidth=0.5)
+    ax.add_collection(p)
+    if label: ax.add_patch(Polygon([[0,0]], color=color, alpha=alpha, label=label))
+    if len(centers) > 0: ax.autoscale_view()
+    ax.set_xlim(-0.5, 0.5)
+    ax.set_ylim(-0.5, 0.5)
 
 
-def plot_trajectories(ax, sys, Z0, n_samples=10, t0=0.0, tf=1.0, dt=0.01, **kwargs):
-    """Plot sample trajectories from the initial zonotope."""
-    import jax
-
+def plot_vmapped_trajectories(ax, sys, Z0, n_samples=50, t0=0.0, tf=3.0, dt=0.02, **kwargs):
     key = jax.random.PRNGKey(0)
+    vs = jax.random.uniform(key, (n_samples, Z0.m), minval=-1., maxval=1.)
+    x0s = Z0.ox + jax.vmap(lambda v: Z0.G @ v)(vs)
+    
+    # # Calculate exact steps to match main loop
+    # num_steps = int((tf - t0) / dt)
 
+    # def step_rk4(x, t):
+    #     k1 = sys.f(t, x)
+    #     k2 = sys.f(t + dt/2, x + dt/2 * k1)
+    #     k3 = sys.f(t + dt/2, x + dt/2 * k2)
+    #     k4 = sys.f(t + dt, x + dt * k3)
+    #     return x + dt/6*(k1 + 2*k2 + 2*k3 + k4), None
+
+    def sim(x0):
+        # Scan with static time grid
+        # times = t0 + jnp.arange(num_steps) * dt
+        # _, xs = jax.lax.scan(step_rk4, x0, times)
+        # return xs
+        return sys.compute_trajectory(t0, tf, x0, dt=dt)
+
+    trajs = jax.vmap(sim)(x0s) 
+    trajs = trajs.to_convenience()
+    
     for i in range(n_samples):
-        key, subkey = jax.random.split(key)
-        v = jax.random.uniform(subkey, shape=(Z0.m,), minval=-1, maxval=1)
-        x0 = Z0.ox + Z0.G @ v
+        ax.plot(trajs.ys[i, :, 0], trajs.ys[i, :, 1], **kwargs)
 
-        traj = sys.compute_trajectory(t0, tf, x0, dt=dt)
-        ts = np.array(traj.ts)
-        ys = np.array(traj.ys)
-
-        # Filter valid times
-        valid = np.isfinite(ts)
-        ts, ys = ts[valid], ys[valid]
-
-        ax.plot(ys[:, 0], ys[:, 1], **kwargs)
-
-
-# --- Main Example ---
-
+# --- Main ---
 
 def main():
-    # Create pendulum system
-    pendulum = PendulumSystem(damping=0.1)
+    plt.style.use('bmh')
+    
+    pendulum = PendulumSystem(damping=0.2)
+    Z0 = Zonotope(jnp.array([0.5, 0.0]), jnp.diag(jnp.array([0.05, 0.05])))
 
-    # Initial zonotope: small region around (θ=0.2, ω=0)
-    center = jnp.array([0.2, 0.0])
-    generators = jnp.array([
-        [0.0001, 0.0],   # Small uncertainty in θ
-        [0.0, 0.0001],   # Small uncertainty in ω
-    ])
-    Z0 = Zonotope(center, generators)
+    t0, tf = 0.0, 10.0
+    dt = 0.02
+    
+    # Explicitly calculate num_steps as a standard int
+    num_steps = int((tf - t0) / dt)
+    
+    print(f"System: Pendulum (damping=0.2)")
+    print(f"Horizon: [{t0}, {tf}], dt={dt}, Steps={num_steps}")
 
-    # Time parameters
-    t0, tf = 0.0, 5.
-    dt = 0.05
+    # Run Benchmarks
+    tube_lohner = benchmark_full_method("Lohner", LohnerReachability, pendulum, t0, num_steps, dt, Z0)
+    tube_ag = benchmark_full_method("Althoff-Girard", AlthoffGirardReachability, pendulum, t0, num_steps, dt, Z0)
+    tube_at = benchmark_full_method("Althoff-Taylor", AlthoffTaylorReachability, pendulum, t0, num_steps, dt, Z0)
 
-    print("Computing reachable tubes...")
-    print(f"  Initial set: center={center}, generators shape={generators.shape}")
-    print(f"  Time: [{t0}, {tf}], dt={dt}")
+    # Plotting
+    print("\nPlotting...")
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    traj_opts = {'color': 'k', 'lw': 0.5, 'alpha': 0.5}
 
-    # Compute reachable tubes with both algorithms
-    print("\n  Running Lohner's algorithm...")
-    tube_lohner = lohner_reachtube(
-        pendulum, t0, tf, Z0, dt,
-        max_generators=8,
-        taylor_order=2,
-    )
-    print(f"    Done. {len(tube_lohner)} time steps.")
+    names = ["Lohner", "Althoff-Girard", "Althoff-Taylor", "Comparison"]
+    tubes = [tube_lohner, tube_ag, tube_at]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
 
-    print("\n  Running Althoff-Girard algorithm...")
-    tube_ag = althoff_girard_reachtube(
-        pendulum, t0, tf, Z0, dt,
-        max_generators=8,
-    )
-    print(f"    Done. {len(tube_ag)} time steps.")
+    for i in range(3):
+        axes[i].set_title(names[i])
+        plot_reachtube(axes[i], tubes[i], color=colors[i], stride=10)
+        plot_vmapped_trajectories(axes[i], pendulum, Z0, t0=t0, tf=tf, dt=dt, **traj_opts)
 
-    # --- Plot Results ---
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[3].set_title("Comparison")
+    for i, t in enumerate(tubes):
+        plot_reachtube(axes[3], t, color=colors[i], alpha=0.15, stride=10, label=names[i])
+    plot_vmapped_trajectories(axes[3], pendulum, Z0, t0=t0, tf=tf, dt=dt, **traj_opts)
+    axes[3].legend()
 
-    # Plot 1: Lohner's algorithm
-    ax1 = axes[0]
-    ax1.set_title("Lohner's Algorithm")
-    plot_reachtube(ax1, tube_lohner, color='blue', alpha=0.4, label='Reachable set')
-    plot_trajectories(ax1, pendulum, Z0, n_samples=20, t0=t0, tf=tf,
-                      color='black', linewidth=0.5, alpha=0.7)
-    ax1.set_xlabel(r'$\theta$ (angle)')
-    ax1.set_ylabel(r'$\omega$ (angular velocity)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.set_aspect('equal', adjustable='datalim')
-
-    # Plot 2: Althoff-Girard algorithm
-    ax2 = axes[1]
-    ax2.set_title("Althoff-Girard Algorithm")
-    plot_reachtube(ax2, tube_ag, color='red', alpha=0.4, label='Reachable set')
-    plot_trajectories(ax2, pendulum, Z0, n_samples=20, t0=t0, tf=tf,
-                      color='black', linewidth=0.5, alpha=0.7)
-    ax2.set_xlabel(r'$\theta$ (angle)')
-    ax2.set_ylabel(r'$\omega$ (angular velocity)')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_aspect('equal', adjustable='datalim')
-
-    # Plot 3: Comparison (overlay)
-    ax3 = axes[2]
-    ax3.set_title("Comparison")
-    plot_reachtube(ax3, tube_lohner, color='blue', alpha=0.3, label='Lohner')
-    plot_reachtube(ax3, tube_ag, color='red', alpha=0.3, label='Althoff-Girard')
-    plot_trajectories(ax3, pendulum, Z0, n_samples=10, t0=t0, tf=tf,
-                      color='black', linewidth=0.5, alpha=0.7, label='Trajectories')
-    ax3.set_xlabel(r'$\theta$ (angle)')
-    ax3.set_ylabel(r'$\omega$ (angular velocity)')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    ax3.set_aspect('equal', adjustable='datalim')
+    for ax in axes:
+        ax.set_xlabel('Theta')
+        ax.set_ylabel('Omega')
 
     plt.tight_layout()
-    plt.savefig('reachable_sets.png', dpi=150, bbox_inches='tight')
-    print(f"\nSaved plot to 'reachable_sets.png'")
+    plt.savefig('jit_benchmark.png')
     plt.show()
-
-    # --- Print some statistics ---
-    print("\n--- Statistics ---")
-    print(f"Lohner final zonotope: {tube_lohner[-1].m} generators")
-    print(f"Althoff-Girard final zonotope: {tube_ag[-1].m} generators")
-
-    # Compare volumes (using interval hull as proxy)
-    hull_lohner = tube_lohner[-1].interval_hull()
-    hull_ag = tube_ag[-1].interval_hull()
-    vol_lohner = np.prod(np.array(hull_lohner.upper - hull_lohner.lower))
-    vol_ag = np.prod(np.array(hull_ag.upper - hull_ag.lower))
-    print(f"Final interval hull volume - Lohner: {vol_lohner:.4f}, Althoff-Girard: {vol_ag:.4f}")
-
 
 if __name__ == "__main__":
     main()
