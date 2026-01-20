@@ -574,9 +574,18 @@ def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
     )
     return Interval(resl.reshape(xsh), resu.reshape(xsh))
 
-
 inclusion_registry[lax.pow_p] = _inclusion_pow_p
 
+def _inclusion_abs_p (x: Interval) -> Interval:
+    ol = jnp.where(
+        jnp.logical_and(x.lower <= 0, x.upper >= 0),
+        0.0,
+        jnp.minimum(lax.abs(x.lower), lax.abs(x.upper)),
+    )
+    ou = jnp.maximum(lax.abs(x.lower), lax.abs(x.upper))
+    return Interval(ol, ou)
+
+inclusion_registry[lax.abs_p] = _inclusion_abs_p
 
 # def _inclusion_tanh_p(x: Interval, accuracy=None) -> Interval:
 #     return Interval(lax.tanh(x.lower, accuracy=accuracy), lax.tanh(x.upper, accuracy=accuracy))

@@ -20,6 +20,16 @@ def fact (n) :
 def inv_fact (n) :
     return lax.exp(-lax.lgamma(n + 1.))
 
+class ReachableSets (ABC) :
+    ts: jax.Array
+    sets: list
+    @abstractmethod
+    def __call__ (self, t) :
+        """Get the reachable set at closest time index to t"""
+        i = jnp.searchsorted(self.ts, t) - 1
+        return jnp.where(t - self.ts[i] < self.ts[i+1] - t, self.sets[i], self.sets[i+1])
+        
+
 class PolyReachableTube (ReachableTube) :
     ts: jax.Array
     ox_coeffs: jax.Array
@@ -64,7 +74,20 @@ def prolongation (f:Callable, p:int) -> Callable :
         return x_series
     return f_prolonged
 
-class ParametricReach :
+class ReachableSetGenerator (ABC) :
+    sys: System
+
+    @abstractmethod
+    def step (self, t:float, set0:Parametope, f_args) -> Parametope :
+        """Compute the next reachable set from set0 at time t"""
+        pass
+
+    @abstractmethod
+    def compute_reach_sets (self, t0:float, tf:float, set0:Parametope, f_args) -> ReachableSets :
+        """Compute the reachable sets over [t0, tf] starting from set0"""
+        pass
+
+class PolyReachableTubeGenerator :
     sys: System
 
     def __init__ (self, sys: System, dt:float, ox_order:int, alpha_order:int=0, y_order:int=1) :
@@ -87,5 +110,5 @@ class ParametricReach :
             return jet(self.sys.f, (t, x), ([1.] + [0.]*(len(series)-1), series))[-1]
         
 
-    def compute_reachable_tube (self) -> PolyReachableTube :
+    # def compute_reachable_tube (self) -> PolyReachableTube :
 
