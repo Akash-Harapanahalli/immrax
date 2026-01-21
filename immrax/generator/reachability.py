@@ -260,9 +260,16 @@ class AlthoffGirardReachability(BaseZonotopeGenerator):
         J_c = jax.jacfwd(f_x)(c)
         f_c = f_x(c)
         
+        # Linearization error bound (Lagrange remainder)
+        # Error <= 0.5 * max(||H||) * ||x - c||^2
+        # We use component-wise bound: |L_i| <= 0.5 * h_max_i * (sum(|x-c|))^2
+        # Note: sum(x^2) is NOT safe, (sum(|x|))^2 is required for strict over-approximation
+        
         delta = R - Interval(c, c)
         delta_max = jnp.maximum(jnp.abs(delta.lower), jnp.abs(delta.upper))
-        dx_sq_sum = jnp.sum(delta_max**2)
+        
+        # The deviation vector norm squared (L1 norm squared is conservative but safe)
+        dx_sq_sum = (jnp.sum(delta_max))**2
 
         def get_hess_bound(i):
             h_max = natif(lambda x: jnp.max(jnp.abs(jax.hessian(lambda s: self.sys.f(t, s, *f_args)[i])(x))))(R).upper
@@ -270,12 +277,30 @@ class AlthoffGirardReachability(BaseZonotopeGenerator):
             
         L_bound = jax.vmap(get_hess_bound)(jnp.arange(n))
 
-        Phi = jax.scipy.linalg.expm(J_c * dt)
+        # Exact computation of integral of exponential
+        # exp([ [J*dt, I*dt], [0, 0] ]) = [ [Phi, int_Phi], [0, I] ]
+        M = jnp.zeros((2*n, 2*n))
+        M = M.at[:n, :n].set(J_c * dt)
+        M = M.at[:n, n:].set(jnp.eye(n) * dt)
+        
+        expM = jax.scipy.linalg.expm(M)
+        Phi = expM[:n, :n]
+        int_Phi = expM[:n, n:]
+        
         v = f_c - J_c @ c
-        int_Phi = dt * jnp.eye(n) + 0.5 * (dt**2) * J_c
         
         c_new = Phi @ c + int_Phi @ v
         G_lin = Phi @ Z.G
+        G_rem = jnp.diag(L_bound) # L_bound is already the error magnitude over the step
+        
+        # Note: L_bound is the error rate? No, standard derivation:
+        # x(t) = Phi x(0) + ... + integral(remainder)
+        # If we bound remainder by L, integral is L * dt.
+        # Check if L_bound includes dt?
+        # In code above: L_bound = 0.5 * h * dx^2. This is the spatial error bound.
+        # We need to integrate it over time.
+        # Simple bound: L_int <= dt * L_bound
+        
         G_rem = jnp.diag(dt * L_bound)
         
         return Zonotope(c_new, jnp.concatenate([G_lin, G_rem], axis=1))

@@ -353,6 +353,24 @@ class PolynomialZonotope:
 
         new_G_I = jnp.concatenate([linear_G_I, cross_G_I, quad_G_I], axis=1)
 
+        # Missing cross-terms of independent generators!
+        # (G_I @ b)^T Q (G_I @ b) = sum_{i,j} b_i b_j (g_i^T Q g_j)
+        # We captured diagonal i=j (quad_G_I)
+        # We need cross terms i != j. Since b_i, b_j are independent [-1,1],
+        # b_i * b_j is effectively a new independent variable in [-1,1].
+        
+        indep_cross_list = []
+        for i in range(self.q):
+            for j in range(i + 1, self.q):
+                # g_i^T Q g_j + g_j^T Q g_i
+                term = jnp.einsum("mik,k->mi", jnp.einsum("j,mik->mij", self.G_I[:, i], Q), self.G_I[:, j]) + \
+                       jnp.einsum("mik,k->mi", jnp.einsum("j,mik->mij", self.G_I[:, j], Q), self.G_I[:, i])
+                indep_cross_list.append(term)
+                
+        if len(indep_cross_list) > 0:
+            indep_cross_G_I = jnp.concatenate(indep_cross_list, axis=1)
+            new_G_I = jnp.concatenate([new_G_I, indep_cross_G_I], axis=1)
+
         # Merge terms with same exponents
         new_G, new_E = _compact_polynomial_terms(new_G, new_E)
 

@@ -463,7 +463,12 @@ def constrained_zonotope_from_polytope(
 
     # Constraint: factors represent convex weights
     A = jnp.ones((1, k))
-    b = jnp.array([k - 2.0])  # sum(v) = k - 2 when v ∈ [-1,1] maps to w ∈ [0,1] summing to 1
+    b = jnp.array([2.0 - k])  # sum(v) = k - 2 when v ∈ [-1,1] maps to w ∈ [0,1] summing to 1
+                                # Wait, derivation check:
+                                # sum(w_i) = 1
+                                # w_i = (v_i + 1) / 2
+                                # sum(v_i + 1) / 2 = 1 => sum(v_i) + k = 2 => sum(v_i) = 2 - k
+
 
     return ConstrainedZonotope(ox, G_scaled, A, b)
 
@@ -495,9 +500,7 @@ def constrained_zonotope_intersection(
     # Add constraint: G1 @ v1 - G2 @ v2 = ox2 - ox1
 
     new_ox = cz1.ox
-    new_G = jnp.concatenate([cz1.G, cz2.G], axis=1)
-
-    # Original constraints for v1
+    # Original constraints for v1 (using new larger generator set)
     A1_lifted = jnp.concatenate(
         [cz1.A, jnp.zeros((cz1.p, cz2.m))], axis=1
     )
@@ -508,6 +511,13 @@ def constrained_zonotope_intersection(
     # Intersection constraint: G1 @ v1 - G2 @ v2 = ox2 - ox1
     A_intersect = jnp.concatenate([cz1.G, -cz2.G], axis=1)
     b_intersect = cz2.ox - cz1.ox
+
+    # The intersection set is {x = ox1 + G1 v1 | ... }
+    # So the generators for the new set should correspond only to v1
+    # The variables v2 are auxiliary variables constrained to match v1
+    # We construct the set over variables [v1; v2] but only v1 contributes to geometry
+    
+    new_G = jnp.concatenate([cz1.G, jnp.zeros_like(cz2.G)], axis=1)
 
     new_A = jnp.vstack([A1_lifted, A2_lifted, A_intersect])
     new_b = jnp.concatenate([cz1.b, cz2.b, b_intersect])

@@ -391,6 +391,8 @@ class TaylorModel:
         n = self.n
         new_coeffs_list = []
         new_exp_list = []
+        truncated_lower_list = []
+        truncated_upper_list = []
 
         # p1 * p2 term-by-term
         for i in range(self.num_monomials):
@@ -404,6 +406,39 @@ class TaylorModel:
                 if total_order <= max_order:
                     new_coeffs_list.append(new_coeff)
                     new_exp_list.append(new_exp)
+                else:
+                    # Truncated term! Must add its bound to remainder.
+                    # Bound = coeff * monomial_bound
+                    # Monomial bound over [-1,1]^d:
+                    # if any exponent is odd: [-1, 1]
+                    # if all exponents are even: [0, 1]
+                    has_odd = jnp.any(new_exp % 2 == 1)
+                    if has_odd:
+                         mono_lower, mono_upper = -1.0, 1.0
+                    else:
+                         mono_lower, mono_upper = 0.0, 1.0
+                    
+                    c_pos = jnp.maximum(new_coeff, 0)
+                    c_neg = jnp.minimum(new_coeff, 0)
+                    
+                    term_lower = c_pos * mono_lower + c_neg * mono_upper
+                    term_upper = c_pos * mono_upper + c_neg * mono_lower
+                    
+                    # Accumulate purely in remainder (simplification)
+                    # Ideally we'd accumulate 'truncated_polynomial' but here we just expand the box
+                    # We can't update 'self.remainder' or 'other.remainder', we need to add to 'new_remainder'
+                    # We will accumulate these bounds and add them at end
+                    # But loop complexity...
+                    # Let's collect these bounds in a list
+                    truncated_lower_list.append(term_lower)
+                    truncated_upper_list.append(term_upper)
+
+        if len(truncated_lower_list) > 0:
+            tr_l = jnp.sum(jnp.stack(truncated_lower_list, axis=0), axis=0)
+            tr_u = jnp.sum(jnp.stack(truncated_upper_list, axis=0), axis=0)
+            truncated_remainder = jnp.stack([tr_l, tr_u], axis=1)
+        else:
+            truncated_remainder = jnp.zeros((n, 2), dtype=self.dtype)
 
         if len(new_coeffs_list) > 0:
             new_coeffs = jnp.stack(new_coeffs_list, axis=1)
@@ -430,6 +465,7 @@ class TaylorModel:
 
         # Combined remainder
         new_remainder = _interval_add(_interval_add(p1_r2, r1_p2), r1_r2)
+        new_remainder = _interval_add(new_remainder, truncated_remainder)
 
         return TaylorModel(
             new_coeffs,
