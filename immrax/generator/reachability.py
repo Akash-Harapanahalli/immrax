@@ -281,7 +281,7 @@ class AlthoffGirardReachability(BaseZonotopeGenerator):
         return Zonotope(c_new, jnp.concatenate([G_lin, G_rem], axis=1))
 
 
-class AlthoffTaylorReachability(BaseZonotopeGenerator):
+class TaylorGirardReachability(BaseZonotopeGenerator):
     max_generators: int
     taylor_order: int
 

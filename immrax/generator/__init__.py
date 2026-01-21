@@ -13,7 +13,7 @@ from .reachability import (
     ZonotopeReachSets,
     LohnerReachability,
     AlthoffGirardReachability,
-    AlthoffTaylorReachability,
+    TaylorGirardReachability,
 )
 
 __all__ = [
@@ -28,5 +28,5 @@ __all__ = [
     "ZonotopeReachSets",
     "LohnerReachability",
     "AlthoffGirardReachability",
-    "AlthoffTaylorReachability",
+    "TaylorGirardReachability",
 ]
