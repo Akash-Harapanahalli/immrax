@@ -70,27 +70,26 @@ class PolynomialZonotope:
         self.E = jnp.asarray(E, dtype=jnp.int32)
 
         if G_I is None:
-            G_I = jnp.zeros((self.ox.shape[0], 0), dtype=self.G.dtype)
+            G_I = jnp.zeros(self.ox.shape + (0,), dtype=self.G.dtype)
         self.G_I = jnp.asarray(G_I)
 
-        # Validate dimensions
-        if self.G.ndim != 2:
-            raise ValueError(f"G must be 2D, got shape {self.G.shape}")
-        if self.G.shape[0] != self.ox.shape[0]:
+        # Validate dimensions (using relative indices for batch compatibility)
+        # G.shape[:-1] should match ox.shape (allows arbitrary batch dims)
+        if self.G.shape[:-1] != self.ox.shape:
             raise ValueError(
-                f"G rows must match ox dimension: {self.G.shape[0]} vs {self.ox.shape[0]}"
+                f"Incompatible shapes: ox has shape {self.ox.shape}, "
+                f"G has shape {self.G.shape} (expected G.shape[:-1] = {self.ox.shape})"
             )
-        if self.E.ndim != 2:
-            raise ValueError(f"E must be 2D, got shape {self.E.shape}")
-        if self.E.shape[1] != self.G.shape[1]:
+        # E.shape[-1] must match G.shape[-1] (number of dependent generators)
+        if self.E.shape[-1] != self.G.shape[-1]:
             raise ValueError(
-                f"E columns must match G columns: {self.E.shape[1]} vs {self.G.shape[1]}"
+                f"E columns must match G columns: {self.E.shape[-1]} vs {self.G.shape[-1]}"
             )
-        if self.G_I.ndim != 2:
-            raise ValueError(f"G_I must be 2D, got shape {self.G_I.shape}")
-        if self.G_I.shape[0] != self.ox.shape[0]:
+        # G_I.shape[:-1] should match ox.shape
+        if self.G_I.shape[:-1] != self.ox.shape:
             raise ValueError(
-                f"G_I rows must match ox dimension: {self.G_I.shape[0]} vs {self.ox.shape[0]}"
+                f"Incompatible shapes: ox has shape {self.ox.shape}, "
+                f"G_I has shape {self.G_I.shape} (expected G_I.shape[:-1] = {self.ox.shape})"
             )
 
     # --- Pytree methods ---
@@ -226,31 +225,51 @@ class PolynomialZonotope:
 
     # --- Set operations ---
 
-    def __add__(self, other: "PolynomialZonotope") -> "PolynomialZonotope":
-        """Exact Minkowski sum of two polynomial zonotopes.
+    def __add__(self, other: "PolynomialZonotope | Zonotope" | ArrayLike) -> "PolynomialZonotope":
+        """Exact Minkowski sum of two polynomial zonotopes or translation.
 
         When both PZs share the same dependent factors, the sum preserves
         polynomial dependencies.
         """
-        if not isinstance(other, PolynomialZonotope):
-            raise TypeError("Can only add PolynomialZonotope to PolynomialZonotope")
-        if self.ox.shape != other.ox.shape:
-            raise ValueError(
-                f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+        if isinstance(other, PolynomialZonotope):
+            if self.ox.shape != other.ox.shape:
+                raise ValueError(
+                    f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+                )
+
+            new_ox = self.ox + other.ox
+
+            # Merge dependent generators and exponents
+            # Find common monomials and combine their generators
+            new_G, new_E = _merge_polynomial_terms(
+                self.G, self.E, other.G, other.E
             )
 
-        new_ox = self.ox + other.ox
+            # Concatenate independent generators
+            new_G_I = jnp.concatenate([self.G_I, other.G_I], axis=1)
 
-        # Merge dependent generators and exponents
-        # Find common monomials and combine their generators
-        new_G, new_E = _merge_polynomial_terms(
-            self.G, self.E, other.G, other.E
-        )
+            return PolynomialZonotope(new_ox, new_G, new_E, new_G_I)
 
-        # Concatenate independent generators
-        new_G_I = jnp.concatenate([self.G_I, other.G_I], axis=1)
+        # Handle Zonotope: treat all its generators as independent
+        if isinstance(other, Zonotope):
+            if self.ox.shape != other.ox.shape:
+                raise ValueError(
+                    f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+                )
+            new_ox = self.ox + other.ox
+            # Zonotope generators become independent generators
+            new_G_I = jnp.concatenate([self.G_I, other.G], axis=1)
+            return PolynomialZonotope(new_ox, self.G, self.E, new_G_I)
 
-        return PolynomialZonotope(new_ox, new_G, new_E, new_G_I)
+        # Assume vector translation
+        try:
+            vec = jnp.asarray(other)
+            if vec.shape == self.ox.shape:
+                return PolynomialZonotope(self.ox + vec, self.G, self.E, self.G_I)
+        except:
+            pass
+
+        raise TypeError(f"Unsupported type for __add__: {type(other)}")
 
     def __sub__(self, other: "PolynomialZonotope") -> "PolynomialZonotope":
         """Minkowski difference: PZ1 - PZ2 = PZ1 + (-PZ2)."""
@@ -467,6 +486,7 @@ class PolynomialZonotope:
         """Reduce the order while maintaining an overapproximation.
 
         Converts small dependent generators to independent generators.
+        Returns a polynomial zonotope with fixed shape for JIT compatibility.
 
         Parameters
         ----------
@@ -476,35 +496,102 @@ class PolynomialZonotope:
         Returns
         -------
         PolynomialZonotope
-            Reduced order polynomial zonotope
+            Reduced order polynomial zonotope with fixed shape
         """
         target_total = int(target_order * self.n)
         current_total = self.h + self.q
 
-        if target_total >= current_total:
-            return self
+        # Target: keep some dependent (h_target) and have rest as independent (q_target)
+        # For simplicity, we'll convert dependent to independent to reach target_total
+        # and maintain fixed shapes by padding
 
-        # Sort dependent generators by norm
-        G_norms = jnp.linalg.norm(self.G, axis=0)
-        sorted_idx = jnp.argsort(G_norms)
+        # Strategy: Keep at most half as dependent, rest as independent
+        target_h = min(self.h, target_total // 2)
+        target_q = target_total - target_h
 
-        # Keep largest dependent generators
-        num_to_convert = current_total - target_total
-        if num_to_convert >= self.h:
-            # Convert all dependent to independent
-            return PolynomialZonotope(
-                self.ox,
-                jnp.zeros((self.n, 0), dtype=self.dtype),
-                jnp.zeros((self.p, 0), dtype=jnp.int32),
-                jnp.concatenate([self.G, self.G_I], axis=1),
-            )
+        if current_total <= target_total:
+            # Pad to reach target
+            h_pad = target_h - self.h
+            q_pad = target_q - self.q
 
-        convert_idx = sorted_idx[:num_to_convert]
-        keep_idx = sorted_idx[num_to_convert:]
+            if h_pad > 0:
+                new_G = jnp.concatenate(
+                    [self.G, jnp.zeros((self.n, h_pad), dtype=self.dtype)],
+                    axis=1
+                )
+                new_E = jnp.concatenate(
+                    [self.E, jnp.zeros((self.p, h_pad), dtype=jnp.int32)],
+                    axis=1
+                )
+            else:
+                new_G = self.G[:, :target_h] if self.h > 0 else jnp.zeros((self.n, target_h), dtype=self.dtype)
+                new_E = self.E[:, :target_h] if self.h > 0 else jnp.zeros((self.p, target_h), dtype=jnp.int32)
 
-        new_G = self.G[:, keep_idx]
-        new_E = self.E[:, keep_idx]
-        new_G_I = jnp.concatenate([self.G[:, convert_idx], self.G_I], axis=1)
+            if q_pad > 0:
+                new_G_I = jnp.concatenate(
+                    [self.G_I, jnp.zeros((self.n, q_pad), dtype=self.dtype)],
+                    axis=1
+                )
+            else:
+                new_G_I = self.G_I[:, :target_q] if self.q > 0 else jnp.zeros((self.n, target_q), dtype=self.dtype)
+
+            return PolynomialZonotope(self.ox, new_G, new_E, new_G_I)
+
+        # Need to reduce: convert dependent to independent
+        if self.h > target_h:
+            # Sort dependent generators by norm
+            G_norms = jnp.linalg.norm(self.G, axis=0)
+            sorted_idx = jnp.argsort(-G_norms)  # Descending order (keep largest)
+
+            keep_idx = sorted_idx[:target_h]
+            convert_idx = sorted_idx[target_h:]
+
+            new_G = self.G[:, keep_idx] if target_h > 0 else jnp.zeros((self.n, target_h), dtype=self.dtype)
+            new_E = self.E[:, keep_idx] if target_h > 0 else jnp.zeros((self.p, target_h), dtype=jnp.int32)
+
+            # Converted generators become independent
+            G_converted = self.G[:, convert_idx]
+            combined_G_I = jnp.concatenate([G_converted, self.G_I], axis=1)
+        else:
+            new_G = self.G
+            new_E = self.E
+            combined_G_I = self.G_I
+
+        # Reduce independent generators if needed
+        if combined_G_I.shape[1] > target_q:
+            # Keep largest independent generators, box the rest
+            G_I_norms = jnp.linalg.norm(combined_G_I, axis=0)
+            sorted_idx = jnp.argsort(-G_I_norms)
+
+            n_keep = target_q - self.n  # Reserve n for box
+            if n_keep < 0:
+                n_keep = 0
+
+            keep_idx = sorted_idx[:n_keep]
+            reduce_idx = sorted_idx[n_keep:]
+
+            G_I_keep = combined_G_I[:, keep_idx] if n_keep > 0 else jnp.zeros((self.n, 0), dtype=self.dtype)
+            G_I_reduce = combined_G_I[:, reduce_idx]
+
+            # Box the reduced generators
+            radius = jnp.sum(jnp.abs(G_I_reduce), axis=1)
+            G_box = jnp.diag(radius)
+
+            new_G_I = jnp.concatenate([G_I_keep, G_box], axis=1)
+        else:
+            new_G_I = combined_G_I
+
+        # Pad to exact target sizes
+        if new_G.shape[1] < target_h:
+            pad = target_h - new_G.shape[1]
+            new_G = jnp.concatenate([new_G, jnp.zeros((self.n, pad), dtype=self.dtype)], axis=1)
+            new_E = jnp.concatenate([new_E, jnp.zeros((self.p, pad), dtype=jnp.int32)], axis=1)
+
+        if new_G_I.shape[1] < target_q:
+            pad = target_q - new_G_I.shape[1]
+            new_G_I = jnp.concatenate([new_G_I, jnp.zeros((self.n, pad), dtype=self.dtype)], axis=1)
+        elif new_G_I.shape[1] > target_q:
+            new_G_I = new_G_I[:, :target_q]
 
         return PolynomialZonotope(self.ox, new_G, new_E, new_G_I)
 

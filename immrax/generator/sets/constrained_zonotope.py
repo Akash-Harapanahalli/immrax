@@ -58,25 +58,24 @@ class ConstrainedZonotope:
         self.A = jnp.asarray(A)
         self.b = jnp.asarray(b)
 
-        # Validate dimensions
-        if self.G.ndim != 2:
-            raise ValueError(f"G must be 2D, got shape {self.G.shape}")
-        if self.G.shape[0] != self.ox.shape[0]:
+        # Validate dimensions (using relative indices for batch compatibility)
+        # G.shape[:-1] should match ox.shape (allows arbitrary batch dims)
+        if self.G.shape[:-1] != self.ox.shape:
             raise ValueError(
                 f"Incompatible shapes: ox has shape {self.ox.shape}, "
-                f"G has shape {self.G.shape}"
+                f"G has shape {self.G.shape} (expected G.shape[:-1] = {self.ox.shape})"
             )
-        if self.A.ndim != 2:
-            raise ValueError(f"A must be 2D, got shape {self.A.shape}")
-        if self.A.shape[1] != self.G.shape[1]:
+        # A.shape[-1] must match G.shape[-1] (number of generators)
+        if self.A.shape[-1] != self.G.shape[-1]:
             raise ValueError(
                 f"A and G must have same number of columns: "
-                f"A has {self.A.shape[1]}, G has {self.G.shape[1]}"
+                f"A has {self.A.shape[-1]}, G has {self.G.shape[-1]}"
             )
-        if self.b.shape[0] != self.A.shape[0]:
+        # b.shape[:-1] should match A.shape[:-1] (batch dims + constraint rows)
+        if self.b.shape != self.A.shape[:-1]:
             raise ValueError(
-                f"b length must match A rows: b has {self.b.shape[0]}, "
-                f"A has {self.A.shape[0]} rows"
+                f"b shape must match A rows: b has shape {self.b.shape}, "
+                f"A has shape {self.A.shape}"
             )
 
     # --- Pytree methods ---
@@ -137,30 +136,53 @@ class ConstrainedZonotope:
 
     # --- Set operations ---
 
-    def __add__(self, other: "ConstrainedZonotope") -> "ConstrainedZonotope":
-        """Minkowski sum of two constrained zonotopes.
+    def __add__(self, other: "ConstrainedZonotope | Zonotope" | ArrayLike) -> "ConstrainedZonotope":
+        """Minkowski sum of two constrained zonotopes or translation by vector.
 
         CZ1 + CZ2 = {z1 + z2 : z1 ∈ CZ1, z2 ∈ CZ2}
+        CZ + Z = {cz + z : cz ∈ CZ, z ∈ Z}
+        CZ + v = {z + v : z ∈ CZ}
         """
-        if not isinstance(other, ConstrainedZonotope):
-            raise TypeError("Can only add ConstrainedZonotope to ConstrainedZonotope")
-        if self.ox.shape != other.ox.shape:
-            raise ValueError(
-                f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+        if isinstance(other, ConstrainedZonotope):
+            if self.ox.shape != other.ox.shape:
+                raise ValueError(
+                    f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+                )
+            # New center is sum of centers
+            new_ox = self.ox + other.ox
+            # Generators are concatenated
+            new_G = jnp.concatenate((self.G, other.G), axis=1)
+            # Constraints are block diagonal
+            new_A = jnp.block(
+                [
+                    [self.A, jnp.zeros((self.p, other.m))],
+                    [jnp.zeros((other.p, self.m)), other.A],
+                ]
             )
-        # New center is sum of centers
-        new_ox = self.ox + other.ox
-        # Generators are concatenated
-        new_G = jnp.concatenate((self.G, other.G), axis=1)
-        # Constraints are block diagonal
-        new_A = jnp.block(
-            [
-                [self.A, jnp.zeros((self.p, other.m))],
-                [jnp.zeros((other.p, self.m)), other.A],
-            ]
-        )
-        new_b = jnp.concatenate((self.b, other.b))
-        return ConstrainedZonotope(new_ox, new_G, new_A, new_b)
+            new_b = jnp.concatenate((self.b, other.b))
+            return ConstrainedZonotope(new_ox, new_G, new_A, new_b)
+
+        # Handle Zonotope: convert to ConstrainedZonotope with no constraints
+        if isinstance(other, Zonotope):
+            if self.ox.shape != other.ox.shape:
+                raise ValueError(
+                    f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+                )
+            new_ox = self.ox + other.ox
+            new_G = jnp.concatenate((self.G, other.G), axis=1)
+            # Extend A with zeros for new generators (no constraints on them)
+            new_A = jnp.concatenate([self.A, jnp.zeros((self.p, other.m))], axis=1)
+            return ConstrainedZonotope(new_ox, new_G, new_A, self.b)
+
+        # Assume vector translation
+        try:
+            vec = jnp.asarray(other)
+            if vec.shape == self.ox.shape:
+                return ConstrainedZonotope(self.ox + vec, self.G, self.A, self.b)
+        except:
+            pass
+
+        raise TypeError(f"Unsupported type for __add__: {type(other)}")
 
     def __sub__(self, other: "ConstrainedZonotope") -> "ConstrainedZonotope":
         """Minkowski difference: CZ1 - CZ2 = CZ1 + (-CZ2)."""
@@ -295,6 +317,9 @@ class ConstrainedZonotope:
         Uses generator reduction to decrease the number of generators
         while maintaining an overapproximation.
 
+        Returns a constrained zonotope with exactly target_m generators
+        (padded with zeros if necessary) for JIT compatibility.
+
         Parameters
         ----------
         target_order : float
@@ -303,10 +328,23 @@ class ConstrainedZonotope:
         Returns
         -------
         ConstrainedZonotope
-            Reduced order constrained zonotope (overapproximation)
+            Reduced order constrained zonotope (overapproximation) with fixed shape
         """
         target_m = int(target_order * self.n + self.p)
+
+        # If we have fewer generators than target, pad with zeros
         if target_m >= self.m:
+            padding = target_m - self.m
+            if padding > 0:
+                G_padded = jnp.concatenate(
+                    [self.G, jnp.zeros((self.n, padding), dtype=self.dtype)],
+                    axis=1
+                )
+                A_padded = jnp.concatenate(
+                    [self.A, jnp.zeros((self.p, padding), dtype=self.dtype)],
+                    axis=1
+                )
+                return ConstrainedZonotope(self.ox, G_padded, A_padded, self.b)
             return self
 
         # Sort generators by L1 norm (columns)
@@ -314,11 +352,20 @@ class ConstrainedZonotope:
         sorted_indices = jnp.argsort(norms)
 
         # Keep largest generators, replace smallest with interval hull
-        num_reduce = self.m - target_m
-        reduce_indices = sorted_indices[:num_reduce]
-        keep_indices = sorted_indices[num_reduce:]
+        num_keep = target_m - self.n  # Reserve n for box generators
+        if num_keep < 0:
+            num_keep = 0
 
-        G_keep = self.G[:, keep_indices]
+        keep_indices = sorted_indices[self.m - num_keep:]
+        reduce_indices = sorted_indices[:self.m - num_keep]
+
+        if num_keep > 0:
+            G_keep = self.G[:, keep_indices]
+            A_keep = self.A[:, keep_indices]
+        else:
+            G_keep = jnp.zeros((self.n, 0), dtype=self.dtype)
+            A_keep = jnp.zeros((self.p, 0), dtype=self.dtype)
+
         G_reduce = self.G[:, reduce_indices]
 
         # Overapproximate reduced generators with axis-aligned box
@@ -328,24 +375,27 @@ class ConstrainedZonotope:
         # New generator matrix
         new_G = jnp.concatenate([G_keep, G_box], axis=1)
 
-        # Update constraints (project onto kept generators)
-        A_keep = self.A[:, keep_indices]
-        A_reduce = self.A[:, reduce_indices]
-
         # Add new generators for the box (no constraints on them)
         new_A = jnp.concatenate(
-            [A_keep, jnp.zeros((self.p, self.n))], axis=1
+            [A_keep, jnp.zeros((self.p, self.n), dtype=self.dtype)], axis=1
         )
 
-        # Adjust b to account for reduced constraints
-        # This is an overapproximation: we relax the constraint contribution
-        # from reduced generators to their interval bounds
-        b_pert = jnp.sum(jnp.abs(A_reduce), axis=1)
-        # The constraint becomes: A_keep @ v_keep ∈ [b - b_pert, b + b_pert]
-        # For simplicity, we drop the reduced constraints' contribution
-        new_b = self.b
+        # Ensure exactly target_m columns
+        if new_G.shape[1] < target_m:
+            padding = target_m - new_G.shape[1]
+            new_G = jnp.concatenate(
+                [new_G, jnp.zeros((self.n, padding), dtype=self.dtype)],
+                axis=1
+            )
+            new_A = jnp.concatenate(
+                [new_A, jnp.zeros((self.p, padding), dtype=self.dtype)],
+                axis=1
+            )
+        elif new_G.shape[1] > target_m:
+            new_G = new_G[:, :target_m]
+            new_A = new_A[:, :target_m]
 
-        return ConstrainedZonotope(self.ox, new_G, new_A, new_b)
+        return ConstrainedZonotope(self.ox, new_G, new_A, self.b)
 
     # --- String representation ---
 

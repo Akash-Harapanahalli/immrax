@@ -251,34 +251,58 @@ class TaylorModel:
 
     # --- Set operations ---
 
-    def __add__(self, other: "TaylorModel") -> "TaylorModel":
-        """Addition of two Taylor models."""
-        if not isinstance(other, TaylorModel):
-            raise TypeError("Can only add TaylorModel to TaylorModel")
-        if self.d != other.d:
-            raise ValueError(f"Domain dimensions must match: {self.d} vs {other.d}")
-        if not jnp.allclose(self.domain_center, other.domain_center) or not jnp.allclose(
-            self.domain_radius, other.domain_radius
-        ):
-            raise ValueError("Taylor models must have the same domain")
+    def __add__(self, other: "TaylorModel" | ArrayLike) -> "TaylorModel":
+        """Addition of two Taylor models or translation by vector."""
+        if isinstance(other, TaylorModel):
+            if self.d != other.d:
+                raise ValueError(f"Domain dimensions must match: {self.d} vs {other.d}")
+            if not jnp.allclose(self.domain_center, other.domain_center) or not jnp.allclose(
+                self.domain_radius, other.domain_radius
+            ):
+                raise ValueError("Taylor models must have the same domain")
 
-        # Merge polynomial terms
-        new_coeffs, new_exponents = _merge_taylor_terms(
-            self.coeffs, self.exponents, other.coeffs, other.exponents
-        )
+            # Merge polynomial terms
+            new_coeffs, new_exponents = _merge_taylor_terms(
+                self.coeffs, self.exponents, other.coeffs, other.exponents
+            )
 
-        # Add remainders (interval addition)
-        new_remainder = jnp.stack(
-            [
-                self.remainder_lower + other.remainder_lower,
-                self.remainder_upper + other.remainder_upper,
-            ],
-            axis=1,
-        )
+            # Add remainders (interval addition)
+            new_remainder = jnp.stack(
+                [
+                    self.remainder_lower + other.remainder_lower,
+                    self.remainder_upper + other.remainder_upper,
+                ],
+                axis=1,
+            )
 
-        return TaylorModel(
-            new_coeffs, new_exponents, new_remainder, self.domain_center, self.domain_radius
-        )
+            return TaylorModel(
+                new_coeffs, new_exponents, new_remainder, self.domain_center, self.domain_radius
+            )
+            
+        # Assume vector translation (polynomial coefficient modification)
+        try:
+            vec = jnp.asarray(other)
+            if vec.shape == self.shape:
+                # Add to constant term (represented by exponents=0 column)
+                # But we use sparse representation.
+                # Easiest: add a new constant term polynomial and merge
+                
+                # Construct constant polynomial
+                # exp = zeros(d, 1)
+                const_exp = jnp.zeros((self.d, 1), dtype=jnp.int32)
+                const_coeff = vec[:, None] # (n, 1)
+                
+                new_coeffs, new_exponents = _merge_taylor_terms(
+                    self.coeffs, self.exponents, const_coeff, const_exp
+                )
+                
+                return TaylorModel(
+                    new_coeffs, new_exponents, self.remainder, self.domain_center, self.domain_radius
+                )
+        except:
+             pass
+
+        raise TypeError(f"Unsupported type for __add__: {type(other)}")
 
     def __sub__(self, other: "TaylorModel") -> "TaylorModel":
         """Subtraction: TM1 - TM2."""

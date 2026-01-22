@@ -10,7 +10,7 @@ from .sets import (
 )
 
 from .reachability import (
-    ZonotopeReachSets,
+    GenericReachSets,
     LohnerReachability,
     AlthoffGirardReachability,
     TaylorGirardReachability,
@@ -24,8 +24,7 @@ __all__ = [
     "zonotope_from_interval",
     "zonotope_concatenate",
     # Reachability
-    "ZonotopeReachTube",
-    "ZonotopeReachSets",
+    "GenericReachSets",
     "LohnerReachability",
     "AlthoffGirardReachability",
     "TaylorGirardReachability",

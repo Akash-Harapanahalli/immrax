@@ -83,19 +83,31 @@ class Zonotope:
 
     # --- Set operations ---
 
-    def __add__(self, other: "Zonotope") -> "Zonotope":
-        """Minkowski sum of two zonotopes.
+    def __add__(self, other: "Zonotope" | ArrayLike) -> "Zonotope":
+        """Minkowski sum of two zonotopes or translation by vector.
 
         Z1 + Z2 = {z1 + z2 : z1 ∈ Z1, z2 ∈ Z2}
-                = {c1 + c2 + [G1 | G2] v : v ∈ [-1,1]^(m1+m2)}
+        Z + v = {z + v : z ∈ Z}
         """
-        if not isinstance(other, Zonotope):
-            raise TypeError("Can only add Zonotope to Zonotope")
-        if self.ox.shape != other.ox.shape:
-            raise ValueError(
-                f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
-            )
-        return Zonotope(self.ox + other.ox, jnp.concatenate((self.G, other.G), axis=-1))
+        if isinstance(other, Zonotope):
+            if self.ox.shape != other.ox.shape:
+                raise ValueError(
+                    f"Incompatible dimensions: {self.ox.shape} vs {other.ox.shape}"
+                )
+            return Zonotope(self.ox + other.ox, jnp.concatenate((self.G, other.G), axis=-1))
+        
+        # Assume vector translation
+        try:
+            vec = jnp.asarray(other)
+            if vec.shape == self.ox.shape:
+                return Zonotope(self.ox + vec, self.G)
+            else:
+                 # Try broadcasting or raise error
+                 pass
+        except:
+             pass
+             
+        raise TypeError(f"Unsupported type for __add__: {type(other)}")
 
     def __sub__(self, other: "Zonotope") -> "Zonotope":
         """Minkowski difference (Pontryagin difference is not closed for zonotopes).
@@ -177,6 +189,89 @@ class Zonotope:
         in_zonotope = jnp.all(jnp.abs(v) <= 1.0 + 1e-8)
 
         return in_hull & in_zonotope
+
+    # --- Reduction methods ---
+
+    def reduce_order(self, target_order: float) -> "Zonotope":
+        """Reduce the order of the zonotope using Girard's method.
+
+        Replaces small generators with their interval hull to reduce
+        the number of generators while maintaining an overapproximation.
+
+        Returns a zonotope with exactly target_order * n generators
+        (padded with zeros if necessary) for JIT compatibility.
+
+        Parameters
+        ----------
+        target_order : float
+            Target order m / n
+
+        Returns
+        -------
+        Zonotope
+            Reduced order zonotope (overapproximation) with fixed shape
+        """
+        target_m = int(target_order * self.n)
+
+        # If we have fewer generators than target, pad with zeros
+        if target_m >= self.m:
+            padding = target_m - self.m
+            if padding > 0:
+                G_padded = jnp.concatenate(
+                    [self.G, jnp.zeros((self.n, padding), dtype=self.dtype)],
+                    axis=1
+                )
+                return Zonotope(self.ox, G_padded)
+            return self
+
+        # Sort generators by a metric: ||g||_1 - ||g||_inf
+        # This keeps generators that are "more aligned" with axes
+        g_norms_1 = jnp.sum(jnp.abs(self.G), axis=0)
+        g_norms_inf = jnp.max(jnp.abs(self.G), axis=0)
+        metric = g_norms_1 - g_norms_inf
+
+        sorted_indices = jnp.argsort(metric)
+
+        # Keep generators with largest metric (most "spread out")
+        # Reduce generators with smallest metric (most axis-aligned)
+        num_reduce = self.m - target_m + self.n  # Make room for n box generators
+        if num_reduce > self.m:
+            num_reduce = self.m
+
+        reduce_indices = sorted_indices[:num_reduce]
+        keep_indices = sorted_indices[num_reduce:]
+
+        # Generators to keep
+        n_keep = target_m - self.n
+        if n_keep > 0:
+            G_keep = self.G[:, keep_indices[:n_keep]]
+        else:
+            G_keep = jnp.zeros((self.n, 0), dtype=self.dtype)
+
+        # Overapproximate reduced generators with axis-aligned box
+        G_reduce = self.G[:, reduce_indices]
+        # Also include any extra kept generators that don't fit
+        if n_keep < len(keep_indices):
+            extra = self.G[:, keep_indices[n_keep:]]
+            G_reduce = jnp.concatenate([G_reduce, extra], axis=1)
+
+        radius = jnp.sum(jnp.abs(G_reduce), axis=1)
+        G_box = jnp.diag(radius)
+
+        # New generator matrix with exactly target_m generators
+        new_G = jnp.concatenate([G_keep, G_box], axis=1)
+
+        # Ensure exactly target_m columns
+        if new_G.shape[1] < target_m:
+            padding = target_m - new_G.shape[1]
+            new_G = jnp.concatenate(
+                [new_G, jnp.zeros((self.n, padding), dtype=self.dtype)],
+                axis=1
+            )
+        elif new_G.shape[1] > target_m:
+            new_G = new_G[:, :target_m]
+
+        return Zonotope(self.ox, new_G)
 
     # --- String representation ---
 
