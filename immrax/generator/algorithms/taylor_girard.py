@@ -64,9 +64,11 @@ class TaylorGirardReachability(BaseSetGenerator):
 
     def _taylor_map(self, t, x, f_args):
         """Compute Taylor expansion of the flow map at point x."""
-        series = self._get_series(t, x, *f_args)
+        series_list = self._get_series(t, x, *f_args)
+        series = jnp.stack(series_list)
         kk = jnp.arange(len(series))
-        return jnp.sum(series * self.dt**kk * inv_fact(kk))
+        coeffs = (self.dt**kk * inv_fact(kk))[:, None]
+        return jnp.sum(series * coeffs, axis=0)
 
     def step(self, t: float, Z, f_args):
         """Perform one step of Taylor-Girard algorithm.
@@ -96,6 +98,7 @@ class TaylorGirardReachability(BaseSetGenerator):
         Z_lin = Z_lin + shift
 
         # Bound highest derivative for remainder
+        # Bound highest derivative for time remainder (Lagrange in time)
         def get_highest_derivative_norm(x):
             series = self._get_series(t, x, *f_args)
             t_series = [1.] + [0.] * (len(series) - 1)
@@ -103,12 +106,56 @@ class TaylorGirardReachability(BaseSetGenerator):
             return jnp.abs(out_series[-1])
 
         max_deriv = natif(get_highest_derivative_norm)(R).upper
-
-        # Remainder coefficient
+        
+        # Remainder coefficient for time
         p = self.taylor_order
         coeff = (dt**(p + 1)) * inv_fact(p + 1)
+        
+        # Time error zonotope
+        Z_error_time = Zonotope(jnp.zeros_like(c), jnp.diag(coeff * max_deriv))
 
-        # Error zonotope
-        Z_error = Zonotope(jnp.zeros_like(c), jnp.diag(coeff * max_deriv))
+        # --- Spatial Remainder ---
+        # Bound linearization error: R_s = 1/2 * (x-c)^T * H(xi) * (x-c)
+        # Compute Hessian of the Taylor map w.r.t state
+        def taylor_map_fn(x): 
+            return self._taylor_map(t, x, f_args)
+            
+        hessian_fn = jax.jacfwd(jax.jacrev(taylor_map_fn))
+        
+        # Bound Hessian over rough enclosure R
+        # H_int has shape (n, n, n) of Intervals
+        H_int = natif(hessian_fn)(R)
+        
+        dx_int = R - c
+        dx_abs = jnp.maximum(jnp.abs(dx_int.lower), jnp.abs(dx_int.upper)) # (n,)
 
-        return Z_lin + Z_error
+        # Check if set supports quadratic map (e.g. PolynomialZonotope)
+        if hasattr(Z, 'quadratic_map'):
+            # Use center of Hessian for quadratic map
+            # Q = 0.5 * H_center
+            H_center = (H_int.lower + H_int.upper) / 2
+            Q = 0.5 * H_center
+            
+            # Map the centered set Z-c through quadratic form Q
+            Z_quad = (Z - c).quadratic_map(Q)
+            
+            # Use radius of Hessian for unstructured error bound
+            # H_radius = (H_upper - H_lower) / 2
+            H_radius = (H_int.upper - H_int.lower) / 2
+            H_for_bound = H_radius
+        else:
+            # No quadratic map support, bound entire Hessian
+            Z_quad = Zonotope(jnp.zeros_like(c), jnp.zeros((len(c), 0)))
+            H_for_bound = jnp.maximum(jnp.abs(H_int.lower), jnp.abs(H_int.upper))
+
+        # Contraction: (n,n,n) * (n) * (n) -> (n)
+        # quad_bound[i] = 0.5 * sum_jk H_ijk * dx_j * dx_k
+        
+        # First contract last dim
+        temp = jnp.dot(H_for_bound, dx_abs) # (n, n)
+        # Contract next dim
+        quad_bound = 0.5 * jnp.dot(temp, dx_abs) # (n,)
+        
+        Z_error_spatial = Zonotope(jnp.zeros_like(c), jnp.diag(quad_bound))
+
+        return Z_lin + Z_quad + Z_error_time + Z_error_spatial

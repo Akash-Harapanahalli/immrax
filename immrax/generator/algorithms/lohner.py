@@ -53,48 +53,52 @@ class LohnerReachability(BaseSetGenerator):
         self._get_series = prolongation(self.sys.f, self.taylor_order - 1)
 
     def _enforce_limit(self, Z) -> Any:
-        """Reduce set order using polymorphic reduce_order method."""
-        if hasattr(Z, 'reduce_order'):
-            return Z.reduce_order(self.target_order)
+        """Ensure constant shape (2n generators) for lax.scan compatibility."""
+        n = Z.center.shape[0]
+        target_gens = 2 * n
+        current_gens = Z.generators.shape[1]
+        
+        if current_gens > target_gens:
+             return Z.reduce_order(float(target_gens) / n)
+        elif current_gens < target_gens:
+             padding = jnp.zeros((n, target_gens - current_gens), dtype=Z.generators.dtype)
+             new_G = jnp.concatenate([Z.generators, padding], axis=1)
+             return Zonotope(Z.center, new_G)
         return Z
 
     def _taylor_map(self, t, x, f_args):
-        """Compute Taylor expansion of the flow map at point x.
-
-        Evaluates φ(x) ≈ x + dt*f(x) + dt²/2*f'(x)*f(x) + ...
-        """
-        series = self._get_series(t, x, *f_args)
+        """Compute Taylor expansion of the flow map at point x."""
+        series_list = self._get_series(t, x, *f_args)
+        series = jnp.stack(series_list)
         kk = jnp.arange(len(series))
-        return jnp.sum(series * self.dt**kk * inv_fact(kk))
+        coeffs = (self.dt**kk * inv_fact(kk))[:, None]
+        return jnp.sum(series * coeffs, axis=0)
 
     def step(self, t: float, Z, f_args):
-        """Perform one step of Lohner's algorithm.
+        """Perform one step of Lohner's algorithm with QR reduction.
 
-        1. Compute Taylor expansion of flow at center
-        2. Linearize around center using Jacobian
-        3. Bound remainder using interval arithmetic
-        4. Combine linear image with remainder bound
+        1. Compute Taylor expansion and Jacobian
+        2. Compute time and spatial remainders
+        3. Propagate generators
+        4. Apply QR-based reduction to control wrapping effect
         """
         dt = self.dt
         c = Z.center
+        n = c.shape[0]
 
-        # Compute rough enclosure for remainder bounds
+        # Compute rough enclosure
         R = self._compute_rough_enclosure(t, Z, f_args)
 
-        # Taylor map at center
+        # Taylor map and Jacobian
         c_new = self._taylor_map(t, c, f_args)
-
-        # Jacobian of Taylor map at center
         A = jax.jacfwd(lambda x: self._taylor_map(t, x, f_args))(c)
-
-        # Linear image of set
-        Z_lin = A @ Z
-
-        # Recenter to Taylor map center
+        
+        # Propagated generators
+        G = Z.generators
+        G_lin = A @ G
         shift = c_new - A @ c
-        Z_lin = Z_lin + shift
-
-        # Bound highest derivative for remainder
+        
+        # --- Time Remainder ---
         def get_highest_derivative_norm(x):
             series = self._get_series(t, x, *f_args)
             t_series = [1.] + [0.] * (len(series) - 1)
@@ -102,13 +106,55 @@ class LohnerReachability(BaseSetGenerator):
             return jnp.abs(out_series[-1])
 
         max_deriv = natif(get_highest_derivative_norm)(R).upper
-
-        # Remainder bound coefficient
         p = self.taylor_order
-        coeff = (dt**(p + 1)) * inv_fact(p + 1)
+        time_rem_coeff = (dt**(p + 1)) * inv_fact(p + 1)
+        G_time_err = jnp.diag(time_rem_coeff * max_deriv)
 
-        # Error zonotope (works with any set type via __add__)
-        gen_rem = coeff * max_deriv
-        Z_error = Zonotope(jnp.zeros_like(c), jnp.diag(gen_rem))
-
-        return Z_lin + Z_error
+        # --- Spatial Remainder ---
+        def taylor_map_fn(x): 
+            return self._taylor_map(t, x, f_args)
+            
+        hessian_fn = jax.jacfwd(jax.jacrev(taylor_map_fn))
+        H_int = natif(hessian_fn)(R)
+        
+        # User requested using rough enclosure for second order terms
+        dx_int = R - c
+        H_abs = jnp.maximum(jnp.abs(H_int.lower), jnp.abs(H_int.upper))
+        dx_abs = jnp.maximum(jnp.abs(dx_int.lower), jnp.abs(dx_int.upper))
+        
+        temp = jnp.dot(H_abs, dx_abs)
+        spatial_err_bound = 0.5 * jnp.dot(temp, dx_abs)
+        G_spatial_err = jnp.diag(spatial_err_bound)
+        
+        # --- Combine and Reduce (Lohner QR) ---
+        # Combine all generators
+        G_all = jnp.concatenate([G_lin, G_time_err, G_spatial_err], axis=1)
+        
+        # QR decomposition of the Jacobian A to find local frame
+        # Q captures the rotation of the flow
+        Q, _ = jnp.linalg.qr(A)
+        
+        # Project generators onto Q basis
+        G_proj = Q.T @ G_all
+        
+        # Keep the first n generators (corresponds to A @ G_old's main axes if G_old was aligned)
+        # Assuming G starts with n basis vectors.
+        # If G grows, this assumption might drift, but Lohner resets G structure.
+        # We take first n columns as the "main" parallelepiped.
+        G_main = G_proj[:, :n]
+        
+        # The rest are treated as error/noise
+        G_rest = G_proj[:, n:]
+        
+        # Bound the rest by an axis-aligned box (in Q frame)
+        # Sum of absolute values of rows
+        box_radius = jnp.sum(jnp.abs(G_rest), axis=1)
+        G_box = jnp.diag(box_radius)
+        
+        # Reconstruct generators in original frame
+        # G_new = Q @ [G_main, G_box]
+        G_new_proj = jnp.concatenate([G_main, G_box], axis=1)
+        G_new = Q @ G_new_proj
+        
+        # Result zonotope (c + shift is c_new)
+        return Zonotope(c_new, G_new)

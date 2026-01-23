@@ -2,7 +2,7 @@ from typing import List
 import jax
 from jax.tree_util import register_pytree_node_class
 import jax.numpy as jnp
-from typing import Tuple, Iterable
+from typing import Tuple, Iterable, Union, Optional
 from jaxtyping import ArrayLike
 import numpy as onp
 
@@ -87,7 +87,7 @@ class Interval:
     def transpose(self, *args) -> "Interval":
         return Interval(self.lower.transpose(*args), self.upper.transpose(*args))
 
-    def scale (self, factor: float | ArrayLike) -> "Interval":
+    def scale (self, factor: Union[float, ArrayLike]) -> "Interval":
         return icentpert(self.center, self.pert * factor)
 
     @property
@@ -125,7 +125,7 @@ class Interval:
         # dtype=np.dtype([('f1',float), ('f2', float)])).reshape(self.shape + (1,)).__repr__()
         return self.lower.__str__() + " <= x <= " + self.upper.__str__()
 
-    def __getitem__(self, i: slice | ArrayLike) -> "Interval":
+    def __getitem__(self, i: Union[slice, ArrayLike]) -> "Interval":
         return Interval(self.lower[i], self.upper[i])
 
     def __iter__(self):
@@ -139,7 +139,7 @@ class Interval:
 # HELPER FUNCTIONS
 
 
-def interval(lower: ArrayLike, upper: ArrayLike | None = None) -> Interval:
+def interval(lower: ArrayLike, upper: Optional[ArrayLike] = None) -> Interval:
     """interval: Helper to create a Interval from a lower and upper bound.
 
     Parameters
@@ -322,7 +322,7 @@ def i2ut(i: Interval) -> jax.Array:
     return jnp.concatenate((i.lower, i.upper))
 
 
-def ut2i(coordinate: jax.Array, n: int | None = None) -> Interval:
+def ut2i(coordinate: jax.Array, n: Optional[int] = None) -> Interval:
     """ut2i: Helper to convert an upper triangular coordinate in :math:`\\mathbb{R}\\times\\mathbb{R}` to an interval.
 
     Parameters
@@ -383,7 +383,7 @@ def iconcatenate(intervals: Iterable[Interval], axis: int = 0) -> Interval:
         jnp.concatenate([i.upper for i in intervals], axis=axis),
     )
 
-def scale (i: Interval, factor: float | ArrayLike) -> Interval:
+def scale (i: Interval, factor: Union[float, ArrayLike]) -> Interval:
     """Scale an interval by a given factor around its center.
 
     Parameters

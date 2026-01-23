@@ -14,13 +14,13 @@ from functools import partial
 jax.config.update('jax_enable_x64', True)
 
 from immrax.system import System
-from immrax.generator import AlthoffGirardReachability
+from immrax.generator import AlthoffGirardReachability, TaylorGirardReachability, LohnerReachability
 from immrax.generator.sets import (
     Zonotope, zonotope_from_interval,
     ConstrainedZonotope, constrained_zonotope_from_zonotope,
     PolynomialZonotope, polynomial_zonotope_from_interval,
 )
-from immrax.inclusion import interval
+from immrax.inclusion import interval, icentpert
 
 
 # --- Nonlinear Systems ---
@@ -73,7 +73,7 @@ def benchmark_reachability(algo, set0, num_steps: int, set_name: str):
     # Block until computation is done
     result.ts.block_until_ready()
     compile_time = time.perf_counter() - compile_start
-    print(f"done ({compile_time:.3f}s)")
+    print(f"done ({compile_time:.4f}s)")
 
     # Execution run (JIT-compiled, should be fast)
     print(f"    Executing...", end=" ", flush=True)
@@ -81,7 +81,7 @@ def benchmark_reachability(algo, set0, num_steps: int, set_name: str):
     result = jit_compute(set0, num_steps)
     result.ts.block_until_ready()
     exec_time = time.perf_counter() - exec_start
-    print(f"done ({exec_time:.4f}s)")
+    print(f"done ({exec_time:.6f}s)")
 
     # Get final hull width
     final_set = result[num_steps]
@@ -126,49 +126,60 @@ def plot_reach_sets(ax, reach_result, color, label, alpha=0.4):
         ax.add_patch(rect)
 
 
-def run_benchmarks():
+def run_benchmarks(alg, alg_kwargs):
     """Run benchmarks comparing set representations."""
     print("=" * 70)
-    print("REACHABILITY BENCHMARKS")
+    print(f"REACHABILITY BENCHMARKS {alg.__name__}")
     print("Comparing: Zonotope vs ConstrainedZonotope vs PolynomialZonotope")
-    print("Using: AlthoffGirardReachability with JIT compilation")
     print("=" * 70)
 
-    dt = 0.05
-    num_steps = 40
-    target_order = 2.0
-
     results = {}
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
+    
     # --- Van der Pol ---
     print("\n" + "-" * 70)
     print("[1/2] Van der Pol Oscillator (mu=0.5)")
     print("-" * 70)
 
-    vdp = VanDerPol(mu=0.5)
-    iv_vdp = interval(jnp.array([0.9, 0.0]), jnp.array([1.1, 0.2]))
+    vdp = VanDerPol(mu=1.)
+    # iv_vdp = interval(jnp.array([0.9, 0.0]), jnp.array([1.1, 0.2]))
+    iv_vdp = icentpert([-2., 0.], [0.1, 0.01]).scale(.5)
 
     z0 = zonotope_from_interval(iv_vdp)
     cz0 = constrained_zonotope_from_zonotope(z0)
     pz0 = polynomial_zonotope_from_interval(iv_vdp)
 
-    algo_vdp = AlthoffGirardReachability(vdp, dt=dt, target_order=target_order)
+    dt = 0.05
+    num_steps = round(7./dt)
+
+    algo_vdp = alg(vdp, dt=dt, **alg_kwargs)
 
     results['vdp_z'] = benchmark_reachability(algo_vdp, z0, num_steps, "Zonotope")
     results['vdp_cz'] = benchmark_reachability(algo_vdp, cz0, num_steps, "ConstrainedZonotope")
     results['vdp_pz'] = benchmark_reachability(algo_vdp, pz0, num_steps, "PolynomialZonotope")
 
-    ax = axes[0]
-    plot_reach_sets(ax, results['vdp_z']['result'], 'blue', 'Zonotope')
-    plot_reach_sets(ax, results['vdp_cz']['result'], 'green', 'ConstrainedZonotope')
-    plot_reach_sets(ax, results['vdp_pz']['result'], 'red', 'PolynomialZonotope')
-    ax.autoscale()
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    ax.set_title(f'Van der Pol (mu=0.5)\ndt={dt}, steps={num_steps}')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
+    # Plot VDP
+    fig1, axes1 = plt.subplots(1, 3, figsize=(18, 5))
+    methods = [('vdp_z', 'Zonotope', 'blue'), ('vdp_cz', 'ConstrainedZonotope', 'green'), ('vdp_pz', 'PolynomialZonotope', 'red')]
+    if alg == LohnerReachability:
+        methods = methods[:-1]
+    
+    for i, (key, name, color) in enumerate(methods):
+        ax = axes1[i]
+        plot_reach_sets(ax, results[key]['result'], color, name)
+        # Calculate area roughly or just show width
+        w = results[key]['hull_width']
+        ax.set_title(f'{name}\nWidth: [{w[0]:.3f}, {w[1]:.3f}]')
+        ax.set_xlabel('x')
+        if i == 0: ax.set_ylabel('y')
+        ax.grid(True, alpha=0.3)
+        ax.autoscale()
+    
+    fig1.suptitle(f'{alg.__name__} Van der Pol (mu=0.5), dt={dt}, steps={num_steps}')
+    plt.tight_layout()
+    filename = f'reachability_benchmark_vdp_{alg.__name__}.png'
+    plt.savefig(filename, dpi=150)
+    print(f"Saved plot to: {filename}")
+
 
     # --- Pendulum ---
     print("\n" + "-" * 70)
@@ -176,7 +187,8 @@ def run_benchmarks():
     print("-" * 70)
 
     pendulum = Pendulum(b=0.5)
-    iv_pend = interval(jnp.array([0.2, -0.1]), jnp.array([0.3, 0.1]))
+    # iv_pend = interval(jnp.array([0.2, -0.1]), jnp.array([0.3, 0.1]))
+    iv_pend = icentpert([0.25, 0.0], 0.05)
 
     z0_p = zonotope_from_interval(iv_pend)
     cz0_p = constrained_zonotope_from_zonotope(z0_p)
@@ -184,25 +196,31 @@ def run_benchmarks():
 
     dt_pend = 0.02
     num_steps_pend = 50
-    algo_pend = AlthoffGirardReachability(pendulum, dt=dt_pend, target_order=target_order)
+    algo_pend = alg(pendulum, dt=dt_pend, **alg_kwargs)
 
     results['pend_z'] = benchmark_reachability(algo_pend, z0_p, num_steps_pend, "Zonotope")
     results['pend_cz'] = benchmark_reachability(algo_pend, cz0_p, num_steps_pend, "ConstrainedZonotope")
     results['pend_pz'] = benchmark_reachability(algo_pend, pz0_p, num_steps_pend, "PolynomialZonotope")
 
-    ax = axes[1]
-    plot_reach_sets(ax, results['pend_z']['result'], 'blue', 'Zonotope')
-    plot_reach_sets(ax, results['pend_cz']['result'], 'green', 'ConstrainedZonotope')
-    plot_reach_sets(ax, results['pend_pz']['result'], 'red', 'PolynomialZonotope')
-    ax.autoscale()
-    ax.set_xlabel('theta')
-    ax.set_ylabel('omega')
-    ax.set_title(f'Damped Pendulum (b=0.5)\ndt={dt_pend}, steps={num_steps_pend}')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
+    # Plot Pendulum
+    fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5))
+    methods_pend = [('pend_z', 'Zonotope', 'blue'), ('pend_cz', 'ConstrainedZonotope', 'green'), ('pend_pz', 'PolynomialZonotope', 'red')]
 
+    for i, (key, name, color) in enumerate(methods_pend):
+        ax = axes2[i]
+        plot_reach_sets(ax, results[key]['result'], color, name)
+        w = results[key]['hull_width']
+        ax.set_title(f'{name}\nWidth: [{w[0]:.3f}, {w[1]:.3f}]')
+        ax.set_xlabel('theta')
+        if i == 0: ax.set_ylabel('omega')
+        ax.grid(True, alpha=0.3)
+        ax.autoscale()
+
+    fig2.suptitle(f'{alg.__name__} Damped Pendulum (b=0.5), dt={dt_pend}, steps={num_steps_pend}')
     plt.tight_layout()
-    plt.savefig('reachability_benchmark.png', dpi=150, bbox_inches='tight')
+    filename = f'reachability_benchmark_pend_{alg.__name__}.png'
+    plt.savefig(filename, dpi=150)
+    print(f"Saved plot to: {filename}")
 
     # --- Summary ---
     print("\n" + "=" * 70)
@@ -226,13 +244,11 @@ def run_benchmarks():
         print(f"{sys_name:<12} {set_type:<22} {r['compile_time']:<12.3f} {r['exec_time']:<12.4f} {speedup:<10.1f}x")
 
     print("=" * 70)
-    print("Saved plot to: reachability_benchmark.png")
-    print("=" * 70)
-
     plt.show()
 
     return results
 
 
 if __name__ == "__main__":
-    results = run_benchmarks()
+    for alg, alg_kwargs in [(TaylorGirardReachability, {'target_order': 20., 'taylor_order': 4})]:
+        results = run_benchmarks(alg, alg_kwargs)

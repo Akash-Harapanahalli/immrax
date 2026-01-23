@@ -242,17 +242,36 @@ class BaseSetGenerator(ReachableSetGenerator):
         Interval
             Enclosure of reachable states over [t, t+dt]
         """
-        # Initial guess: current set inflated slightly
+        # Initial guess
         R = Z.interval_hull().scale(1.1)
         dt_int = Interval(0.0, self.dt)
+        max_iters = 10
 
-        # Fixed 3 iterations of Picard
-        def body(i, R_curr):
+        def loop_cond(val):
+            i, _, converged = val
+            return (i < max_iters) & (~converged)
+
+        def loop_body(val):
+            i, R_curr, _ = val
+            # Picard operator: K(X) = x0 + [0,dt]*f(X)
             f_bound = natif(lambda x: self.sys.f(t, x, *f_args))(R_curr)
             R_next = Z.interval_hull() + dt_int * f_bound
-            return Interval(
+            
+            # Check inclusion: K(R_curr) <= R_curr
+            # Note: R_next is the result of the Picard operator
+            is_subset = jnp.all(R_next.lower >= R_curr.lower) & \
+                        jnp.all(R_next.upper <= R_curr.upper)
+                        
+            # If not subset, inflate to encourage convergence
+            R_union = Interval(
                 jnp.minimum(R_curr.lower, R_next.lower),
                 jnp.maximum(R_curr.upper, R_next.upper)
             )
+            R_new = R_union.scale(1.05)
+            
+            # Return next state
+            # If valid, keep R_curr (it works). If not, try R_new.
+            return (i + 1, jax.lax.cond(is_subset, lambda: R_curr, lambda: R_new), is_subset)
 
-        return lax.fori_loop(0, 3, body, R)
+        _, R_final, _ = lax.while_loop(loop_cond, loop_body, (0, R, False))
+        return R_final

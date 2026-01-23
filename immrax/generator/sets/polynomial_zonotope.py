@@ -505,8 +505,9 @@ class PolynomialZonotope:
         # For simplicity, we'll convert dependent to independent to reach target_total
         # and maintain fixed shapes by padding
 
-        # Strategy: Keep at most half as dependent, rest as independent
-        target_h = min(self.h, target_total // 2)
+        # Strategy: Keep half as dependent, rest as independent
+        # Fixed shape for JIT stability
+        target_h = target_total // 2
         target_q = target_total - target_h
 
         if current_total <= target_total:
