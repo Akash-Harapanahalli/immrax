@@ -65,13 +65,8 @@ class TaylorGirardReachability(BaseSetGenerator):
     def _taylor_map(self, t, x, f_args):
         """Compute Taylor expansion of the flow map at point x."""
         series = self._get_series(t, x, *f_args)
-        res = jnp.zeros_like(x)
-        dt_pow = 1.0
-        for k, term in enumerate(series):
-            if k > 0:
-                dt_pow *= self.dt
-            res = res + (term * dt_pow * inv_fact(k))
-        return res
+        kk = jnp.arange(len(series))
+        return jnp.sum(series * self.dt**kk * inv_fact(kk))
 
     def step(self, t: float, Z, f_args):
         """Perform one step of Taylor-Girard algorithm.

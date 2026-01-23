@@ -40,6 +40,7 @@ from .base import (
 from .lohner import LohnerReachability
 from .althoff_girard import AlthoffGirardReachability
 from .taylor_girard import TaylorGirardReachability
+from .taylor_model import TaylorModelReachability
 
 __all__ = [
     # Helper functions
@@ -56,4 +57,5 @@ __all__ = [
     "LohnerReachability",
     "AlthoffGirardReachability",
     "TaylorGirardReachability",
+    "TaylorModelReachability",
 ]

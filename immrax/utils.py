@@ -6,15 +6,8 @@ import jax
 from jax._src.traceback_util import api_boundary
 from jax._src.util import wraps
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as onp
-from pypoman import plot_polygon
-from scipy.spatial import HalfspaceIntersection
-import shapely.geometry as sg
-import shapely.ops as so
 
-import immrax as irx
 from immrax.inclusion import interval, Corner, Interval, all_corners, i2lu, i2ut, ut2i
 from immrax.system import Trajectory
 
@@ -51,13 +44,24 @@ def run_times(N: int, f: Callable, *args, **kwargs):
 # Plotting
 # ================================================================================
 
-sg_box = lambda x, xi=0, yi=1: sg.box(
-    x[xi].lower, x[yi].lower, x[xi].upper, x[yi].upper
-)
-sg_boxes = lambda xx, xi=0, yi=1: [sg_box(x, xi, yi) for x in xx]
+def _get_shapely():
+    """Lazy import of shapely."""
+    import shapely.geometry as sg
+    import shapely.ops as so
+    return sg, so
+
+
+def sg_box(x, xi=0, yi=1):
+    sg, _ = _get_shapely()
+    return sg.box(x[xi].lower, x[yi].lower, x[xi].upper, x[yi].upper)
+
+
+def sg_boxes(xx, xi=0, yi=1):
+    return [sg_box(x, xi, yi) for x in xx]
 
 
 def draw_sg_union(ax, boxes, **kwargs):
+    _, so = _get_shapely()
     shape = so.unary_union(boxes)
     xs, ys = shape.exterior.xy
     kwargs.setdefault("ec", "tab:blue")
@@ -76,6 +80,8 @@ def draw_iarrays(ax, xx, xi=0, yi=1, **kwargs):
 
 
 def draw_iarray_3d(ax, x, xi=0, yi=1, zi=2, **kwargs):
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
     Xl, Yl, Zl = x.lower[(xi, yi, zi),]
     Xu, Yu, Zu = x.upper[(xi, yi, zi),]
     poly_alpha = kwargs.pop("poly_alpha", 0.0)
@@ -122,9 +128,11 @@ def plot_interval_t(ax, tt, x, **kwargs):
 
 
 def draw_trajectory_2d(traj: Trajectory, vars=(0, 1), **kwargs):
+    import matplotlib.pyplot as plt
+
     n = traj.ys[0].shape[0] // 2
     y_int = [
-        irx.ut2i(jnp.array([y[vars[0]], y[vars[1]], y[vars[0] + n], y[vars[1] + n]]))
+        ut2i(jnp.array([y[vars[0]], y[vars[1]], y[vars[0] + n], y[vars[1] + n]]))
         for y in traj.ys
     ]  # TODO: fix indexing
     alpha = kwargs.pop("alpha", 0.4)
@@ -135,7 +143,10 @@ def draw_trajectory_2d(traj: Trajectory, vars=(0, 1), **kwargs):
 
 
 def draw_refined_trajectory_2d(traj: Trajectory, H: jnp.ndarray, vars=(0, 1), **kwargs):
-    ys_int = [irx.ut2i(y) for y in traj.ys]
+    from scipy.spatial import HalfspaceIntersection
+    from pypoman import plot_polygon
+
+    ys_int = [ut2i(y) for y in traj.ys]
     color = kwargs.pop("color", "tab:blue")
     for bound in ys_int:
         dx = 1e-3 * jnp.ones_like(bound.lower)
@@ -256,7 +267,7 @@ def get_sparse_corners(x: Interval, verbose=False, **kwargs):
     # Static value usage here.
     ic = onp.isclose(x.lower.reshape(-1), x.upper.reshape(-1), **kwargs)
     cs = [
-        irx.Corner(p)
+        Corner(p)
         for p in product(*[(0,) if ic[i] else (0, 1) for i in range(len(ic))])
     ]
     if verbose:

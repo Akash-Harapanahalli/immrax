@@ -87,7 +87,7 @@ class Interval:
     def transpose(self, *args) -> "Interval":
         return Interval(self.lower.transpose(*args), self.upper.transpose(*args))
 
-    def scale (self, factor: float|ArrayLike) -> "Interval":
+    def scale (self, factor: float | ArrayLike) -> "Interval":
         return icentpert(self.center, self.pert * factor)
 
     @property
@@ -383,7 +383,7 @@ def iconcatenate(intervals: Iterable[Interval], axis: int = 0) -> Interval:
         jnp.concatenate([i.upper for i in intervals], axis=axis),
     )
 
-def scale (i: Interval, factor: float|ArrayLike) -> Interval:
+def scale (i: Interval, factor: float | ArrayLike) -> Interval:
     """Scale an interval by a given factor around its center.
 
     Parameters

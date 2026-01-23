@@ -26,6 +26,7 @@ from .taylor_model import (
     taylor_model,
     taylor_model_from_interval,
     taylor_model_from_function,
+    taylor_model_concatenate,
 )
 
 __all__ = [
@@ -51,4 +52,5 @@ __all__ = [
     "taylor_model",
     "taylor_model_from_interval",
     "taylor_model_from_function",
+    "taylor_model_concatenate",
 ]

@@ -24,6 +24,8 @@ from .sets import (
     TaylorModel,
     taylor_model,
     taylor_model_from_interval,
+    taylor_model_from_function,
+    taylor_model_concatenate,
 )
 
 from .algorithms import (
@@ -62,6 +64,8 @@ __all__ = [
     "TaylorModel",
     "taylor_model",
     "taylor_model_from_interval",
+    "taylor_model_from_function",
+    "taylor_model_concatenate",
     # Reachability data structures
     "ReachableSets",
     "GenericReachSets",

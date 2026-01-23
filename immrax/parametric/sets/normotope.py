@@ -2,7 +2,10 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike, Float
-from matplotlib.axes import Axes
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 from ...inclusion import Interval, interval, icentpert, i2centpert, mjacM
 from ...system import System
@@ -82,7 +85,7 @@ class Normotope(Parametope):
         )
 
     def plot_projection(
-        self, ax: Axes, xi: int = 0, yi: int = 1, rescale: bool = False, **kwargs
+        self, ax: "Axes", xi: int = 0, yi: int = 1, rescale: bool = False, **kwargs
     ) -> None:
         """Plot the projection of the normotope onto the xi-yi plane."""
         raise NotImplementedError(
@@ -211,7 +214,7 @@ class LinfNormotope(Normotope):
         n = self.alpha.shape[0]
         return Polytope(self.ox, self.alpha, jnp.ones(2 * n) * self.y)
 
-    def plot_projection(self, ax: Axes, xi=0, yi=1, rescale=False, **kwargs) -> None:
+    def plot_projection(self, ax: "Axes", xi=0, yi=1, rescale=False, **kwargs) -> None:
         self.to_polytope().plot_projection(ax, xi, yi, rescale, **kwargs)
 
     @classmethod
@@ -266,7 +269,7 @@ class L1Normotope(Normotope):
         S = jnp.array(list(product(*[[1, -1]] * n)))
         return Polytope(self.ox, S @ self.alpha, jnp.ones(2 * 2**n) * self.y)
 
-    def plot_projection(self, ax: Axes, xi=0, yi=1, rescale=False, **kwargs) -> None:
+    def plot_projection(self, ax: "Axes", xi=0, yi=1, rescale=False, **kwargs) -> None:
         self.to_polytope().plot_projection(ax, xi, yi, rescale, **kwargs)
 
     @classmethod
@@ -323,7 +326,7 @@ class L2Normotope(Normotope):
     #     return Polytope (self.ox, self.alpha, jnp.ones(2*n)*self.y)
 
     def plot_projection(
-        self, ax: Axes, xi: int = 0, yi: int = 1, rescale: bool = False, **kwargs
+        self, ax: "Axes", xi: int = 0, yi: int = 1, rescale: bool = False, **kwargs
     ) -> None:
         # self.to_polytope().plot_projection(ax, xi, yi, rescale, **kwargs)
         Ellipsoid(self.ox, self.alpha / self.y, jnp.array([0.0, 1.0])).plot_projection(
