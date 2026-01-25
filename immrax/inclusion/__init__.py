@@ -36,6 +36,9 @@ from .jacobian import (
     mjacM,
 )
 
+from . import tm as tm
+from .tm import nattm
+
 __all__ = [
     "Interval",
     "interval",
@@ -52,6 +55,8 @@ __all__ = [
     "interval_union",
     "nif",
     "natif",
+    "tm",
+    "nattm",
     "jacM",
     "jacif",
     "custom_if",

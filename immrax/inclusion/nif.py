@@ -141,7 +141,8 @@ def _add_passthrough_to_registry(primitive: Primitive) -> None:
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
 _add_passthrough_to_registry(lax.slice_p)
-_add_passthrough_to_registry(lax.split_p)
+if hasattr(lax, 'split_p'):
+    _add_passthrough_to_registry(lax.split_p)
 _add_passthrough_to_registry(lax.dynamic_slice_p)
 _add_passthrough_to_registry(lax.squeeze_p)
 _add_passthrough_to_registry(lax.transpose_p)
@@ -168,7 +169,8 @@ _add_passthrough_to_registry(lax.reduce_sum_p)
 _add_passthrough_to_registry(lax.pad_p)
 _add_passthrough_to_registry(lax.ne_p)
 _add_passthrough_to_registry(lax.lt_p)
-_add_passthrough_to_registry(lax.lt_to_p)
+if hasattr(lax, 'lt_to_p'):
+    _add_passthrough_to_registry(lax.lt_to_p)
 _add_passthrough_to_registry(debug_callback_p)
 
 """
@@ -374,7 +376,8 @@ def _inclusion_square_p(x: Interval) -> Interval:
     return _inclusion_integer_pow_p(x, 2)
 
 
-inclusion_registry[lax.square_p] = _inclusion_square_p
+if hasattr(lax, 'square_p'):
+    inclusion_registry[lax.square_p] = _inclusion_square_p
 
 
 def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
@@ -527,7 +530,7 @@ _add_passthrough_to_registry(lax.atan_p)
 
 def _inclusion_asin_p(x: Interval, accuracy=None) -> Interval:
     return Interval(
-        lax.arcsin(x.lower, accuracy=accuracy), lax.arcsin(x.upper, accuracy=accuracy)
+        lax.asin(x.lower), lax.asin(x.upper)
     )
 
 
@@ -541,6 +544,35 @@ def _inclusion_sqrt_p(x: Interval, accuracy=None) -> Interval:
 
 
 inclusion_registry[lax.sqrt_p] = _inclusion_sqrt_p
+
+
+def _inclusion_rsqrt_p(x: Interval, accuracy=None) -> Interval:
+    # rsqrt = 1/sqrt(x) is monotonically decreasing
+    # Map [a, b] -> [rsqrt(b), rsqrt(a)]
+    # Handle domain x > 0.
+    ol = jnp.where((x.upper <= 0), -jnp.inf, lax.rsqrt(x.upper)) # if upper <= 0, invalid. if lower <= 0, rsqrt(lower) inv.
+    # Actually, interval semantics: if input contains invalid points, result is usually entire real line or restricted.
+    # Existing sqrt uses -inf for invalid.
+    # rsqrt(0) -> inf.
+    # if x.lower <= 0, rsqrt(x.lower) is usually nan/inf. 
+    # Let's match JAX behavior but swap bounds.
+    
+    # Simple swap:
+    lower_r = lax.rsqrt(x.upper)
+    upper_r = lax.rsqrt(x.lower)
+    
+    # Handle negative inputs:
+    # If upper < 0, result is invalid.
+    ol = jnp.where(x.upper < 0, -jnp.inf, lower_r)
+    ou = jnp.where(x.lower < 0, jnp.inf, upper_r)
+    
+    return Interval(ol, ou)
+
+if hasattr(lax, 'rsqrt_p'):
+    inclusion_registry[lax.rsqrt_p] = _inclusion_rsqrt_p
+else:
+    # Fallback if rsqrt_p is not directly exposed (it usually is)
+    pass
 
 
 def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
