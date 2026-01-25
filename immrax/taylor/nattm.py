@@ -27,7 +27,7 @@ from jax.extend.core import Primitive
 from jax._src.debugging import debug_callback_p
 
 from immrax.inclusion.interval import Interval, interval, icentpert
-from immrax.generator.sets.taylor_model import (
+from immrax.taylor.taylor_model import (
     TaylorModel,
     taylor_model,
     taylor_model_concatenate,
@@ -487,10 +487,41 @@ def _tm_univariate(
     # We need to map over the batch dimension of x (n output dims)
     # c is (n,)
     
+    # Map primitive to corresponding jnp function for evaluation
+    # This avoids issues with primitive.bind requiring extra params like accuracy
+    _prim_to_func = {
+        lax.sin_p: jnp.sin,
+        lax.cos_p: jnp.cos,
+        lax.tan_p: jnp.tan,
+        lax.exp_p: jnp.exp,
+        lax.log_p: jnp.log,
+        lax.log1p_p: jnp.log1p,
+        lax.tanh_p: jnp.tanh,
+        lax.sqrt_p: jnp.sqrt,
+        lax.asin_p: jnp.arcsin,
+        lax.atan_p: jnp.arctan,
+    }
+
+    # Get the function for this primitive
+    if hasattr(primitive_p, 'bind'):
+        # Check if it's a known primitive
+        prim_func = _prim_to_func.get(primitive_p, None)
+        if prim_func is None:
+            # Fall back to using the primitive with try/except
+            def prim_func(v):
+                try:
+                    return primitive_p.bind(v)
+                except TypeError:
+                    # Try with accuracy=None for newer JAX
+                    return primitive_p.bind(v, accuracy=None)
+    else:
+        # It's a custom object with a bind method (like ReciprocalPrimitive)
+        prim_func = lambda v: primitive_p.bind(v)
+
     def get_coeffs(val):
         # val is scalar
         def scalar_f(v):
-             return jnp.sum(primitive_p.bind(v))
+             return jnp.sum(prim_func(v))
 
         # Compute derivatives up to order
         # derivs = [f(c), f'(c), f''(c), ...]
@@ -499,7 +530,7 @@ def _tm_univariate(
         for _ in range(order):
             g = jax.grad(g)
             derivs.append(g(val))
-            
+
         return jnp.array(derivs)
 
     # Vectorize over n output dimensions
@@ -561,25 +592,23 @@ def _tm_univariate(
     
     def get_deriv_bound(i):
         # We need to differentiate the primitive with respect to its input.
-        # primitive_p.bind(v) is what we differentiate.
-        
+        # Use prim_func which maps to jnp functions to avoid bind issues.
+
         def scalar_f(v):
             # v is scalar
             # We assume primitive maps scalar to scalar for univariate
-            # We need to reshape v to input shape if needed? 
-            # univariate usually means elementwise.
-            return jnp.sum(primitive_p.bind(v))
+            return jnp.sum(prim_func(v))
 
         # We need the (order+1)-th derivative
         # We use a loop of grads
         g = scalar_f
         for _ in range(order + 1):
             g = jax.grad(g)
-            
+
         # Evaluate g on the interval hull of component i
         # interval hull component i is interval(lower[i], upper[i])
         iv_i = interval(x_hull.lower[i], x_hull.upper[i])
-        
+
         return natif(g)(iv_i)
 
     # Compute bounds for each dimension

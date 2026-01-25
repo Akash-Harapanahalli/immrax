@@ -35,6 +35,8 @@ finally:
 from . import embedding as embedding
 from .embedding import *
 
+from . import taylor as taylor
+from .taylor import *
 
 from . import refinement as refinement
 from . import utils as utils

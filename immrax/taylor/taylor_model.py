@@ -14,8 +14,9 @@ from jax.experimental import jet
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike
 
-from .zonotope import Zonotope
-from ...inclusion import Interval, interval, icentpert
+from immrax.inclusion import Interval, interval, icentpert
+
+# Zonotope is imported lazily in to_zonotope() to avoid circular import
 
 
 # Cache for canonical exponent structures
@@ -200,13 +201,13 @@ class TaylorModel:
         c = self.coeffs[idx]
         if c.ndim == 1:
             c = c[None, :]
-            
+
         rem = self.remainder[idx]
         # Intervals might return scalars on indexing depending on impl
         # If scalar, wrap in 1D interval?
         # Implemented Interval sets lower/upper. Indexing them gives scalars/arrays.
         # Interval constructor expects arrays.
-        
+
         # Let's ensure remainder is properly formatted if scalar
         if hasattr(rem, 'lower') and rem.lower.ndim == 0:
              # Re-wrap scalar interval into 1D interval?
@@ -220,13 +221,13 @@ class TaylorModel:
              # Checks: assert remainder.lower.shape == (n,)
              # So if n=1, remainder must be (1,).
              pass
-             
+
         # If rem is scalar interval, we need to reshape it to (1,)
         # Check if rem has shape.
         if hasattr(rem, 'shape') and rem.shape == ():
              # It's a scalar interval.
              # We need to reshape its components?
-             # immrax Interval might not support reshape directly. 
+             # immrax Interval might not support reshape directly.
              # We can construct new interval.
              rem = interval(rem.lower[None], rem.upper[None])
 
@@ -647,11 +648,18 @@ class TaylorModel:
 
     # --- Conversion methods ---
 
-    def to_zonotope(self) -> Zonotope:
+    def to_zonotope(self):
         """Convert to a zonotope (overapproximation).
 
         Each monomial term becomes a generator.
+
+        Returns
+        -------
+        Zonotope
+            Zonotope overapproximation of the Taylor model
         """
+        # Lazy import to avoid circular dependency
+        from immrax.generator.sets.zonotope import Zonotope
         # Center is the constant term plus remainder center
         remainder_center = self.remainder.center
         remainder_radius = self.remainder.pert
@@ -1016,11 +1024,11 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
 
     # Coefficients: center for constant, radius*I for linear, 0 otherwise
     coeffs = jnp.zeros((n, num_monomials), dtype=center.dtype)
-    
+
     # Constant term (all zeros exponent)
     zero_idx = jnp.where(jnp.sum(exponents, axis=0) == 0)[0][0]
     coeffs = coeffs.at[:, zero_idx].set(center)
-    
+
     # Linear terms
     for i in range(n):
         # Term corresponding to e_i
@@ -1082,10 +1090,10 @@ def taylor_model_from_function(
     # Compute Taylor coefficients using recursive jet
     # This gives us the full derivative tensor up to max_order
     # tensor[k1, k2, ..., kd] corresponds to coeff for x1^k1 * ... * xd^kd
-    
+
     if max_order == 0:
         return TaylorModel(
-            f(domain_center).reshape(-1, 1), 
+            f(domain_center).reshape(-1, 1),
             jnp.zeros((d, 1), dtype=jnp.int32),
             icentpert(jnp.zeros(n), jnp.zeros(n)),
             domain_center,
@@ -1098,18 +1106,18 @@ def taylor_model_from_function(
     # T_1 = jacfwd(f)(x)
     # T_2 = jacfwd(jacfwd(f))(x)
     # ...
-    
+
     # Compute higher order derivatives using jacfwd loop
     # We go up to max_order + 1 to compute the Lagrange remainder term
-    
+
     deriv_tensors = []
-    
+
     # Order 0
     val = f(domain_center)
     if val.ndim == 0:
         val = val[None] # (1,) if scalar
-    deriv_tensors.append(val) 
-    
+    deriv_tensors.append(val)
+
     # Ensure we strictly differentiate a vector-valued function
     # to maintain consistent tensor shape (n, d, d...)
     if f(domain_center).ndim == 0:
@@ -1127,15 +1135,15 @@ def taylor_model_from_function(
             deriv_tensors.append(tensor)
 
     coeffs = jnp.zeros((n, num_monomials), dtype=f_center.dtype)
-    
+
     for i in range(num_monomials):
         exp = exponents[:, i] # (d,)
         order = jnp.sum(exp)
-        
+
         # Only compute coeffs up to max_order
         if order > max_order:
              continue
-        
+
         if order == 0:
             c = deriv_tensors[0]
         else:
@@ -1143,47 +1151,47 @@ def taylor_model_from_function(
             for var_idx in range(d):
                 count = exp[var_idx]
                 idx_list.extend([var_idx] * int(count))
-            
+
             tensor = deriv_tensors[int(order)]
             full_idx = (slice(None), *idx_list)
             c = tensor[full_idx] # (n,)
 
         fact_prod = jnp.prod(jax.scipy.special.gamma(exp + 1))
-        
+
         scale = jnp.prod(domain_radius ** exp) / fact_prod
-        
+
         coeffs = coeffs.at[:, i].set(c * scale)
 
     # Estimate remainder using Lagrange remainder bound:
     # |R_n(x)| <= (1/(n+1)!) * sup |D^{n+1}f(xi)| * |x-c|^{n+1}
     # We approximate sup |D^{n+1}f(xi)| with |D^{n+1}f(c)| (centered evaluation)
     # Ideally this should be evaluated over the interval domain.
-    
+
     next_order = max_order + 1
     # Tensor of shape (n, d, d, ..., d) (k+1 'd's)
     D_next = deriv_tensors[next_order]
-    
+
     # Take absolute value for bounding
     abs_D_next = jnp.abs(D_next) # (n, d, ..., d)
-    
+
     # Contract with radius vector r (d,) repeatedly (next_order times)
     # We can use a loop or reshape tricks.
     # We want sum_{j1...j_{k+1}} |T_{...}| * r_{j1} * ... * r_{j_{k+1}}
-    
+
     current_bound = abs_D_next
     for _ in range(next_order):
         # Contract last dimension with domain_radius
         # current is (n, ..., d)
-        current_bound = jnp.dot(current_bound, domain_radius) 
+        current_bound = jnp.dot(current_bound, domain_radius)
         # jnp.dot sums product over last axis of a and first of b (b is 1D)
         # result reduces rank by 1.
-    
+
     # current_bound is now (n,)
-    
+
     # Divide by (n+1)!
     fact = jax.scipy.special.gamma(next_order + 1)
     remainder_bound = current_bound / fact
-    
+
     # Ensure non-zero for safety if needed, though 0 is valid for exact polynomials
     remainder = icentpert(jnp.zeros(n, dtype=f_center.dtype), remainder_bound)
 

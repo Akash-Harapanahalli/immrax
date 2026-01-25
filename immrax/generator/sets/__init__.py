@@ -21,7 +21,9 @@ from .polynomial_zonotope import (
     polynomial_zonotope_cartesian_product,
 )
 
-from .taylor_model import (
+# Re-export from taylor module for backward compatibility
+# Import directly from submodule to avoid circular import
+from immrax.taylor.taylor_model import (
     TaylorModel,
     taylor_model,
     taylor_model_from_interval,
