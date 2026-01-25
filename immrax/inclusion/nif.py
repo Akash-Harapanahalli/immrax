@@ -257,7 +257,7 @@ def _inclusion_add_p(x: Interval, y: Interval) -> Interval:
 inclusion_registry[lax.add_p] = _inclusion_add_p
 inclusion_registry[ad_util.add_any_p] = _inclusion_add_p
 Interval.__add__ = _inclusion_add_p
-
+Interval.__radd__ = _inclusion_add_p
 
 def _inclusion_sub_p(x: Interval, y: Interval) -> Interval:
     if isinstance(x, Interval) and isinstance(y, Interval):
@@ -272,6 +272,7 @@ def _inclusion_sub_p(x: Interval, y: Interval) -> Interval:
 
 inclusion_registry[lax.sub_p] = _inclusion_sub_p
 Interval.__sub__ = _inclusion_sub_p
+Interval.__rsub__ = _inclusion_sub_p
 
 
 def _inclusion_neg_p(x: Interval) -> Interval:
@@ -306,6 +307,7 @@ def _inclusion_mul_p(x: Interval, y: Interval) -> Interval:
 
 inclusion_registry[lax.mul_p] = _inclusion_mul_p
 Interval.__mul__ = _inclusion_mul_p
+Interval.__rmul__ = _inclusion_mul_p
 
 
 def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
@@ -321,6 +323,7 @@ def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
 
 inclusion_registry[lax.div_p] = _inclusion_div_p
 Interval.__truediv__ = _inclusion_div_p
+Interval.__rtruediv__ = _inclusion_div_p
 
 
 def _inclusion_reciprocal_p(x: Interval) -> Interval:
@@ -640,6 +643,7 @@ def _inclusion_log1p_p(x: Interval, accuracy=None) -> Interval :
 inclusion_registry[lax.log1p_p] = _inclusion_log1p_p
 
 Interval.__matmul__ = jit(natif(jnp.matmul))
+Interval.__rmatmul__ = jit(natif(jnp.matmul))
 
 # Some linear algebra routines
 
