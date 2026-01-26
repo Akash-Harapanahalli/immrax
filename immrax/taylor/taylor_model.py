@@ -27,27 +27,14 @@ def _get_canonical_exponents(d: int, max_order: int) -> Array:
 
 
 def _generate_exponents_impl(d: int, max_order: int) -> Array:
-    """Generate all exponent multi-indices up to given order (implementation)."""
-    from itertools import combinations_with_replacement
+    """Generate all exponent multi-indices up to given order."""
+    from itertools import product
 
-    exponents_list = []
-    for total in range(max_order + 1):
-        for combo in combinations_with_replacement(range(d), total):
-            exp = [0] * d
-            for idx in combo:
-                exp[idx] += 1
-            exponents_list.append(exp)
-
-    # Remove duplicates
-    seen = set()
-    unique_exponents = []
-    for exp in exponents_list:
-        key = tuple(exp)
-        if key not in seen:
-            seen.add(key)
-            unique_exponents.append(exp)
-
-    return jnp.array(unique_exponents, dtype=jnp.int32).T
+    exponents = [
+        exp for exp in product(range(max_order + 1), repeat=d)
+        if sum(exp) <= max_order
+    ]
+    return jnp.array(exponents, dtype=jnp.int32).T
 
 
 @register_pytree_node_class
@@ -349,44 +336,44 @@ class TaylorModel:
         """
         # Lazy import to avoid circular dependency
         from immrax.generator.sets.zonotope import Zonotope
+
         # Center is the constant term plus remainder center
         remainder_center = self.remainder.center
         remainder_radius = self.remainder.pert
 
-        ox = self.constant_term + remainder_center
+        # Vectorized computation of monomial properties
+        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
+        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)  # (m,)
 
-        # Non-constant terms become generators
-        generators_list = []
+        # For even monomials (non-constant), we shift center by 0.5*coeff
+        # and scale generators by 0.5
+        even_non_const = ~has_odd & ~is_constant  # (m,)
+        center_shift = jnp.sum(
+            jnp.where(even_non_const[None, :], 0.5 * self.coeffs, 0.0), axis=1
+        )  # (n,)
 
-        for i in range(self.num_monomials):
-            exp_i = self.exponents[:, i]
-            coeff_i = self.coeffs[:, i]
+        ox = self.constant_term + remainder_center + center_shift
 
-            if jnp.all(exp_i == 0):
-                continue  # Skip constant term
+        # Generator scaling: 0.5 for even non-constant, 1.0 for odd
+        gen_scale = jnp.where(even_non_const, 0.5, 1.0)  # (m,)
 
-            # Monomial range over [-1,1]^d
-            has_odd = jnp.any(exp_i % 2 == 1)
-            if has_odd:
-                # Range is [-1, 1], generator is coeff_i
-                generators_list.append(coeff_i)
-            else:
-                # Range is [0, 1], need to shift
-                # [0,1] = 0.5 + 0.5*[-1,1]
-                ox = ox + 0.5 * coeff_i
-                generators_list.append(0.5 * coeff_i)
+        # Non-constant generators from polynomial terms
+        non_const_mask = ~is_constant  # (m,)
+        poly_generators = jnp.where(
+            non_const_mask[None, :], self.coeffs * gen_scale[None, :], 0.0
+        )  # (n, m)
 
-        # Add remainder as axis-aligned generators
-        for i in range(self.n):
-            gen = jnp.zeros(self.n, dtype=self.dtype)
-            gen = gen.at[i].set(remainder_radius[i])
-            if remainder_radius[i] > 1e-12:
-                generators_list.append(gen)
+        # Remainder generators (axis-aligned)
+        remainder_generators = jnp.diag(remainder_radius)  # (n, n)
 
-        if len(generators_list) > 0:
-            G = jnp.stack(generators_list, axis=1)
-        else:
-            G = jnp.zeros((self.n, 0), dtype=self.dtype)
+        # Concatenate all generators
+        G = jnp.concatenate([poly_generators, remainder_generators], axis=1)
+
+        # Remove zero generators (columns with near-zero norm)
+        col_norms = jnp.linalg.norm(G, axis=0)
+        nonzero_mask = col_norms > 1e-12
+        # For JIT compatibility, keep all columns but zero out small ones
+        G = jnp.where(nonzero_mask[None, :], G, 0.0)
 
         return Zonotope(ox, G)
 
@@ -509,28 +496,30 @@ class TaylorModel:
         TaylorModel
             Reduced order Taylor model (overapproximation)
         """
-        if target_order >= self.order:
-            return self
-
         # Separate terms to keep and terms to absorb
-        term_orders = jnp.sum(self.exponents, axis=0)
-        keep_mask = term_orders <= target_order
+        term_orders = jnp.sum(self.exponents, axis=0)  # (m,)
+        keep_mask = term_orders <= target_order  # (m,)
+        absorb_mask = ~keep_mask  # (m,)
 
-        # Bound absorbed terms
-        absorbed_remainder = interval(
-            jnp.zeros(self.n, dtype=self.dtype),
-            jnp.zeros(self.n, dtype=self.dtype)
-        )
+        # Vectorized monomial bounds for absorbed terms
+        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)  # (m,)
+        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
+        mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))  # (m,)
+        mono_upper = jnp.ones(self.num_monomials)  # (m,)
 
-        for i in range(self.num_monomials):
-            if term_orders[i] > target_order:
-                exp_i = self.exponents[:, i]
-                coeff_i = self.coeffs[:, i]
+        # Only absorb terms above target_order
+        absorb_coeffs = jnp.where(absorb_mask[None, :], self.coeffs, 0.0)  # (n, m)
 
-                # Bound this monomial
-                mono_bound = _bound_monomial(exp_i)
-                term_bound = interval(coeff_i, coeff_i) * mono_bound
-                absorbed_remainder = absorbed_remainder + term_bound
+        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (n, m)
+        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (n, m)
+
+        term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]  # (n, m)
+        term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]  # (n, m)
+
+        absorbed_lower = jnp.sum(term_lower, axis=1)  # (n,)
+        absorbed_upper = jnp.sum(term_upper, axis=1)  # (n,)
+
+        absorbed_remainder = interval(absorbed_lower, absorbed_upper)
 
         # New remainder includes absorbed terms
         new_remainder = self.remainder + absorbed_remainder
@@ -711,21 +700,25 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
     exponents = _generate_exponents(n, order)
     num_monomials = exponents.shape[1]
 
-    # Coefficients: center for constant, radius*I for linear, 0 otherwise
-    coeffs = jnp.zeros((n, num_monomials), dtype=center.dtype)
+    # Vectorized coefficient computation
+    # Constant term: where sum(exponents) == 0
+    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
 
-    # Constant term (all zeros exponent)
-    zero_idx = jnp.where(jnp.sum(exponents, axis=0) == 0)[0][0]
-    coeffs = coeffs.at[:, zero_idx].set(center)
+    # Linear terms: where exponents == e_i for each dimension i
+    # A term is linear in dimension i if exponents[:, j] == e_i
+    eye_n = jnp.eye(n, dtype=jnp.int32)  # (n, n)
+    # is_linear[i, j] = True if monomial j is x_i (linear in dim i only)
+    # Compare exponents (d, m) with each unit vector e_i, reduce over d dimension
+    is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (n, m)
 
-    # Linear terms
-    for i in range(n):
-        # Term corresponding to e_i
-        target = jnp.eye(n, dtype=jnp.int32)[i]
-        matches = jnp.all(exponents == target[:, None], axis=0)
-        idx = jnp.where(matches)[0]
-        if len(idx) > 0:
-            coeffs = coeffs.at[i, idx[0]].set(radius[i])
+    # Build coefficients matrix
+    # Constant contribution: center broadcasted to constant term column
+    const_coeffs = jnp.where(is_constant[None, :], center[:, None], 0.0)  # (n, m)
+
+    # Linear contribution: radius[i] for the x_i term in row i
+    linear_coeffs = jnp.where(is_linear, radius[:, None], 0.0)  # (n, m)
+
+    coeffs = const_coeffs + linear_coeffs
 
     remainder = interval(jnp.zeros(n, dtype=center.dtype))
 

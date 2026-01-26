@@ -195,6 +195,25 @@ def get_half_intervals(x: Interval, N=1, ut=False):
 # Math
 # ================================================================================
 
+
+def fact(n):
+    """Compute factorial using log-gamma for numerical stability.
+
+    JIT-compatible factorial computation using JAX's lgamma.
+    """
+    from jax import lax
+    return lax.exp(lax.lgamma(n + 1.))
+
+
+def inv_fact(n):
+    """Compute inverse factorial using log-gamma for numerical stability.
+
+    JIT-compatible inverse factorial computation using JAX's lgamma.
+    """
+    from jax import lax
+    return lax.exp(-lax.lgamma(n + 1.))
+
+
 # @partial(jax.jit,static_argnums=(1,))
 def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
     n = len(x) // 2

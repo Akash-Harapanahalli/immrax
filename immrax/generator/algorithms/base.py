@@ -15,19 +15,8 @@ from typing import Any, Callable
 
 from ...system import System
 from ...inclusion import Interval, natif
+from ...utils import fact, inv_fact
 from ..sets import Zonotope
-
-
-# --- Helper Functions ---
-
-def fact(n):
-    """Compute factorial using log-gamma for numerical stability."""
-    return lax.exp(lax.lgamma(n + 1.))
-
-
-def inv_fact(n):
-    """Compute inverse factorial using log-gamma for numerical stability."""
-    return lax.exp(-lax.lgamma(n + 1.))
 
 
 def prolongation(f: Callable, p: int) -> Callable:

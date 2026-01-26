@@ -28,6 +28,7 @@ from jax.extend.core import Primitive
 from jax._src.debugging import debug_callback_p
 
 from immrax.inclusion.interval import Interval, interval, icentpert
+from immrax.utils import fact, inv_fact
 from immrax.taylor.taylor_model import (
     TaylorModel,
     taylor_model,
@@ -38,58 +39,34 @@ from immrax.taylor.taylor_model import (
     _merge_taylor_terms,
 )
 
-# Move bound_polynomial logic here as helper
+# Move bound_polynomial logic here as helper (JIT-compatible vectorized version)
 def _bound_polynomial(tm: TaylorModel) -> Interval:
     """Bound the polynomial part over the domain.
-    
-    Uses Horner-like evaluation for 1D case to preserve correlations.
-    Falls back to term-by-term for multivariate case.
+
+    Fully vectorized for JIT compatibility.
     """
-    if tm.d == 1:
-        return _bound_polynomial_horner_1d(tm)
-    else:
-        return _bound_polynomial_termwise(tm)
+    # Monomial bounds over [-1, 1]^d:
+    # - If any exponent is odd: range is [-1, 1]
+    # - If all exponents are even (nonzero): range is [0, 1]
+    # - Constant term (all zero): range is [1, 1]
+    has_odd = jnp.any(tm.exponents % 2 == 1, axis=0)  # (m,)
+    is_constant = jnp.all(tm.exponents == 0, axis=0)  # (m,)
 
-def _bound_polynomial_horner_1d(tm: TaylorModel) -> Interval:
-    """Bound 1D polynomial using Horner's method for tighter bounds."""
-    # Sort monomials by degree (descending)
-    degrees = tm.exponents[0, :]  # 1D, so just first row
-    max_deg = int(jnp.max(degrees))
+    mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))  # (m,)
+    mono_upper = jnp.ones(tm.num_monomials)  # (m,)
 
-    # Build coefficient array indexed by degree
-    poly_coeffs = jnp.zeros((tm.n, max_deg + 1), dtype=tm.dtype)
-    for i in range(tm.num_monomials):
-        deg = int(degrees[i])
-        poly_coeffs = poly_coeffs.at[:, deg].add(tm.coeffs[:, i])
+    # For each term, bound is coeff * [mono_lower, mono_upper]
+    # Handle positive/negative coeffs separately
+    c_pos = jnp.maximum(tm.coeffs, 0.0)  # (n, m)
+    c_neg = jnp.minimum(tm.coeffs, 0.0)  # (n, m)
 
-    # Horner's method: p(x) = c_0 + x*(c_1 + x*(c_2 + ...))
-    # Evaluated on interval [-1, 1]
-    x_interval = icentpert(jnp.array([0.0]), jnp.array([1.0]))  # [-1, 1]
+    term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]  # (n, m)
+    term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]  # (n, m)
 
-    # Start from highest degree
-    result = interval(poly_coeffs[:, max_deg])
-    for deg in range(max_deg - 1, -1, -1):
-        # result = c_deg + x * result
-        result = result * x_interval[0] + interval(poly_coeffs[:, deg])
+    result_lower = jnp.sum(term_lower, axis=1)  # (n,)
+    result_upper = jnp.sum(term_upper, axis=1)  # (n,)
 
-    return result
-
-def _bound_polynomial_termwise(tm: TaylorModel) -> Interval:
-    """Bound polynomial term-by-term (conservative for multivariate)."""
-    result = interval(jnp.zeros(tm.n, dtype=tm.dtype))
-
-    for i in range(tm.num_monomials):
-        exp_i = tm.exponents[:, i]
-        coeff_i = tm.coeffs[:, i]
-
-        # Bound monomial over [-1, 1]^d
-        mono_bound = _bound_monomial(exp_i)  # scalar interval
-
-        # Multiply by coefficient (vector)
-        term_bound = interval(coeff_i, coeff_i) * mono_bound
-        result = result + term_bound
-
-    return result
+    return interval(result_lower, result_upper)
 
 TaylorModel._bound_polynomial = _bound_polynomial
 
@@ -130,9 +107,9 @@ def nattm(
         Natural Taylor Model Function of f
     """
 
-    # Note: Cannot use @jit here because TaylorModel operations have
-    # Python control flow (int(), for loops) that aren't JIT-compatible.
-    # JIT can be applied to the underlying function f if needed.
+    # Note: TaylorModel operations are now JIT-compatible (vectorized).
+    # However, the jaxpr interpreter itself uses Python control flow,
+    # so @jit is not applied here. JIT can be applied to the underlying function f.
     @wraps(f)
     def wrapped(*args, **kwargs):
         """Natural Taylor Model function."""
@@ -246,6 +223,28 @@ def nattm_jaxpr(jaxpr: Jaxpr, consts, *args, max_order: int = 2, propagate_sourc
 # Set of primitives that need max_order parameter
 _needs_max_order = set()
 
+# Registry mapping primitives to their corresponding jnp functions for univariate operations
+_univariate_prim_to_func = {}
+
+
+def _register_tm_univariate(primitive: Primitive, func: Callable) -> None:
+    """Register a univariate primitive for Taylor model arithmetic.
+
+    This registers the primitive in three places:
+    1. _univariate_prim_to_func - maps primitive to jnp function for jet
+    2. tm_inclusion_registry - the TM operation handler
+    3. _needs_max_order - marks it as needing max_order parameter
+    """
+    # Register the jnp function for jet
+    _univariate_prim_to_func[primitive] = func
+
+    # Create and register the TM handler
+    def _tm_handler(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
+        return _tm_univariate(primitive, x, max_order=max_order)
+
+    tm_inclusion_registry[primitive] = _tm_handler
+    _needs_max_order.add(primitive)
+
 
 def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
     """Creates a TM function that applies to the coefficients individually.
@@ -345,11 +344,38 @@ def _add_tm_passthrough_to_registry(primitive: Primitive) -> None:
 # Register passthrough operations
 _add_tm_passthrough_to_registry(lax.copy_p)
 _add_tm_passthrough_to_registry(lax.reshape_p)
-_add_tm_passthrough_to_registry(lax.squeeze_p)
 _add_tm_passthrough_to_registry(lax.broadcast_in_dim_p)
 _add_tm_passthrough_to_registry(lax.iota_p)
 _add_tm_passthrough_to_registry(lax.convert_element_type_p)
 _add_tm_passthrough_to_registry(debug_callback_p)
+
+
+# --- Squeeze operation (special handling to preserve polynomial structure) ---
+
+def _tm_squeeze_p(x, *, dimensions) -> TaylorModel:
+    """Handle squeeze of Taylor models, preserving polynomial structure.
+
+    For TMs, squeeze removes size-1 dimensions from the output.
+    The key insight is that squeeze doesn't change the polynomial relationship,
+    it just changes how we interpret the output shape.
+
+    For TM internals, we keep coeffs as (n, m) and remainder as (n,).
+    If the output becomes scalar, we still use n=1 internally.
+    """
+    if not istaylormodel(x):
+        return lax.squeeze_p.bind(x, dimensions=dimensions)
+
+    # For TMs with n=1 output being squeezed to scalar:
+    # - Keep coeffs as (1, m)
+    # - Keep remainder as (1,)
+    # The polynomial structure is preserved; only the "external" shape changes.
+
+    # TMs always maintain (n, m) coeffs and (n,) remainder internally,
+    # so squeeze is essentially a no-op that just changes shape interpretation.
+    return TaylorModel(x.coeffs, x.exponents, x.remainder,
+                       x.domain_center, x.domain_radius, _static_order=x._static_order)
+
+tm_inclusion_registry[lax.squeeze_p] = _tm_squeeze_p
 
 
 # --- Slice operation (special handling) ---
@@ -653,197 +679,116 @@ TaylorModel.multiply = _tm_mul_p
 
 
 
-from jax.experimental import jet
+from jax.experimental.jet import jet
 from immrax.inclusion.nif import natif
 
 def _tm_univariate(
-    primitive_p: Primitive, 
-    x: TaylorModel, 
-    *, 
+    primitive_p: Primitive,
+    x: TaylorModel,
+    *,
     max_order: int | None = None
 ) -> TaylorModel:
     """Generic implementation for univariate Taylor Model operations.
-    
-    Uses jax.experimental.jet for coefficients and jax.grad + natif for 
+
+    Uses jax.experimental.jet for Taylor coefficients and natif for
     Lagrange remainder bounds.
     """
     if not istaylormodel(x):
         return primitive_p.bind(x)
 
     order = max_order if max_order is not None else x._static_order
-    
-    # x = c + p(u) + r
-    # f(x) = f(c + p + r) = T_f(c; p+r) + R
-    # T_f(c; p+r) = sum f^(k)(c)/k! * (p+r)^k
-    # This acts on the full interval of x?
-    # No, standard TM arithmetic transforms the reference point.
-    # We expand f around the constant term c of x.
-    # f(c + p_rem) where p_rem = x - c
-    
     c = x.constant_term
-    
-    # 1. Compute coefficients f^(k)(c)/k! using repeated grad
-    # jet was failing for some primitives (like asin), so we use grad loop which is robust.
-    
-    # We need to map over the batch dimension of x (n output dims)
-    # c is (n,)
-    
-    # Map primitive to corresponding jnp function for evaluation
-    # This avoids issues with primitive.bind requiring extra params like accuracy
-    _prim_to_func = {
-        lax.sin_p: jnp.sin,
-        lax.cos_p: jnp.cos,
-        lax.tan_p: jnp.tan,
-        lax.exp_p: jnp.exp,
-        lax.log_p: jnp.log,
-        lax.log1p_p: jnp.log1p,
-        lax.tanh_p: jnp.tanh,
-        lax.sqrt_p: jnp.sqrt,
-        lax.asin_p: jnp.arcsin,
-        lax.atan_p: jnp.arctan,
-    }
 
-    # Get the function for this primitive
-    if hasattr(primitive_p, 'bind'):
-        # Check if it's a known primitive
-        prim_func = _prim_to_func.get(primitive_p, None)
-        if prim_func is None:
-            # Fall back to using the primitive with try/except
-            def prim_func(v):
-                try:
-                    return primitive_p.bind(v)
-                except TypeError:
-                    # Try with accuracy=None for newer JAX
-                    return primitive_p.bind(v, accuracy=None)
-    else:
-        # It's a custom object with a bind method (like ReciprocalPrimitive)
-        prim_func = lambda v: primitive_p.bind(v)
+    # Get the function for this primitive from the registry, fallback to bind
+    prim_func = _univariate_prim_to_func.get(primitive_p, lambda v: primitive_p.bind(v))
 
+    # 1. Compute Taylor coefficients f^(k)(c)/k! using jet
+    # jet(f, (c,), ((1, 0, 0, ...),)) computes f(c + t) and returns coefficients
     def get_coeffs(val):
-        # val is scalar
-        def scalar_f(v):
-             return jnp.sum(prim_func(v))
+        primals = (val,)
+        # Input x = c + t: coefficient 1 for t^1, 0 for higher powers
+        series = (tuple(1.0 if i == 0 else 0.0 for i in range(order)),)
+        f_val, f_series = jet(prim_func, primals, series)
+        return jnp.array([f_val] + list(f_series))
 
-        # Compute derivatives up to order
-        # derivs = [f(c), f'(c), f''(c), ...]
-        derivs = [scalar_f(val)]
-        g = scalar_f
-        for _ in range(order):
-            g = jax.grad(g)
-            derivs.append(g(val))
-
-        return jnp.array(derivs)
-
-    # Vectorize over n output dimensions
-    # coeffs_raw shape: (n, order + 1)
+    # Vectorize over n output dimensions, shape: (n, order + 1)
     coeffs_raw = jax.vmap(get_coeffs)(c)
-    
-    # Divide by k! to get Taylor coefficients
-    import math
-    factorials = jnp.array([math.factorial(k) for k in range(order + 1)], dtype=coeffs_raw.dtype)
-    coeffs_raw = coeffs_raw / factorials[None, :]
-    
-    # 2. Construct resulting polynomial
-    # Result = sum_{k=0}^order a_k * (x - c)^k
-    # We can do this efficiently by evaluating the polynomial P(z) = sum a_k z^k
-    # where z = x - c. 
-    # z has no constant term.
-    
+
+    # 2. Construct resulting polynomial using Horner's method with lax.scan
+    # Result = a_0 + z * (a_1 + z * (a_2 + ...)) where z = x - c
     z = x - c
-    
-    # Accumulate result using Horner-like scheme or simple summation
-    # Res = a_0 + z * (a_1 + z * (a_2 + ...))
-    # But z is a TM.
-    
-    # Initialize with highest order term
-    result = _tm_constant(coeffs_raw[:, order], x.d, order, x.domain_center, x.domain_radius)
-    
-    for k in range(order - 1, -1, -1):
-        # Multiply by z and add next coeff
-        term_k = _tm_constant(coeffs_raw[:, k], x.d, order, x.domain_center, x.domain_radius)
-        if k == 0:
-             # Last step: just add a_0. No multiplication by z.
-             # Wait, loop logic:
-             # prev result was (a_n z + a_{n-1}) ...
-             # We want a_0 + z * (...)
-             result = result.multiply(z, max_order=order) + term_k
-        else:
-             # Ops are result * z + a_k?
-             # Let's trace:
-             # Init: a_n
-             # Loop k=n-1: a_n * z + a_{n-1}
-             # ...
-             # Loop k=0: (...) * z + a_0
-             # Yes.
-             result = result.multiply(z, max_order=order) + term_k
-             
-    # 3. Compute Remainder
-    # Lagrange remainder: f^(order+1)(xi) / (order+1)! * z^(order+1)
-    # The term z^(order+1) is (x-c)^(order+1)
-    # We bounds for f^(order+1)(xi) over the interval hull of x.
-    
 
-    # ... inside _tm_univariate ...
-    
-    # Compute (order+1)-th derivative function
-    # We need to handle JAX transformations carefully.
-    
-    # Hull of x (vector n)
+    def horner_step(carry, coeff):
+        # coeff is shape (n,) for this term
+        term = _tm_constant(coeff, x.d, order, x.domain_center, x.domain_radius)
+        return carry.multiply(z, max_order=order) + term, None
+
+    init = _tm_constant(coeffs_raw[:, order], x.d, order, x.domain_center, x.domain_radius)
+    # Scan over coefficients from a_{order-1} down to a_0
+    result, _ = lax.scan(horner_step, init, coeffs_raw[:, :order].T[::-1])
+
+    # 3. Compute Lagrange remainder: f^(order+1)(xi) / (order+1)! * z^(order+1)
+    # Need to bound f^(order+1) over the interval hull of x
     x_hull = x.interval_hull()
-    
+
     def get_deriv_bound(i):
-        # We need to differentiate the primitive with respect to its input.
-        # Use prim_func which maps to jnp functions to avoid bind issues.
+        # Use jet to define (order+1)-th derivative, then bound with natif
+        def deriv_func(v):
+            primals = (v,)
+            series = (tuple(1.0 if j == 0 else 0.0 for j in range(order + 1)),)
+            _, f_series = jet(prim_func, primals, series)
+            # f_series[-1] = f^(order+1)(v) / (order+1)!, so multiply back
+            return f_series[-1] * fact(order + 1)
 
-        def scalar_f(v):
-            # v is scalar
-            # We assume primitive maps scalar to scalar for univariate
-            return jnp.sum(prim_func(v))
-
-        # We need the (order+1)-th derivative
-        # We use a loop of grads
-        g = scalar_f
-        for _ in range(order + 1):
-            g = jax.grad(g)
-
-        # Evaluate g on the interval hull of component i
-        # interval hull component i is interval(lower[i], upper[i])
         iv_i = interval(x_hull.lower[i], x_hull.upper[i])
-
-        return natif(g)(iv_i)
+        return natif(deriv_func)(iv_i)
 
     # Compute bounds for each dimension
-    deriv_bounds_lower = []
-    deriv_bounds_upper = []
-    
-    for i in range(x.n):
-        # Note: If x.n is large, this loop is slow during tracing.
-        # But TMs are usually low-dim output.
-        wb = get_deriv_bound(i)
-        deriv_bounds_lower.append(wb.lower)
-        deriv_bounds_upper.append(wb.upper)
-        
-    deriv_bound = interval(jnp.stack(deriv_bounds_lower), jnp.stack(deriv_bounds_upper))
-    
-    # Factorial (order+1)!
-    # Use float for division
-    import math
-    fact = float(math.factorial(order + 1))
-    
-    # z bound
-    z_poly_bound = z._bound_polynomial()
-    # z has no constant term, so z_poly_bound + z.remainder is bound of z
-    z_bound = z_poly_bound + z.remainder
+    deriv_bounds = [get_deriv_bound(i) for i in range(x.n)]
+    deriv_bound = interval(
+        jnp.stack([b.lower for b in deriv_bounds]),
+        jnp.stack([b.upper for b in deriv_bounds])
+    )
+
+    # Compute remainder bound
+    z_bound = z._bound_polynomial() + z.remainder
     z_mag = jnp.maximum(jnp.abs(z_bound.lower), jnp.abs(z_bound.upper))
     z_pow_bound = z_mag ** (order + 1)
-    
-    # Remainder term: deriv_bound * z_pow_bound / fact
-    # Note: Interval multiplication handles signs correctly
-    rem_term = deriv_bound * (z_pow_bound / fact)
-    
-    # Add to result remainder
-    final_remainder = result.remainder + rem_term
-    
+    rem_term = deriv_bound * (z_pow_bound * inv_fact(order + 1))
+
+    lagrange_remainder = result.remainder + rem_term
+
+    # Intersect with direct natif bound for tighter results
+    # The natif bound is independent of Taylor expansion and may be tighter
+    poly_bound = result._bound_polynomial()
+    taylor_hull = poly_bound + lagrange_remainder
+
+    # Compute natif bound over the original input interval hull
+    def natif_bound_dim(i):
+        iv_i = interval(x_hull.lower[i], x_hull.upper[i])
+        return natif(prim_func)(iv_i)
+
+    natif_bounds = [natif_bound_dim(i) for i in range(x.n)]
+    natif_hull = interval(
+        jnp.stack([b.lower for b in natif_bounds]),
+        jnp.stack([b.upper for b in natif_bounds])
+    )
+
+    # Intersect the two bounds
+    intersected_lower = jnp.maximum(taylor_hull.lower, natif_hull.lower)
+    intersected_upper = jnp.minimum(taylor_hull.upper, natif_hull.upper)
+    intersected_hull = interval(intersected_lower, intersected_upper)
+
+    # Adjust remainder so that poly_bound + final_remainder = intersected_hull
+    # For interval addition: [pl, pu] + [rl, ru] = [pl+rl, pu+ru]
+    # So rl = fl - pl and ru = fu - pu
+    final_remainder = interval(
+        intersected_hull.lower - poly_bound.lower,
+        intersected_hull.upper - poly_bound.upper
+    )
+
+    final_remainder = poly_bound
+
     return TaylorModel(result.coeffs, result.exponents, final_remainder,
                        result.domain_center, result.domain_radius, _static_order=order)
 
@@ -1019,67 +964,14 @@ TaylorModel.__rmatmul__ = _tm_rmatmul_p
 
 # --- Transcendental functions ---
 
-
-# --- Transcendental functions ---
-
-def _tm_exp_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.exp_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.exp_p] = _tm_exp_p
-_needs_max_order.add(lax.exp_p)
-
-
-def _tm_log_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.log_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.log_p] = _tm_log_p
-_needs_max_order.add(lax.log_p)
-
-
-def _tm_log1p_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.log1p_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.log1p_p] = _tm_log1p_p
-_needs_max_order.add(lax.log1p_p)
-
-
-def _tm_sin_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.sin_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.sin_p] = _tm_sin_p
-_needs_max_order.add(lax.sin_p)
-
-
-def _tm_cos_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.cos_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.cos_p] = _tm_cos_p
-_needs_max_order.add(lax.cos_p)
-
-
-
-
-
-
-def _tm_tan_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.tan_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.tan_p] = _tm_tan_p
-_needs_max_order.add(lax.tan_p)
-
-
-def _tm_tanh_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.tanh_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.tanh_p] = _tm_tanh_p
-_needs_max_order.add(lax.tanh_p)
-
-
-def _tm_sqrt_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    return _tm_univariate(lax.sqrt_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.sqrt_p] = _tm_sqrt_p
-_needs_max_order.add(lax.sqrt_p)
+_register_tm_univariate(lax.exp_p, jnp.exp)
+_register_tm_univariate(lax.log_p, jnp.log)
+_register_tm_univariate(lax.log1p_p, jnp.log1p)
+_register_tm_univariate(lax.sin_p, jnp.sin)
+_register_tm_univariate(lax.cos_p, jnp.cos)
+_register_tm_univariate(lax.tan_p, jnp.tan)
+_register_tm_univariate(lax.tanh_p, jnp.tanh)
+_register_tm_univariate(lax.sqrt_p, jnp.sqrt)
 
 
 
@@ -1258,19 +1150,8 @@ tm_inclusion_registry[lax.reduce_min_p] = _tm_reduce_min_p
 
 # --- Inverse trig functions ---
 
-
-def _tm_asin_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-     return _tm_univariate(lax.asin_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.asin_p] = _tm_asin_p
-_needs_max_order.add(lax.asin_p)
-
-
-def _tm_atan_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-     return _tm_univariate(lax.atan_p, x, max_order=max_order)
-
-tm_inclusion_registry[lax.atan_p] = _tm_atan_p
-_needs_max_order.add(lax.atan_p)
+_register_tm_univariate(lax.asin_p, jnp.arcsin)
+_register_tm_univariate(lax.atan_p, jnp.arctan)
 
 
 

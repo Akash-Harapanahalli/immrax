@@ -26,8 +26,6 @@ BaseSetGenerator
 
 from .base import (
     # Helper functions
-    fact,
-    inv_fact,
     prolongation,
     # Data structures
     ReachableSets,
@@ -37,10 +35,13 @@ from .base import (
     BaseSetGenerator,
 )
 
+# Re-export fact/inv_fact from utils for backwards compatibility
+from ...utils import fact, inv_fact
+
 from .lohner import LohnerReachability
 from .althoff_girard import AlthoffGirardReachability
 from .taylor_girard import TaylorGirardReachability
-from .taylor_model import TaylorModelReachability
+from .tm_flowpipe import TMFlowpipeGenerator, tm_flowpipe_step, tm_reachtube
 
 __all__ = [
     # Helper functions
@@ -57,5 +58,7 @@ __all__ = [
     "LohnerReachability",
     "AlthoffGirardReachability",
     "TaylorGirardReachability",
-    "TaylorModelReachability",
+    "TMFlowpipeGenerator",
+    "tm_flowpipe_step",
+    "tm_reachtube",
 ]
