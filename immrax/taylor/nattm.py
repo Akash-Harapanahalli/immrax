@@ -7,6 +7,7 @@ propagating polynomial approximations with rigorous remainder bounds.
 
 from functools import wraps, partial
 from typing import Any, Callable, Sequence
+from jaxtyping import Array, ArrayLike
 
 import equinox as eqx
 import jax
@@ -33,7 +34,65 @@ from immrax.taylor.taylor_model import (
     taylor_model_concatenate,
     _generate_exponents,
     _get_canonical_exponents,
+    _bound_monomial,
+    _merge_taylor_terms,
 )
+
+# Move bound_polynomial logic here as helper
+def _bound_polynomial(tm: TaylorModel) -> Interval:
+    """Bound the polynomial part over the domain.
+    
+    Uses Horner-like evaluation for 1D case to preserve correlations.
+    Falls back to term-by-term for multivariate case.
+    """
+    if tm.d == 1:
+        return _bound_polynomial_horner_1d(tm)
+    else:
+        return _bound_polynomial_termwise(tm)
+
+def _bound_polynomial_horner_1d(tm: TaylorModel) -> Interval:
+    """Bound 1D polynomial using Horner's method for tighter bounds."""
+    # Sort monomials by degree (descending)
+    degrees = tm.exponents[0, :]  # 1D, so just first row
+    max_deg = int(jnp.max(degrees))
+
+    # Build coefficient array indexed by degree
+    poly_coeffs = jnp.zeros((tm.n, max_deg + 1), dtype=tm.dtype)
+    for i in range(tm.num_monomials):
+        deg = int(degrees[i])
+        poly_coeffs = poly_coeffs.at[:, deg].add(tm.coeffs[:, i])
+
+    # Horner's method: p(x) = c_0 + x*(c_1 + x*(c_2 + ...))
+    # Evaluated on interval [-1, 1]
+    x_interval = icentpert(jnp.array([0.0]), jnp.array([1.0]))  # [-1, 1]
+
+    # Start from highest degree
+    result = interval(poly_coeffs[:, max_deg])
+    for deg in range(max_deg - 1, -1, -1):
+        # result = c_deg + x * result
+        result = result * x_interval[0] + interval(poly_coeffs[:, deg])
+
+    return result
+
+def _bound_polynomial_termwise(tm: TaylorModel) -> Interval:
+    """Bound polynomial term-by-term (conservative for multivariate)."""
+    result = interval(jnp.zeros(tm.n, dtype=tm.dtype))
+
+    for i in range(tm.num_monomials):
+        exp_i = tm.exponents[:, i]
+        coeff_i = tm.coeffs[:, i]
+
+        # Bound monomial over [-1, 1]^d
+        mono_bound = _bound_monomial(exp_i)  # scalar interval
+
+        # Multiply by coefficient (vector)
+        term_bound = interval(coeff_i, coeff_i) * mono_bound
+        result = result + term_bound
+
+    return result
+
+TaylorModel._bound_polynomial = _bound_polynomial
+
 
 # Registry mapping JAX primitives to Taylor model operations
 tm_inclusion_registry = {}
@@ -398,58 +457,200 @@ tm_inclusion_registry[jax._src.pjit.pjit_p] = _tm_pjit_p
 
 # --- Arithmetic operations ---
 
-def _tm_add_p(x: TaylorModel, y: TaylorModel) -> TaylorModel:
+
+def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
     """Taylor model addition."""
     if istaylormodel(x) and istaylormodel(y):
-        return x + y
+        # Merge polynomial terms
+        new_coeffs, new_exponents = _merge_taylor_terms(
+            x.coeffs, x.exponents, y.coeffs, y.exponents
+        )
+
+        # Add remainders using Interval addition
+        new_remainder = x.remainder + y.remainder
+
+        new_order = max(x._static_order, y._static_order)
+        result = TaylorModel(
+            new_coeffs, new_exponents, new_remainder, x.domain_center, x.domain_radius,
+            _static_order=new_order
+        )
+        # Convert to canonical form for compatibility
+        return result.to_canonical(new_order)
+        
     elif istaylormodel(x):
-        return x + jnp.asarray(y)
+        # TM + Array
+        val = jnp.asarray(y)
+        # Add to constant term
+        # Need to handle shape
+        if val.ndim == 0:
+            val = jnp.full(x.shape, val)
+        
+        # We can implement this by creating a constant TM or modifying coeffs
+        # Modifying coeffs is cheaper
+        const_exp = jnp.zeros((x.d, 1), dtype=jnp.int32)
+        const_coeff = val[:, None]
+        
+        new_coeffs, new_exponents = _merge_taylor_terms(
+            x.coeffs, x.exponents, const_coeff, const_exp
+        )
+        
+        result = TaylorModel(
+            new_coeffs, new_exponents, x.remainder, x.domain_center, x.domain_radius,
+            _static_order=x._static_order
+        )
+        return result.to_canonical(x._static_order)
+        
     elif istaylormodel(y):
-        return jnp.asarray(x) + y
+        # Array + TM
+        return _tm_add_p(y, x)
     else:
         return x + y
 
 tm_inclusion_registry[lax.add_p] = _tm_add_p
 tm_inclusion_registry[ad_util.add_any_p] = _tm_add_p
+TaylorModel.__add__ = _tm_add_p
+TaylorModel.__radd__ = _tm_add_p
 
 
-def _tm_sub_p(x: TaylorModel, y: TaylorModel) -> TaylorModel:
+
+def _tm_sub_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
     """Taylor model subtraction."""
-    if istaylormodel(x) and istaylormodel(y):
-        return x - y
-    elif istaylormodel(x):
-        return x - jnp.asarray(y)
-    elif istaylormodel(y):
-        return jnp.asarray(x) - y
-    else:
-        return x - y
+    if istaylormodel(y):
+        return _tm_add_p(x, _tm_neg_p(y))
+    return _tm_add_p(x, -jnp.asarray(y))
 
 tm_inclusion_registry[lax.sub_p] = _tm_sub_p
+TaylorModel.__sub__ = _tm_sub_p
+TaylorModel.__rsub__ = lambda self, other: _tm_sub_p(other, self)
 
 
 def _tm_neg_p(x: TaylorModel) -> TaylorModel:
     """Taylor model negation."""
     if not istaylormodel(x):
         return -x
-    return -x
+    return TaylorModel(
+        -x.coeffs,
+        x.exponents,
+        -x.remainder,
+        x.domain_center,
+        x.domain_radius,
+        _static_order=x._static_order,
+    )
 
 tm_inclusion_registry[lax.neg_p] = _tm_neg_p
+TaylorModel.__neg__ = _tm_neg_p
 
 
-def _tm_mul_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> TaylorModel:
+
+def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = None) -> TaylorModel:
     """Taylor model multiplication."""
     if istaylormodel(x) and istaylormodel(y):
-        order = max_order if max_order is not None else max(x._static_order, y._static_order)
-        return x.multiply(y, max_order=order)
+        if x.n != y.n:
+            raise ValueError(f"Output dimensions must match: {x.n} vs {y.n}")
+        if x.d != y.d:
+            raise ValueError(f"Domain dimensions must match: {x.d} vs {y.d}")
+
+        n = x.n
+        d = x.d
+        m1 = x.num_monomials
+        m2 = y.num_monomials
+
+        # Compute all product exponents: shape (d, m1*m2)
+        exp1 = x.exponents[:, :, None]  # (d, m1, 1)
+        exp2 = y.exponents[:, None, :]  # (d, 1, m2)
+        all_exp = (exp1 + exp2).reshape(d, m1 * m2)
+
+        # Compute all product coefficients: shape (n, m1*m2)
+        coeff1 = x.coeffs[:, :, None]  # (n, m1, 1)
+        coeff2 = y.coeffs[:, None, :]  # (n, 1, m2)
+        all_coeffs = (coeff1 * coeff2).reshape(n, m1 * m2)
+
+        # Compute total order of each product term
+        total_orders = jnp.sum(all_exp, axis=0)
+
+        effective_order = max_order if max_order is not None else max(x._static_order, y._static_order)
+
+        # If max_order specified, zero out high-order terms and add to remainder
+        # Mask for terms to keep
+        keep_mask = total_orders <= effective_order
+        
+        # Zero out coefficients above max_order
+        new_coeffs = jnp.where(keep_mask[None, :], all_coeffs, 0.0)
+
+        # Bound truncated terms and add to remainder
+        truncated_coeffs = jnp.where(keep_mask[None, :], 0.0, all_coeffs)
+        
+        # Compute monomial bounds
+        has_odd = jnp.any(all_exp % 2 == 1, axis=0)
+        mono_lower = jnp.where(has_odd, -1.0, 0.0)
+        mono_upper = jnp.ones(m1 * m2)
+
+        c_pos = jnp.maximum(truncated_coeffs, 0.0)
+        c_neg = jnp.minimum(truncated_coeffs, 0.0)
+        term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]
+        term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]
+
+        trunc_lower = jnp.sum(term_lower, axis=1)
+        trunc_upper = jnp.sum(term_upper, axis=1)
+        truncated_remainder = interval(trunc_lower, trunc_upper)
+
+        new_exponents = all_exp
+
+        # Compute remainder bounds using Interval operations
+        # (p1 + r1) * (p2 + r2) = p1*p2 + p1*r2 + r1*p2 + r1*r2
+        p1_bounds = _bound_polynomial(x)
+        p2_bounds = _bound_polynomial(y)
+
+        # Cross terms using Interval multiplication
+        p1_r2 = p1_bounds * y.remainder
+        r1_p2 = x.remainder * p2_bounds
+        r1_r2 = x.remainder * y.remainder
+
+        # Combined remainder
+        new_remainder = p1_r2 + r1_p2 + r1_r2 + truncated_remainder
+
+        result = TaylorModel(
+            new_coeffs,
+            new_exponents,
+            new_remainder,
+            x.domain_center,
+            x.domain_radius,
+            _static_order=effective_order,
+        )
+
+        return result.to_canonical(effective_order)
+
     elif istaylormodel(x):
-        return x * jnp.asarray(y)
+        # TM * Array
+        alpha = jnp.asarray(y)
+        if alpha.ndim == 0:
+            new_coeffs = alpha * x.coeffs
+            new_remainder = x.remainder * alpha
+        else:
+            new_coeffs = alpha[:, None] * x.coeffs
+            # Element-wise scaling of interval
+            new_remainder = interval(alpha, alpha) * x.remainder
+        
+        return TaylorModel(
+            new_coeffs,
+            x.exponents,
+            new_remainder,
+            x.domain_center,
+            x.domain_radius,
+            _static_order=x._static_order,
+        )
+
     elif istaylormodel(y):
-        return jnp.asarray(x) * y
+        return _tm_mul_p(y, x, max_order=max_order)
     else:
         return x * y
 
 tm_inclusion_registry[lax.mul_p] = _tm_mul_p
 _needs_max_order.add(lax.mul_p)
+TaylorModel.__mul__ = _tm_mul_p
+TaylorModel.__rmul__ = _tm_mul_p
+TaylorModel.multiply = _tm_mul_p
+
 
 
 from jax.experimental import jet
@@ -717,6 +918,8 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order: int = None) -> Taylo
 
 tm_inclusion_registry[lax.integer_pow_p] = _tm_integer_pow_p
 _needs_max_order.add(lax.integer_pow_p)
+TaylorModel.__pow__ = _tm_integer_pow_p
+
 
 
 def _tm_square_p(x: TaylorModel, *, max_order: int = None) -> TaylorModel:
@@ -744,6 +947,74 @@ def _tm_pow_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> Taylo
 
 tm_inclusion_registry[lax.pow_p] = _tm_pow_p
 _needs_max_order.add(lax.pow_p)
+
+
+def _tm_rmatmul_p(self: TaylorModel, other: ArrayLike) -> TaylorModel:
+    """Left matrix multiplication: M @ TM."""
+    M = jnp.asarray(other)
+    new_coeffs = M @ self.coeffs
+
+    # Remainder transformation using Interval matmul
+    # remainder is (n,). We treat as column vector?
+    # self.remainder is Interval(lower, upper)
+    # n is output dim.
+    # M @ TM means M (m x n) @ TM (n output) -> (m output)
+    
+    # We can use interval matmul if we reshape
+    rem_interval = interval(self.remainder.lower.reshape(-1, 1), 
+                            self.remainder.upper.reshape(-1, 1))
+    
+    # M @ rem_interval
+    # We need to construct interval matrix for M
+    M_iv = interval(M)
+    
+    # Helper for interval matmul
+    # Or reuse natif matmul?
+    # Interval.__matmul__ is defined in nif.py
+    
+    # Simply:
+    # new_lower = M+ @ l - M- @ u ... standard interval matmul logic
+    # But let's use the Interval class if it supports matmul
+    # Check if Interval has matmul
+    # immrax.inclusion.interval has no matmul impl in class, but nif.py patches it.
+    # nattm.py imports nif.
+    
+    # rem_col = self.remainder.reshape((-1, 1)) # If supported?
+    # Interval doesn't support reshape attribute in all versions? 
+    # nif.py: Interval.reshape = ...
+    
+    # Let's do explicit logic to be safe, matching original TaylorModel logic
+    rem_l = self.remainder.lower
+    rem_u = self.remainder.upper
+    
+    # M_pos = max(M, 0), M_neg = min(M, 0)
+    # [M] * [r]
+    # lower = M_pos @ r_l + M_neg @ r_u
+    # upper = M_pos @ r_u + M_neg @ r_l
+    
+    M_pos = jnp.maximum(M, 0.0)
+    M_neg = jnp.minimum(M, 0.0)
+    
+    new_l = M_pos @ rem_l + M_neg @ rem_u
+    new_u = M_pos @ rem_u + M_neg @ rem_l
+    
+    new_remainder = interval(new_l, new_u)
+    
+    # Output dimension changes
+    # New domain is same
+    # Coefficients were mapped
+    
+    return TaylorModel(
+        new_coeffs,
+        self.exponents,
+        new_remainder,
+        self.domain_center,
+        self.domain_radius,
+        _static_order=self._static_order,
+    )
+
+TaylorModel.__rmatmul__ = _tm_rmatmul_p
+
 
 
 # --- Transcendental functions ---
@@ -787,128 +1058,29 @@ _needs_max_order.add(lax.cos_p)
 
 
 
-def _taylor_sin_series(p: TaylorModel, order: int) -> TaylorModel:
-    """Compute Taylor series for sin(p) where p has no constant term."""
-    result = _tm_constant(jnp.zeros(p.n, dtype=p.dtype), p.d, order,
-                          p.domain_center, p.domain_radius)
-    power = p  # p^1
-    sign = 1.0
-    factorial = 1.0
 
-    for k in range(order + 1):
-        exp = 2 * k + 1
-        if exp > order:
-            break
-        # Compute factorial(2k+1)
-        for i in range(1 if k == 0 else 2*k, exp + 1):
-            factorial *= i
-
-        result = result + power * (sign / factorial)
-
-        # p^{2k+1} -> p^{2k+3}
-        power = power.multiply(p, max_order=order)
-        power = power.multiply(p, max_order=order)
-        sign = -sign
-
-    return result
-
-
-def _taylor_cos_series(p: TaylorModel, order: int) -> TaylorModel:
-    """Compute Taylor series for cos(p) where p has no constant term."""
-    result = _tm_constant(jnp.ones(p.n, dtype=p.dtype), p.d, order,
-                          p.domain_center, p.domain_radius)
-    power = p.multiply(p, max_order=order)  # p^2
-    sign = -1.0
-    factorial = 2.0
-
-    for k in range(1, order + 1):
-        exp = 2 * k
-        if exp > order:
-            break
-
-        result = result + power * (sign / factorial)
-
-        # p^{2k} -> p^{2k+2}
-        power = power.multiply(p, max_order=order)
-        power = power.multiply(p, max_order=order)
-        sign = -sign
-        factorial *= (exp + 1) * (exp + 2)
-
-    return result
 
 
 def _tm_tan_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    """Taylor model tangent: tan(x) = sin(x) / cos(x)."""
-    return _tm_div_p(_tm_sin_p(x, max_order=max_order),
-                      _tm_cos_p(x, max_order=max_order),
-                      max_order=max_order)
+    return _tm_univariate(lax.tan_p, x, max_order=max_order)
 
 tm_inclusion_registry[lax.tan_p] = _tm_tan_p
 _needs_max_order.add(lax.tan_p)
 
 
 def _tm_tanh_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    """Taylor model hyperbolic tangent."""
-    if not istaylormodel(x):
-        return jnp.tanh(x)
-
-    order = max_order if max_order is not None else x._static_order
-
-    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-    two_x = x * 2.0
-    exp_2x = _tm_exp_p(two_x, max_order=order)
-
-    one = _tm_constant(jnp.ones(x.n, dtype=x.dtype), x.d, order,
-                       x.domain_center, x.domain_radius)
-
-    num = exp_2x - one
-    den = exp_2x + one
-
-    return _tm_div_p(num, den, max_order=order)
+    return _tm_univariate(lax.tanh_p, x, max_order=max_order)
 
 tm_inclusion_registry[lax.tanh_p] = _tm_tanh_p
 _needs_max_order.add(lax.tanh_p)
 
 
 def _tm_sqrt_p(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-    """Taylor model square root: sqrt(x) = x^0.5."""
-    if not istaylormodel(x):
-        return jnp.sqrt(x)
-
-    order = max_order if max_order is not None else x._static_order
-
-    # sqrt(c + p) = sqrt(c) * sqrt(1 + p/c)
-    # Use binomial series: (1+u)^{1/2} = sum_{k=0}^n C(1/2,k) u^k
-    c = x.constant_term
-    sqrt_c = jnp.sqrt(c)
-
-    u = (x - c) * (1.0 / c)
-
-    # Compute binomial series
-    result = _tm_constant(jnp.ones(x.n, dtype=x.dtype), x.d, order,
-                          x.domain_center, x.domain_radius)
-    power = u  # u^1
-    coeff = 0.5  # C(1/2, 1) = 1/2
-
-    for k in range(1, order + 1):
-        result = result + power * coeff
-        power = power.multiply(u, max_order=order)
-        # C(1/2, k+1) = C(1/2, k) * (1/2 - k) / (k + 1)
-        coeff = coeff * (0.5 - k) / (k + 1)
-
-    result = result * sqrt_c
-
-    # Add remainder bound
-    u_bound = u._bound_polynomial() + u.remainder
-    u_max = jnp.maximum(jnp.abs(u_bound.lower), jnp.abs(u_bound.upper))
-    remainder_bound = jnp.abs(sqrt_c) * jnp.abs(coeff) * (u_max ** (order + 1))
-
-    result_remainder = result.remainder + icentpert(jnp.zeros(x.n), remainder_bound)
-    return TaylorModel(result.coeffs, result.exponents, result_remainder,
-                       result.domain_center, result.domain_radius, _static_order=order)
+    return _tm_univariate(lax.sqrt_p, x, max_order=max_order)
 
 tm_inclusion_registry[lax.sqrt_p] = _tm_sqrt_p
 _needs_max_order.add(lax.sqrt_p)
+
 
 
 def _tm_abs_p(x: TaylorModel) -> TaylorModel:

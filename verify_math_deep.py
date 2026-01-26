@@ -5,8 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from immrax.inclusion import interval, icentpert
-from immrax.generator.sets.taylor_model import TaylorModel
-from immrax.inclusion.tm import nattm, tm_inclusion_registry
+from immrax.taylor.taylor_model import TaylorModel
+from immrax.taylor.nattm import nattm, tm_inclusion_registry
 
 print("DEBUG: Checking registry keys...")
 print(f"asin_p in registry: {lax.asin_p in tm_inclusion_registry}")
@@ -30,7 +30,7 @@ def check_containment(f_tm, f_ref, domain_min, domain_max, num_samples=1000):
     # coeffs: c, r
     d = 1
     order = 4 # Use high order to check if implemented
-    from immrax.generator.sets.taylor_model import _get_canonical_exponents
+    from immrax.taylor.taylor_model import _get_canonical_exponents
     exponents = _get_canonical_exponents(d, order)
     coeffs = jnp.zeros((1, exponents.shape[1]))
     # Constant term (idx 0 usually)
@@ -100,7 +100,7 @@ def verify_asin_order():
     radius = 0.5
     d=1
     order=3
-    from immrax.generator.sets.taylor_model import _get_canonical_exponents
+    from immrax.taylor.taylor_model import _get_canonical_exponents
     exponents = _get_canonical_exponents(d, order)
     coeffs = jnp.zeros((1, exponents.shape[1]))
     coeffs = coeffs.at[:, 1].set(radius) # x = 0.5 u
@@ -137,7 +137,7 @@ def verify_atan_order():
     center = 0.0
     radius = 0.5
     order = 3
-    from immrax.generator.sets.taylor_model import _get_canonical_exponents
+    from immrax.taylor.taylor_model import _get_canonical_exponents
     d=1
     exponents = _get_canonical_exponents(d, order)
     coeffs = jnp.zeros((1, exponents.shape[1]))
