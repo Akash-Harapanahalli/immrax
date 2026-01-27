@@ -42,31 +42,102 @@ from immrax.taylor.taylor_model import (
 # Move bound_polynomial logic here as helper (JIT-compatible vectorized version)
 def _bound_polynomial(tm: TaylorModel) -> Interval:
     """Bound the polynomial part over the domain.
-
-    Fully vectorized for JIT compatibility.
+    
+    Uses exact optimization (critical points) for 1D case.
+    Uses termwise bounds for multivariate case.
     """
-    # Monomial bounds over [-1, 1]^d:
-    # - If any exponent is odd: range is [-1, 1]
-    # - If all exponents are even (nonzero): range is [0, 1]
-    # - Constant term (all zero): range is [1, 1]
-    has_odd = jnp.any(tm.exponents % 2 == 1, axis=0)  # (m,)
-    is_constant = jnp.all(tm.exponents == 0, axis=0)  # (m,)
+    if tm.d == 1:
+        return _bound_polynomial_1d_exact(tm)
+    else:
+        # Vectorized termwise bound
+        has_odd = jnp.any(tm.exponents % 2 == 1, axis=0)
+        is_constant = jnp.all(tm.exponents == 0, axis=0)
 
-    mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))  # (m,)
-    mono_upper = jnp.ones(tm.num_monomials)  # (m,)
+        mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))
+        mono_upper = jnp.ones(tm.num_monomials)
 
-    # For each term, bound is coeff * [mono_lower, mono_upper]
-    # Handle positive/negative coeffs separately
-    c_pos = jnp.maximum(tm.coeffs, 0.0)  # (n, m)
-    c_neg = jnp.minimum(tm.coeffs, 0.0)  # (n, m)
+        c_pos = jnp.maximum(tm.coeffs, 0.0)
+        c_neg = jnp.minimum(tm.coeffs, 0.0)
 
-    term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]  # (n, m)
-    term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]  # (n, m)
+        term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]
+        term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]
 
-    result_lower = jnp.sum(term_lower, axis=1)  # (n,)
-    result_upper = jnp.sum(term_upper, axis=1)  # (n,)
+        return interval(jnp.sum(term_lower, axis=1), jnp.sum(term_upper, axis=1))
 
-    return interval(result_lower, result_upper)
+
+def _bound_polynomial_1d_exact(tm: TaylorModel) -> Interval:
+    """Bound 1D polynomial exactly by finding critical points."""
+    # coeffs shape: (n, m)
+    # exponents shape: (1, m)
+    
+    # 1. Reconstruct polynomial coefficients in standard basis [c_0, c_1, ..., c_k]
+    # Use _static_order to ensure max_deg is static for JIT
+    max_deg = tm._static_order
+    
+    if max_deg == 0:
+        # Constant Taylor Model
+        return interval(tm.coeffs[:, 0], tm.coeffs[:, 0])
+        
+    # Standard basis coeffs: (n, max_deg + 1)
+    # indexed by power: [const, x, x^2, ...]
+    poly_coeffs = jnp.zeros((tm.n, max_deg + 1), dtype=tm.dtype)
+    
+    # This loop is unrolled during JIT if dimensions are static, which they are for a given TM
+    # But tm.num_monomials can be large. 
+    # Using scatter/index_add is better for JIT
+    
+    degrees = tm.exponents[0].astype(jnp.int32)
+    poly_coeffs = poly_coeffs.at[:, degrees].add(tm.coeffs)
+    
+    # poly_coeffs are [c_0, c_1, ..., c_k] for p(x) = sum c_i x^i
+    
+    # 2. Compute bounds for each output dimension
+    def get_dim_bounds(coeffs):
+        # coeffs: (max_deg + 1,)
+        # Derivative coefficients: [c_1, 2c_2, ..., k*c_k]
+        # P'(x) = sum_{i=1}^k i*c_i x^{i-1}
+        # New coeffs for P'(x): [1*c_1, 2*c_2, ..., k*c_k]
+        
+        k = jnp.arange(1, max_deg + 1, dtype=coeffs.dtype)
+        deriv_coeffs = coeffs[1:] * k
+        
+        # Check if derivative is zero (constant polynomial, already handled but safe to check)
+        # or if max_deg was 0 (handled above)
+        
+        # Find roots of derivative (roots takes high->low)
+        # jnp.roots expects p[0] * x^n + ... + p[n]
+        # So we reverse deriv_coeffs
+        # deriv_coeffs has size max_deg.
+        # If max_deg=1, deriv_coeffs has size 1 (the constant slope).
+        
+        if max_deg == 1:
+             valid_roots = jnp.array([], dtype=coeffs.dtype)
+             is_real = jnp.array([], dtype=bool)
+             in_range = jnp.array([], dtype=bool)
+        else:
+             roots = jnp.roots(deriv_coeffs[::-1], strip_zeros=False)
+             
+             # Filter real roots in [-1, 1]
+             is_real = jnp.abs(jnp.imag(roots)) < 1e-6
+             in_range = jnp.abs(jnp.real(roots)) <= 1.0
+             valid_roots = jnp.real(roots)
+        
+        # Evaluate polynomial at endpoints -1, 1 and valid roots
+        # Points to check (max_deg is static now, so condition is static)
+        check_points = jnp.concatenate([
+            jnp.array([-1.0, 1.0]),
+            jnp.where(is_real & in_range, valid_roots, -1.0) if max_deg > 1 else jnp.array([])
+        ])
+        
+        # Evaluate P(x) using Horner or polyval (polyval expects high->low)
+        vals = jnp.polyval(coeffs[::-1], check_points)
+        
+        return jnp.min(vals), jnp.max(vals)
+
+    # Vectorize over output dimensions
+    lowers, uppers = jax.vmap(get_dim_bounds)(poly_coeffs)
+    
+    return interval(lowers, uppers)
 
 TaylorModel._bound_polynomial = _bound_polynomial
 
@@ -111,7 +182,7 @@ def nattm(
     # However, the jaxpr interpreter itself uses Python control flow,
     # so @jit is not applied here. JIT can be applied to the underlying function f.
     @wraps(f)
-    def wrapped(*args, **kwargs):
+    def wrapped(*args, **kwargs) -> TaylorModel :
         """Natural Taylor Model function."""
         # Get representative values for tracing (use domain centers)
         geteval = lambda x: x.evaluate_polynomial(x.domain_center) if istaylormodel(x) else jnp.asarray(x)
@@ -344,7 +415,6 @@ def _add_tm_passthrough_to_registry(primitive: Primitive) -> None:
 # Register passthrough operations
 _add_tm_passthrough_to_registry(lax.copy_p)
 _add_tm_passthrough_to_registry(lax.reshape_p)
-_add_tm_passthrough_to_registry(lax.broadcast_in_dim_p)
 _add_tm_passthrough_to_registry(lax.iota_p)
 _add_tm_passthrough_to_registry(lax.convert_element_type_p)
 _add_tm_passthrough_to_registry(debug_callback_p)
@@ -376,6 +446,47 @@ def _tm_squeeze_p(x, *, dimensions) -> TaylorModel:
                        x.domain_center, x.domain_radius, _static_order=x._static_order)
 
 tm_inclusion_registry[lax.squeeze_p] = _tm_squeeze_p
+
+
+# --- Broadcast_in_dim operation (special handling to preserve polynomial structure) ---
+
+def _tm_broadcast_in_dim_p(x, *, shape, broadcast_dimensions, sharding=None) -> TaylorModel:
+    """Handle broadcast_in_dim of Taylor models, preserving polynomial structure.
+
+    This is used when constructing arrays like jnp.array([scalar1, scalar2]).
+    JAX broadcasts each scalar from shape () to shape (1,) before concatenating.
+
+    For TMs, the internal representation always uses (n, m) coeffs where n >= 1.
+    A "scalar" TM has n=1. Broadcasting from () to (1,) is a no-op for TMs.
+    """
+    if not istaylormodel(x):
+        return lax.broadcast_in_dim_p.bind(x, shape=shape,
+                                            broadcast_dimensions=broadcast_dimensions,
+                                            sharding=sharding)
+
+    # For TMs, broadcasting from scalar () to (1,) or similar shape changes
+    # that don't affect the output dimension count are no-ops.
+    # The TM already has coeffs of shape (n, m) where n is the output dimension.
+
+    # Check if this is the common case: scalar TM broadcast to (1,)
+    if x.n == 1 and shape == (1,) and broadcast_dimensions == ():
+        # This is broadcasting a "scalar" TM to a 1-element vector TM
+        # The internal representation is already (1, m), so no change needed
+        return TaylorModel(x.coeffs, x.exponents, x.remainder,
+                           x.domain_center, x.domain_radius, _static_order=x._static_order)
+
+    # For more complex broadcasts, we need to replicate the TM structure
+    # This handles cases like broadcasting (n,) to (k, n) etc.
+    # For now, fall back to interval-based approach for complex cases
+    from immrax.inclusion.nif import inclusion_registry
+    hull = x.interval_hull()
+    result_interval = inclusion_registry[lax.broadcast_in_dim_p](
+        hull, shape=shape, broadcast_dimensions=broadcast_dimensions, sharding=sharding
+    )
+    return _tm_from_interval(result_interval, x.d, x._static_order,
+                             x.domain_center, x.domain_radius)
+
+tm_inclusion_registry[lax.broadcast_in_dim_p] = _tm_broadcast_in_dim_p
 
 
 # --- Slice operation (special handling) ---
@@ -764,30 +875,22 @@ def _tm_univariate(
     taylor_hull = poly_bound + lagrange_remainder
 
     # Compute natif bound over the original input interval hull
-    def natif_bound_dim(i):
-        iv_i = interval(x_hull.lower[i], x_hull.upper[i])
-        return natif(prim_func)(iv_i)
-
-    natif_bounds = [natif_bound_dim(i) for i in range(x.n)]
-    natif_hull = interval(
-        jnp.stack([b.lower for b in natif_bounds]),
-        jnp.stack([b.upper for b in natif_bounds])
-    )
+    # natif supports vectorized intervals if the primitive does
+    natif_hull = natif(prim_func)(x_hull)
 
     # Intersect the two bounds
-    intersected_lower = jnp.maximum(taylor_hull.lower, natif_hull.lower)
-    intersected_upper = jnp.minimum(taylor_hull.upper, natif_hull.upper)
-    intersected_hull = interval(intersected_lower, intersected_upper)
+    intersected_hull = taylor_hull & natif_hull
 
-    # Adjust remainder so that poly_bound + final_remainder = intersected_hull
-    # For interval addition: [pl, pu] + [rl, ru] = [pl+rl, pu+ru]
-    # So rl = fl - pl and ru = fu - pu
-    final_remainder = interval(
-        intersected_hull.lower - poly_bound.lower,
-        intersected_hull.upper - poly_bound.upper
-    )
-
-    final_remainder = poly_bound
+    # Back-propagate intersection to remainder constraint
+    # f(x) \in intersected_hull
+    # f(x) = P(x) + R
+    # R = f(x) - P(x) \in intersected_hull - P(x)
+    # Using standard interval subtraction: [A.l - B.u, A.u - B.l]
+    
+    r_compat = intersected_hull - poly_bound
+    
+    # Final remainder is intersection of lagrange_remainder and r_compat
+    final_remainder = lagrange_remainder & r_compat
 
     return TaylorModel(result.coeffs, result.exponents, final_remainder,
                        result.domain_center, result.domain_radius, _static_order=order)

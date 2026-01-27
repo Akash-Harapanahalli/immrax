@@ -157,7 +157,8 @@ def main():
     print("Comparison: nattm (Taylor Model) vs natif (Interval) for Function Bounding")
     print("=" * 100)
 
-    num_runs = 100
+    # num_runs = 100
+    num_runs = 1
     print(f"\nTiming averaged over {num_runs} runs (after JIT compilation)")
 
     # =========================================================================
@@ -239,6 +240,58 @@ def main():
 
     print_table(vec_scalar_results, is_vector=False)
 
+
+    # =========================================================================
+    # Complex Dependency & Stress Tests
+    # =========================================================================
+    print("\n" + "=" * 100)
+    print("COMPLEX DEPENDENCY & STRESS TESTS")
+    print("=" * 100)
+
+    complex_tests = [
+        # 1. Rosenbrock-like (coupled): (1-x)^2 + 100*(y - x^2)^2
+        # Intervals fail hard on x^2 dependency
+        ("Rosenbrock (2D)", lambda x: (1.0 - x[0])**2 + 100.0 * (x[1] - x[0]**2)**2,
+         icentpert(jnp.array([1.0, 1.0]), jnp.array([0.1, 0.1])), 4),
+
+        # 2. Trigonometric Identity: sin^2(x) + cos^2(x) - 1
+        # Should be exactly 0 (or close to it). Intervals will be [-1, 1] worst case.
+        ("sin^2 + cos^2 - 1", lambda x: jnp.sin(x[0])**2 + jnp.cos(x[0])**2 - 1.0,
+         icentpert(jnp.array([0.5]), jnp.array([1.0])), 6),
+
+        # 3. Rational with Repeated Variables: x / (x^2 + 1)
+        # Standard example where dependency matters.
+        ("x / (x^2 + 1)", lambda x: x[0] / (x[0]**2 + 1.0),
+         icentpert(jnp.array([1.0]), jnp.array([0.5])), 4),
+
+        # 4. Determinant of 2x2: x1*x4 - x2*x3
+        # Direct dependency test
+        ("Det(2x2)", lambda x: x[0]*x[3] - x[1]*x[2],
+         icentpert(jnp.array([1., 0., 0., 1.]), jnp.array([0.2, 0.2, 0.2, 0.2])), 3),
+
+        # 5. Coupled ODE-like step (Runge-Kutta style sub-stage)
+        # k1 = f(x), k2 = f(x + 0.5*h*k1) .. lots of nesting
+        ("RK4 Step Term: x + h*(-x)", lambda x: x[0] + 0.1 * (-x[0] + 0.1 * (-x[0])),
+         icentpert(jnp.array([1.0]), jnp.array([0.5])), 3),
+         
+        # 6. High-order interaction
+        # (x+y)^5 - (x-y)^5
+        ("(x+y)^5 - (x-y)^5", lambda x: (x[0] + x[1])**5 - (x[0] - x[1])**5,
+         icentpert(jnp.array([0.0, 0.0]), jnp.array([0.1, 0.1])), 5),
+    ]
+
+    complex_results = []
+    for name, f, iv, order in complex_tests:
+        try:
+            result = compare_scalar(name, f, iv, tm_order=order, num_runs=num_runs)
+            complex_results.append(result)
+        except Exception as e:
+            print(f"Error with {name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print_table(complex_results, is_vector=False)
+
     # =========================================================================
     # Vector Input -> Vector Output Functions
     # =========================================================================
@@ -246,47 +299,39 @@ def main():
     print("VECTOR INPUT -> VECTOR OUTPUT")
     print("=" * 100)
 
-    # Define vector functions using matrix operations (compatible with nattm)
-    # Using matrix-vector products instead of jnp.stack for vector outputs
+    # Define vector functions using natural jnp.array([...]) syntax
     def linear_2d(x):
-        A = jnp.array([[-1.0, 0.5], [0.5, -1.0]])
-        return A @ x
+        return jnp.array([-x[0] + 0.5*x[1], 0.5*x[0] - x[1]])
 
     def rotation_2d(x):
-        A = jnp.array([[0.8, -0.6], [0.6, 0.8]])
-        return A @ x
+        return jnp.array([0.8*x[0] - 0.6*x[1], 0.6*x[0] + 0.8*x[1]])
 
     def vanderpol_rhs(x):
         # x' = [x1, (1-x0^2)*x1 - x0]
-        # Use element-wise multiplication with indicator vectors
-        e0 = jnp.array([1.0, 0.0])
-        e1 = jnp.array([0.0, 1.0])
-        return x[1] * e0 + ((1 - x[0]**2) * x[1] - x[0]) * e1
+        return jnp.array([x[1], (1 - x[0]**2) * x[1] - x[0]])
 
     def lotka_volterra_rhs(x):
         # x' = [x0*(1-x1), x1*(x0-1)]
-        e0 = jnp.array([1.0, 0.0])
-        e1 = jnp.array([0.0, 1.0])
-        return (x[0] * (1 - x[1])) * e0 + (x[1] * (x[0] - 1)) * e1
+        return jnp.array([x[0] * (1 - x[1]), x[1] * (x[0] - 1)])
 
     def pendulum_rhs(x):
         # x' = [x1, -sin(x0) - 0.1*x1]
-        e0 = jnp.array([1.0, 0.0])
-        e1 = jnp.array([0.0, 1.0])
-        return x[1] * e0 + (-jnp.sin(x[0]) - 0.1 * x[1]) * e1
+        return jnp.array([x[1], -jnp.sin(x[0]) - 0.1 * x[1]])
 
     def henon_map(x):
         # y = [1 - 1.4*x0^2 + x1, 0.3*x0]
-        e0 = jnp.array([1.0, 0.0])
-        e1 = jnp.array([0.0, 1.0])
-        return (1 - 1.4 * x[0]**2 + x[1]) * e0 + (0.3 * x[0]) * e1
+        return jnp.array([1 - 1.4 * x[0]**2 + x[1], 0.3 * x[0]])
 
     def lorenz_rhs(x):
         # x' = [10*(x1-x0), x0*(28-x2)-x1, x0*x1 - 8/3*x2]
-        e0 = jnp.array([1.0, 0.0, 0.0])
-        e1 = jnp.array([0.0, 1.0, 0.0])
-        e2 = jnp.array([0.0, 0.0, 1.0])
-        return (10 * (x[1] - x[0])) * e0 + (x[0] * (28 - x[2]) - x[1]) * e1 + (x[0] * x[1] - 8/3 * x[2]) * e2
+        return jnp.array([
+            10 * (x[1] - x[0]),
+            x[0] * (28 - x[2]) - x[1],
+            x[0] * x[1] - 8/3 * x[2]
+        ])
+
+    def breaking(x):
+        return jnp.array([x[0]**4 + x[1]**4 - 2*x[0]**2*x[1]**2, jnp.sin(x[0]) - x[0]])
 
     vec_vec_tests = [
         # 2D -> 2D (dynamical systems style)
@@ -312,6 +357,9 @@ def main():
         # 3D -> 3D
         ("Lorenz RHS", lorenz_rhs,
          icentpert(jnp.array([1.0, 1.0, 1.0]), jnp.array([0.1, 0.1, 0.1])), 2),
+
+        ("Breaking", breaking,
+         icentpert(jnp.array([0., 0.]), jnp.array([1., 1.])), 4),
     ]
 
     vec_vec_results = []

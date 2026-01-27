@@ -31,7 +31,10 @@ def timed(f: Callable):
     return f_timed
 
 
-def run_times(N: int, f: Callable, *args, **kwargs):
+def run_times(N: int, f: Callable, *args, **kwargs) -> Tuple:
+    """
+    Run a function N times and return the (result, times)
+    """
     f_timed = timed(f)
     times = []
     for i in range(N):
