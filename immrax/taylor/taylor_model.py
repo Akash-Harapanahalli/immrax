@@ -39,7 +39,7 @@ def _generate_exponents_impl(d: int, max_order: int) -> Array:
 
 @register_pytree_node_class
 class TaylorModel:
-    r"""Defines a Taylor model set representation
+    r"""Defines a Taylor model set representation with arbitrary output shape.
 
     .. math::
         TM = \{ p(x) + r : x \in D, r \in I \}
@@ -47,7 +47,7 @@ class TaylorModel:
     where:
     - :math:`p(x)` is a multivariate polynomial in the domain variables
     - :math:`D \subseteq \mathbb{R}^d` is the domain (typically a box)
-    - :math:`I \subseteq \mathbb{R}^n` is the interval remainder
+    - :math:`I \subseteq \mathbb{R}^{*output\_shape}` is the interval remainder
 
     The polynomial is represented in the form:
 
@@ -60,13 +60,13 @@ class TaylorModel:
     Parameters
     ----------
     coeffs : ArrayLike
-        Polynomial coefficients. For order k and domain dimension d,
-        shape is (n, num_monomials) where num_monomials = C(d+k, k).
+        Polynomial coefficients. Shape is (*output_shape, num_monomials) where
+        num_monomials = C(d+k, k). The monomial axis is always the **last** axis.
     exponents : ArrayLike
         Exponent matrix, shape (d, num_monomials), integer entries.
         Each column is a multi-index α.
     remainder : Interval
-        Interval remainder bounds.
+        Interval remainder bounds with shape (*output_shape,).
     domain_center : ArrayLike
         Center of the domain box, shape (d,)
     domain_radius : ArrayLike
@@ -80,9 +80,9 @@ class TaylorModel:
            hybrid systems." RTSS 2012.
     """
 
-    coeffs: Array  # Polynomial coefficients, shape (n, num_monomials)
+    coeffs: Array  # Polynomial coefficients, shape (*output_shape, num_monomials)
     exponents: Array  # Exponent matrix, shape (d, num_monomials)
-    remainder: Interval  # Interval remainder
+    remainder: Interval  # Interval remainder, shape (*output_shape,)
     domain_center: Array  # Domain center, shape (d,)
     domain_radius: Array  # Domain half-width, shape (d,)
 
@@ -109,20 +109,24 @@ class TaylorModel:
             # Compute order from exponents (requires concrete values)
             self._static_order = int(jnp.max(jnp.sum(self.exponents, axis=0)))
 
+        # Store output shape (all axes except the last monomial axis)
+        # Monomials are always the LAST axis of coeffs
+        self._output_shape = self.coeffs.shape[:-1]
+
         # Validate dimensions
-        if self.coeffs.ndim != 2:
-            raise ValueError(f"coeffs must be 2D, got shape {self.coeffs.shape}")
+        if self.coeffs.ndim < 1:
+            raise ValueError(f"coeffs must be at least 1D, got shape {self.coeffs.shape}")
         if self.exponents.ndim != 2:
             raise ValueError(f"exponents must be 2D, got shape {self.exponents.shape}")
-        if self.coeffs.shape[1] != self.exponents.shape[1]:
+        if self.coeffs.shape[-1] != self.exponents.shape[1]:
             raise ValueError(
                 f"coeffs and exponents must have same number of monomials: "
-                f"{self.coeffs.shape[1]} vs {self.exponents.shape[1]}"
+                f"{self.coeffs.shape[-1]} vs {self.exponents.shape[1]}"
             )
-        if self.remainder.shape[0] != self.coeffs.shape[0]:
+        if self.remainder.shape != self._output_shape:
             raise ValueError(
-                f"remainder and coeffs must have same output dimension: "
-                f"{self.remainder.shape[0]} vs {self.coeffs.shape[0]}"
+                f"remainder and coeffs must have same output shape: "
+                f"{self.remainder.shape} vs {self._output_shape}"
             )
         if self.domain_center.shape[0] != self.exponents.shape[0]:
             raise ValueError(
@@ -148,20 +152,22 @@ class TaylorModel:
                 self.domain_center,
                 self.domain_radius,
             ),
-            {"_static_order": self._static_order},
+            {"_static_order": self._static_order, "_output_shape": self._output_shape},
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
         static_order = aux_data.get("_static_order") if aux_data else None
+        # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
         return cls(*children, _static_order=static_order)
 
     # --- Properties ---
 
     @property
     def n(self) -> int:
-        """Output dimension."""
-        return self.coeffs.shape[0]
+        """Total number of output elements (product of output_shape)."""
+        import math
+        return math.prod(self._output_shape) if self._output_shape else 1
 
     @property
     def d(self) -> int:
@@ -171,7 +177,7 @@ class TaylorModel:
     @property
     def num_monomials(self) -> int:
         """Number of monomial terms."""
-        return self.coeffs.shape[1]
+        return self.coeffs.shape[-1]
 
     @property
     def order(self) -> int:
@@ -181,48 +187,46 @@ class TaylorModel:
     @property
     def shape(self) -> Tuple[int, ...]:
         """Output shape."""
-        return (self.n,)
+        return self._output_shape
 
     def __getitem__(self, idx) -> "TaylorModel":
-        """Get component(s) of the Taylor Model."""
+        """Get component(s) of the Taylor Model.
+
+        Indexing preserves the monomial axis (last axis of coeffs).
+        The index applies to the output shape dimensions.
+        """
+        # Index into output shape dimensions (coeffs has monomials as last axis)
         c = self.coeffs[idx]
-        if c.ndim == 1:
-            c = c[None, :]
 
+        # Ensure coeffs has at least the monomial dimension
+        if c.ndim == 0:
+            # Single monomial coefficient was selected - shouldn't happen with proper indexing
+            raise ValueError("Cannot index into monomial dimension directly")
+
+        # Index remainder the same way
         rem = self.remainder[idx]
-        # Intervals might return scalars on indexing depending on impl
-        # If scalar, wrap in 1D interval?
-        # Implemented Interval sets lower/upper. Indexing them gives scalars/arrays.
-        # Interval constructor expects arrays.
 
-        # Let's ensure remainder is properly formatted if scalar
-        if hasattr(rem, 'lower') and rem.lower.ndim == 0:
-             # Re-wrap scalar interval into 1D interval?
-             # But TM remainder is n-dim interval.
-             # If idx selects one element, rem is scalar interval.
-             # coeffs is (1, num_monomials). n=1.
-             # scalar interval is fine if n=1?
-             # Let's check init: self.n = coeffs.shape[0].
-             # remainder should match self.n.
-             # self.remainder = remainder.
-             # Checks: assert remainder.lower.shape == (n,)
-             # So if n=1, remainder must be (1,).
-             pass
+        # Ensure remainder shape matches coeffs output shape
+        rem_shape = rem.shape if hasattr(rem, 'shape') else ()
+        coeff_out_shape = c.shape[:-1]
 
-        # If rem is scalar interval, we need to reshape it to (1,)
-        # Check if rem has shape.
-        if hasattr(rem, 'shape') and rem.shape == ():
-             # It's a scalar interval.
-             # We need to reshape its components?
-             # immrax Interval might not support reshape directly.
-             # We can construct new interval.
-             rem = interval(rem.lower[None], rem.upper[None])
+        if rem_shape != coeff_out_shape:
+            # Need to reshape remainder to match
+            if rem_shape == ():
+                # Scalar interval - keep as scalar output shape
+                pass
+            else:
+                # Reshape not needed, shapes should match from same indexing
+                pass
 
         return TaylorModel(c, self.exponents, rem, self.domain_center, self.domain_radius,
                            _static_order=self._static_order)
 
     def __len__(self) -> int:
-        return self.n
+        """Length along first axis of output shape."""
+        if len(self._output_shape) == 0:
+            raise TypeError("Scalar TaylorModel has no len()")
+        return self._output_shape[0]
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -231,12 +235,17 @@ class TaylorModel:
 
     @property
     def constant_term(self) -> Array:
-        """Get the constant (order 0) term of the polynomial."""
+        """Get the constant (order 0) term of the polynomial.
+
+        Returns array with shape (*output_shape,).
+        """
         # Find the column where all exponents are 0
-        is_constant = jnp.all(self.exponents == 0, axis=0)
-        # Sum coefficients for constant terms (should be exactly one)
+        is_constant = jnp.all(self.exponents == 0, axis=0)  # (num_monomials,)
+        # Broadcast mask to match coeffs shape and sum along monomial axis (last)
+        # is_constant has shape (m,), coeffs has shape (*output_shape, m)
+        # We need to broadcast is_constant to match coeffs for the where operation
         return jnp.sum(
-            jnp.where(is_constant[None, :], self.coeffs, 0.0), axis=1
+            jnp.where(is_constant, self.coeffs, 0.0), axis=-1
         )
 
     # --- Polynomial evaluation ---
@@ -252,7 +261,7 @@ class TaylorModel:
         Returns
         -------
         Array
-            Polynomial value, shape (n,)
+            Polynomial value, shape (*output_shape,)
         """
         x = jnp.asarray(x)
         # Normalize to centered coordinates
@@ -269,7 +278,7 @@ class TaylorModel:
         sign_flips = odd_exp.T @ is_negative.astype(jnp.float32)
         signs = jnp.where(sign_flips % 2 == 0, 1.0, -1.0)
 
-        monomials = signs * jnp.exp(log_monomials)
+        monomials = signs * jnp.exp(log_monomials)  # (num_monomials,)
 
         # Handle x_centered = 0 cases (0^0 = 1, 0^k = 0 for k > 0)
         zero_mask = jnp.abs(x_centered) < 1e-30
@@ -278,7 +287,9 @@ class TaylorModel:
         )
         monomials = jnp.where(has_zero_exp, 0.0, monomials)
 
-        return self.coeffs @ monomials
+        # Sum coeffs * monomials along the last (monomial) axis
+        # coeffs has shape (*output_shape, m), monomials has shape (m,)
+        return jnp.sum(self.coeffs * monomials, axis=-1)
 
     def evaluate(self, x: ArrayLike) -> Interval:
         """Evaluate the Taylor model at a point, returning an interval.
@@ -328,6 +339,7 @@ class TaylorModel:
         """Convert to a zonotope (overapproximation).
 
         Each monomial term becomes a generator.
+        Note: Currently only supports 1D output shapes (vectors).
 
         Returns
         -------
@@ -336,6 +348,13 @@ class TaylorModel:
         """
         # Lazy import to avoid circular dependency
         from immrax.generator.sets.zonotope import Zonotope
+
+        if len(self._output_shape) != 1:
+            raise NotImplementedError(
+                f"to_zonotope only supports 1D output shapes, got {self._output_shape}"
+            )
+
+        n = self._output_shape[0]
 
         # Center is the constant term plus remainder center
         remainder_center = self.remainder.center
@@ -349,7 +368,7 @@ class TaylorModel:
         # and scale generators by 0.5
         even_non_const = ~has_odd & ~is_constant  # (m,)
         center_shift = jnp.sum(
-            jnp.where(even_non_const[None, :], 0.5 * self.coeffs, 0.0), axis=1
+            jnp.where(even_non_const, 0.5 * self.coeffs, 0.0), axis=-1
         )  # (n,)
 
         ox = self.constant_term + remainder_center + center_shift
@@ -360,7 +379,7 @@ class TaylorModel:
         # Non-constant generators from polynomial terms
         non_const_mask = ~is_constant  # (m,)
         poly_generators = jnp.where(
-            non_const_mask[None, :], self.coeffs * gen_scale[None, :], 0.0
+            non_const_mask, self.coeffs * gen_scale, 0.0
         )  # (n, m)
 
         # Remainder generators (axis-aligned)
@@ -440,13 +459,13 @@ class TaylorModel:
         has_match = term_orders <= target_order  # (m,)
 
         # Use matrix multiplication for scatter-add
-        # match_matrix.T @ coeffs.T gives us the scattered result
-        # But we need to mask by has_match first
+        # For arbitrary output shape (*output_shape, m), we need to reshape
         scatter_matrix = match_matrix.T.astype(self.dtype)  # (num_canonical, m)
-        masked_coeffs = jnp.where(has_match[None, :], self.coeffs, 0.0)  # (n, m)
+        # Mask coefficients: broadcasting has_match (m,) with coeffs (*output_shape, m)
+        masked_coeffs = jnp.where(has_match, self.coeffs, 0.0)  # (*output_shape, m)
 
-        # new_coeffs[i, j] = sum_k scatter_matrix[j, k] * masked_coeffs[i, k]
-        new_coeffs = masked_coeffs @ scatter_matrix.T  # (n, num_canonical)
+        # Contract along monomial axis: (*output_shape, m) @ (m, num_canonical) -> (*output_shape, num_canonical)
+        new_coeffs = masked_coeffs @ scatter_matrix.T  # (*output_shape, num_canonical)
 
         # Bound terms above target_order and add to remainder
         # Terms with order > target_order need to be absorbed
@@ -459,18 +478,19 @@ class TaylorModel:
         mono_upper = jnp.ones(self.num_monomials)  # (m,)
 
         # Compute term bounds for absorbed terms
-        # For positive coeff: [coeff*lower, coeff*upper]
-        # For negative coeff: [coeff*upper, coeff*lower]
-        absorb_coeffs = jnp.where(absorb_mask[None, :], self.coeffs, 0.0)  # (n, m)
+        # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
+        absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
-        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (n, m)
-        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (n, m)
+        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (*output_shape, m)
+        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (*output_shape, m)
 
-        term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]  # (n, m)
-        term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]  # (n, m)
+        # mono_lower/upper have shape (m,), broadcasting works naturally
+        term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)
+        term_upper = c_pos * mono_upper + c_neg * mono_lower  # (*output_shape, m)
 
-        absorbed_lower = jnp.sum(term_lower, axis=1)  # (n,)
-        absorbed_upper = jnp.sum(term_upper, axis=1)  # (n,)
+        # Sum along monomial axis (last axis)
+        absorbed_lower = jnp.sum(term_lower, axis=-1)  # (*output_shape,)
+        absorbed_upper = jnp.sum(term_upper, axis=-1)  # (*output_shape,)
 
         new_remainder = self.remainder + interval(absorbed_lower, absorbed_upper)
 
@@ -508,16 +528,19 @@ class TaylorModel:
         mono_upper = jnp.ones(self.num_monomials)  # (m,)
 
         # Only absorb terms above target_order
-        absorb_coeffs = jnp.where(absorb_mask[None, :], self.coeffs, 0.0)  # (n, m)
+        # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
+        absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
-        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (n, m)
-        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (n, m)
+        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (*output_shape, m)
+        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (*output_shape, m)
 
-        term_lower = c_pos * mono_lower[None, :] + c_neg * mono_upper[None, :]  # (n, m)
-        term_upper = c_pos * mono_upper[None, :] + c_neg * mono_lower[None, :]  # (n, m)
+        # mono_lower/upper have shape (m,), broadcasting works naturally
+        term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)
+        term_upper = c_pos * mono_upper + c_neg * mono_lower  # (*output_shape, m)
 
-        absorbed_lower = jnp.sum(term_lower, axis=1)  # (n,)
-        absorbed_upper = jnp.sum(term_upper, axis=1)  # (n,)
+        # Sum along monomial axis (last axis)
+        absorbed_lower = jnp.sum(term_lower, axis=-1)  # (*output_shape,)
+        absorbed_upper = jnp.sum(term_upper, axis=-1)  # (*output_shape,)
 
         absorbed_remainder = interval(absorbed_lower, absorbed_upper)
 
@@ -525,7 +548,8 @@ class TaylorModel:
         new_remainder = self.remainder + absorbed_remainder
 
         # Filter coefficients (zero out instead of filtering for JIT)
-        new_coeffs = jnp.where(keep_mask[None, :], self.coeffs, 0.0)
+        # Broadcasting: keep_mask (m,) with coeffs (*output_shape, m)
+        new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorModel(
             new_coeffs,
@@ -540,7 +564,7 @@ class TaylorModel:
 
     def __str__(self) -> str:
         return (
-            f"TaylorModel(n={self.n}, d={self.d}, order={self.order}, "
+            f"TaylorModel(shape={self.shape}, d={self.d}, order={self.order}, "
             f"monomials={self.num_monomials})"
         )
 
@@ -582,9 +606,13 @@ def _bound_monomial(exp: Array) -> Interval:
 def _merge_taylor_terms(
     coeffs1: Array, exp1: Array, coeffs2: Array, exp2: Array
 ) -> Tuple[Array, Array]:
-    """Merge Taylor terms from two Taylor models."""
-    # Simple concatenation (compaction done separately)
-    coeffs = jnp.concatenate([coeffs1, coeffs2], axis=1)
+    """Merge Taylor terms from two Taylor models.
+
+    Coeffs have shape (*output_shape, num_monomials).
+    Concatenates along the last (monomial) axis.
+    """
+    # Simple concatenation along monomial axis (last axis)
+    coeffs = jnp.concatenate([coeffs1, coeffs2], axis=-1)
     exp = jnp.concatenate([exp1, exp2], axis=1)
     return _compact_taylor_terms(coeffs, exp)
 
@@ -593,11 +621,25 @@ def _compact_taylor_terms(coeffs: Array, exponents: Array) -> Tuple[Array, Array
     """Compact Taylor terms by combining terms with identical exponents.
 
     Simplified version that removes zero coefficients.
+    Coeffs have shape (*output_shape, num_monomials).
     """
     # Remove terms with zero coefficients
-    norms = jnp.linalg.norm(coeffs, axis=0)
-    nonzero_mask = norms > 1e-12
-    coeffs_compact = jnp.where(nonzero_mask[None, :], coeffs, 0.0)
+    # Flatten output shape for norm computation, then reshape back
+    original_shape = coeffs.shape
+    output_shape = original_shape[:-1]
+    num_monomials = original_shape[-1]
+
+    if len(output_shape) == 0:
+        # Scalar output: coeffs has shape (m,)
+        norms = jnp.abs(coeffs)
+    else:
+        # Flatten to (prod(output_shape), m) for norm computation
+        flat_coeffs = coeffs.reshape(-1, num_monomials)
+        norms = jnp.linalg.norm(flat_coeffs, axis=0)  # (m,)
+
+    nonzero_mask = norms > 1e-12  # (m,)
+    # Broadcasting: mask (m,) with coeffs (*output_shape, m)
+    coeffs_compact = jnp.where(nonzero_mask, coeffs, 0.0)
     return coeffs_compact, exponents
 
 
@@ -632,11 +674,12 @@ def taylor_model(
     Parameters
     ----------
     coeffs : ArrayLike
-        Polynomial coefficients, shape (n, num_monomials)
+        Polynomial coefficients, shape (*output_shape, num_monomials).
+        Monomials are always the last axis.
     exponents : ArrayLike
         Exponent matrix, shape (d, num_monomials)
     remainder : Interval, optional
-        Remainder interval. Default is zero interval.
+        Remainder interval with shape (*output_shape,). Default is zero interval.
     domain_center : ArrayLike, optional
         Domain center, shape (d,). Default is origin.
     domain_radius : ArrayLike, optional
@@ -650,11 +693,15 @@ def taylor_model(
     coeffs = jnp.asarray(coeffs)
     exponents = jnp.asarray(exponents, dtype=jnp.int32)
 
-    n = coeffs.shape[0]
+    output_shape = coeffs.shape[:-1]
     d = exponents.shape[0]
 
     if remainder is None:
-        remainder = interval(jnp.zeros(n, dtype=coeffs.dtype))
+        if len(output_shape) == 0:
+            # Scalar output
+            remainder = interval(jnp.zeros((), dtype=coeffs.dtype))
+        else:
+            remainder = interval(jnp.zeros(output_shape, dtype=coeffs.dtype))
 
     if domain_center is None:
         domain_center = jnp.zeros(d, dtype=coeffs.dtype)
@@ -680,23 +727,40 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
     Parameters
     ----------
     iv : Interval
-        The domain interval
+        The domain interval with shape (*output_shape,).
+        For scalar intervals, use interval(scalar_value).
     order : int
         Polynomial degree of the Taylor Model (default: 1)
 
     Returns
     -------
     TaylorModel
-        Taylor model for identity function
+        Taylor model for identity function with output shape matching interval shape.
+        Domain dimension d = prod(output_shape).
     """
     center = iv.center
     radius = iv.pert
-    n = center.shape[0]
+    output_shape = center.shape
+
+    # Handle scalar case
+    if len(output_shape) == 0:
+        center = center[None]
+        radius = radius[None]
+        output_shape = (1,)
+        scalar_output = True
+    else:
+        scalar_output = False
+
+    # Flatten to get domain dimension
+    import math
+    n = math.prod(output_shape)
+    center_flat = center.reshape(-1)
+    radius_flat = radius.reshape(-1)
 
     # For identity: p(x_norm) = center + radius * x_norm
     # Note: Higher order terms are simply zero.
 
-    # Generate exponents for full order
+    # Generate exponents for full order (d = n = prod(output_shape))
     exponents = _generate_exponents(n, order)
     num_monomials = exponents.shape[1]
 
@@ -711,18 +775,29 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
     # Compare exponents (d, m) with each unit vector e_i, reduce over d dimension
     is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (n, m)
 
-    # Build coefficients matrix
+    # Build coefficients matrix (flat first, then reshape)
     # Constant contribution: center broadcasted to constant term column
-    const_coeffs = jnp.where(is_constant[None, :], center[:, None], 0.0)  # (n, m)
+    const_coeffs = jnp.where(is_constant[None, :], center_flat[:, None], 0.0)  # (n, m)
 
     # Linear contribution: radius[i] for the x_i term in row i
-    linear_coeffs = jnp.where(is_linear, radius[:, None], 0.0)  # (n, m)
+    linear_coeffs = jnp.where(is_linear, radius_flat[:, None], 0.0)  # (n, m)
 
-    coeffs = const_coeffs + linear_coeffs
+    coeffs_flat = const_coeffs + linear_coeffs  # (n, m)
 
-    remainder = interval(jnp.zeros(n, dtype=center.dtype))
+    # Reshape to output shape
+    if scalar_output:
+        # For scalar output, coeffs should have shape (m,) not (1, m)
+        coeffs = coeffs_flat[0]  # (m,)
+        remainder = interval(jnp.zeros((), dtype=center_flat.dtype))
+        domain_center = center_flat
+        domain_radius = radius_flat
+    else:
+        coeffs = coeffs_flat.reshape(*output_shape, num_monomials)  # (*output_shape, m)
+        remainder = interval(jnp.zeros(output_shape, dtype=center_flat.dtype))
+        domain_center = center_flat
+        domain_radius = radius_flat
 
-    return TaylorModel(coeffs, exponents, remainder, center, radius, _static_order=order)
+    return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=order)
 
 
 def taylor_model_from_function(
@@ -880,10 +955,10 @@ def taylor_model_from_function(
     return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=max_order)
 
 
-def taylor_model_concatenate(tms: list["TaylorModel"]) -> "TaylorModel":
-    """Concatenate multiple TaylorModels along the output dimension.
+def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "TaylorModel":
+    """Concatenate multiple TaylorModels along an output dimension.
 
-    This is the equivalent of jnp.array([tm1, tm2, ...]) for TaylorModels.
+    This is the equivalent of jnp.concatenate for TaylorModels.
     All input TaylorModels must have the same domain and exponent structure.
 
     For JIT compatibility, this function requires all TMs to have identical
@@ -893,11 +968,14 @@ def taylor_model_concatenate(tms: list["TaylorModel"]) -> "TaylorModel":
     ----------
     tms : list of TaylorModel
         TaylorModels to concatenate.
+    axis : int
+        The axis in the output shape along which to concatenate (default: 0).
+        Does not affect the monomial axis (which is always last in coeffs).
 
     Returns
     -------
     TaylorModel
-        Concatenated TaylorModel with n = sum of all input n's.
+        Concatenated TaylorModel.
     """
     if len(tms) == 0:
         raise ValueError("Cannot concatenate empty list of TaylorModels")
@@ -912,11 +990,14 @@ def taylor_model_concatenate(tms: list["TaylorModel"]) -> "TaylorModel":
     exponents = ref.exponents
     static_order = max(tm._static_order for tm in tms)
 
-    # Stack coefficients and remainders (JIT-compatible)
-    coeffs = jnp.concatenate([tm.coeffs for tm in tms], axis=0)
+    # Stack coefficients along specified axis of output shape
+    # coeffs have shape (*output_shape, m), so axis applies to output_shape
+    coeffs = jnp.concatenate([tm.coeffs for tm in tms], axis=axis)
+
+    # Stack remainders along same axis
     remainder = interval(
-        jnp.concatenate([tm.remainder.lower.reshape(-1) for tm in tms]),
-        jnp.concatenate([tm.remainder.upper.reshape(-1) for tm in tms])
+        jnp.concatenate([tm.remainder.lower for tm in tms], axis=axis),
+        jnp.concatenate([tm.remainder.upper for tm in tms], axis=axis)
     )
 
     return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=static_order)
