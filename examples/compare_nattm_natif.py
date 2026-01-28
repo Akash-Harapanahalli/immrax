@@ -157,8 +157,7 @@ def main():
     print("Comparison: nattm (Taylor Model) vs natif (Interval) for Function Bounding")
     print("=" * 100)
 
-    # num_runs = 100
-    num_runs = 1
+    num_runs = 100
     print(f"\nTiming averaged over {num_runs} runs (after JIT compilation)")
 
     # =========================================================================

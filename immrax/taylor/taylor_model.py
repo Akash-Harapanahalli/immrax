@@ -409,7 +409,11 @@ class TaylorModel:
 
     # --- Order reduction and canonicalization ---
 
-    def to_canonical(self, target_order: int | None = None) -> "TaylorModel":
+    def to_canonical(
+        self,
+        target_order: int | None = None,
+        method: str | None = None,
+    ) -> "TaylorModel":
         """Convert to canonical exponent structure.
 
         The canonical structure includes all monomials up to target_order,
@@ -419,6 +423,11 @@ class TaylorModel:
         ----------
         target_order : int, optional
             Target order. If None, uses current maximum order.
+        method : str, optional
+            Algorithm for index mapping: "broadcast" (O(m * num_canonical), fast
+            for small num_canonical), "searchsorted" (O(m log num_canonical),
+            better for large num_canonical), or None to auto-select based on
+            num_canonical threshold.
 
         Returns
         -------
@@ -432,8 +441,10 @@ class TaylorModel:
         canonical_exp = _get_canonical_exponents(self.d, target_order)
         num_canonical = canonical_exp.shape[1]
 
-        # Create mapping from current exponents to canonical indices
-        # For JIT compatibility, we use fully vectorized operations
+        # Auto-select method based on num_canonical if not specified
+        # Threshold ~50: below this broadcast is faster due to lower overhead
+        if method is None:
+            method = "searchsorted" if num_canonical > 50 else "broadcast"
 
         # Compute a unique hash for each exponent vector
         # Use weighted sum: sum_i exp[i] * (max_order+1)^i
@@ -446,26 +457,30 @@ class TaylorModel:
         # Hash canonical exponents: (num_canonical,)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        # For each current term, find its index in canonical
-        # Using broadcasting: (m, num_canonical)
-        match_matrix = current_hash[:, None] == canonical_hash[None, :]
-
-        # Find canonical index for each current term (argmax along canonical axis)
-        # canonical_indices[i] = j means current term i maps to canonical term j
-        canonical_indices = jnp.argmax(match_matrix, axis=1)  # (m,)
-
         # Check if each current term has a match (is within target_order)
         term_orders = jnp.sum(self.exponents, axis=0)  # (m,)
         has_match = term_orders <= target_order  # (m,)
 
-        # Use matrix multiplication for scatter-add
-        # For arbitrary output shape (*output_shape, m), we need to reshape
-        scatter_matrix = match_matrix.T.astype(self.dtype)  # (num_canonical, m)
+        if method == "broadcast":
+            # O(m * num_canonical) - fast for small num_canonical
+            match_matrix = current_hash[:, None] == canonical_hash[None, :]  # (m, num_canonical)
+            scatter_matrix = match_matrix.astype(self.dtype)  # (m, num_canonical)
+        elif method == "searchsorted":
+            # O(m log num_canonical) - better for large num_canonical
+            sort_perm = jnp.argsort(canonical_hash)
+            sorted_canonical_hash = canonical_hash[sort_perm]
+            sorted_indices = jnp.searchsorted(sorted_canonical_hash, current_hash)
+            sorted_indices = jnp.clip(sorted_indices, 0, num_canonical - 1)
+            canonical_indices = sort_perm[sorted_indices]
+            scatter_matrix = jax.nn.one_hot(canonical_indices, num_canonical, dtype=self.dtype)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'broadcast' or 'searchsorted'.")
+
         # Mask coefficients: broadcasting has_match (m,) with coeffs (*output_shape, m)
         masked_coeffs = jnp.where(has_match, self.coeffs, 0.0)  # (*output_shape, m)
 
         # Contract along monomial axis: (*output_shape, m) @ (m, num_canonical) -> (*output_shape, num_canonical)
-        new_coeffs = masked_coeffs @ scatter_matrix.T  # (*output_shape, num_canonical)
+        new_coeffs = masked_coeffs @ scatter_matrix  # (*output_shape, num_canonical)
 
         # Bound terms above target_order and add to remainder
         # Terms with order > target_order need to be absorbed

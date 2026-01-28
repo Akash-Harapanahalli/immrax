@@ -142,7 +142,7 @@ def run_benchmarks(alg, alg_kwargs):
 
     vdp = VanDerPol(mu=1.)
     # iv_vdp = interval(jnp.array([0.9, 0.0]), jnp.array([1.1, 0.2]))
-    iv_vdp = icentpert([-2., 0.], [0.1, 0.01]).scale(.5)
+    iv_vdp = icentpert([-2., 0.], [0.1, 0.01]).scale(.05)
 
     z0 = zonotope_from_interval(iv_vdp)
     cz0 = constrained_zonotope_from_zonotope(z0)

@@ -96,6 +96,18 @@ class Interval:
     def transpose(self, *args) -> "Interval":
         return Interval(self.lower.transpose(*args), self.upper.transpose(*args))
 
+    def broadcast_to(self, shape) -> "Interval":
+        return Interval(jnp.broadcast_to(self.lower, shape), jnp.broadcast_to(self.upper, shape))
+
+    def squeeze(self, axis=None) -> "Interval":
+        return Interval(jnp.squeeze(self.lower, axis=axis), jnp.squeeze(self.upper, axis=axis))
+
+    def sum(self, axis=None, keepdims=False) -> "Interval":
+        return Interval(
+            jnp.sum(self.lower, axis=axis, keepdims=keepdims),
+            jnp.sum(self.upper, axis=axis, keepdims=keepdims)
+        )
+
     def scale (self, factor: Union[float, ArrayLike]) -> "Interval":
         return icentpert(self.center, self.pert * factor)
 

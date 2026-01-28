@@ -469,10 +469,7 @@ def _tm_reshape_p(x, *, new_sizes, dimensions=None) -> TaylorModel:
         new_coeffs = x.coeffs.reshape(*coeff_new_sizes)
 
     # Reshape remainder
-    new_remainder = interval(
-        x.remainder.lower.reshape(*new_sizes),
-        x.remainder.upper.reshape(*new_sizes)
-    )
+    new_remainder = x.remainder.reshape(*new_sizes)
 
     return TaylorModel(new_coeffs, x.exponents, new_remainder,
                        x.domain_center, x.domain_radius, _static_order=x._static_order)
@@ -502,10 +499,7 @@ def _tm_transpose_p(x, *, permutation) -> TaylorModel:
     new_coeffs = lax.transpose(x.coeffs, permutation=coeff_permutation)
 
     # Transpose remainder
-    new_remainder = interval(
-        lax.transpose(x.remainder.lower, permutation=permutation),
-        lax.transpose(x.remainder.upper, permutation=permutation)
-    )
+    new_remainder = x.remainder.transpose(*permutation)
 
     return TaylorModel(new_coeffs, x.exponents, new_remainder,
                        x.domain_center, x.domain_radius, _static_order=x._static_order)
@@ -532,10 +526,7 @@ def _tm_squeeze_p(x, *, dimensions) -> TaylorModel:
     new_coeffs = lax.squeeze(x.coeffs, dimensions=dimensions)
 
     # Apply squeeze to remainder
-    new_remainder = interval(
-        lax.squeeze(x.remainder.lower, dimensions=dimensions),
-        lax.squeeze(x.remainder.upper, dimensions=dimensions)
-    )
+    new_remainder = x.remainder.squeeze(axis=dimensions)
 
     return TaylorModel(new_coeffs, x.exponents, new_remainder,
                        x.domain_center, x.domain_radius, _static_order=x._static_order)
@@ -719,12 +710,8 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
             x_coeffs, x.exponents, y_coeffs, y.exponents
         )
 
-        # Add remainders using Interval addition (with broadcasting)
-        x_rem_lower = jnp.broadcast_to(x.remainder.lower, broadcast_shape)
-        x_rem_upper = jnp.broadcast_to(x.remainder.upper, broadcast_shape)
-        y_rem_lower = jnp.broadcast_to(y.remainder.lower, broadcast_shape)
-        y_rem_upper = jnp.broadcast_to(y.remainder.upper, broadcast_shape)
-        new_remainder = interval(x_rem_lower + y_rem_lower, x_rem_upper + y_rem_upper)
+        # Add remainders (Interval addition auto-broadcasts)
+        new_remainder = x.remainder + y.remainder
 
         new_order = max(x._static_order, y._static_order)
         result = TaylorModel(
@@ -756,9 +743,7 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
         )
 
         # Broadcast remainder
-        x_rem_lower = jnp.broadcast_to(x.remainder.lower, broadcast_shape)
-        x_rem_upper = jnp.broadcast_to(x.remainder.upper, broadcast_shape)
-        new_remainder = interval(x_rem_lower, x_rem_upper)
+        new_remainder = x.remainder.broadcast_to(broadcast_shape)
 
         result = TaylorModel(
             new_coeffs, new_exponents, new_remainder, x.domain_center, x.domain_radius,
@@ -814,7 +799,7 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         if x.d != y.d:
             raise ValueError(f"Domain dimensions must match: {x.d} vs {y.d}")
 
-        # Broadcast output shapes
+        # Broadcast output shapes, throws an error if outputs are not compatible
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, y._output_shape)
 
         d = x.d
@@ -831,7 +816,7 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, m2))
 
         # Compute all product coefficients: shape (*broadcast_shape, m1*m2)
-        # Outer product on monomial axis
+        # Outer product (discrete convolution) along the last monomial axis
         coeff1 = x_coeffs[..., :, None]  # (*broadcast_shape, m1, 1)
         coeff2 = y_coeffs[..., None, :]  # (*broadcast_shape, 1, m2)
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
@@ -871,25 +856,10 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         p1_bounds = _bound_polynomial(x)
         p2_bounds = _bound_polynomial(y)
 
-        # Broadcast polynomial bounds and remainders
-        p1_lower = jnp.broadcast_to(p1_bounds.lower, broadcast_shape)
-        p1_upper = jnp.broadcast_to(p1_bounds.upper, broadcast_shape)
-        p2_lower = jnp.broadcast_to(p2_bounds.lower, broadcast_shape)
-        p2_upper = jnp.broadcast_to(p2_bounds.upper, broadcast_shape)
-        p1_bounds_bc = interval(p1_lower, p1_upper)
-        p2_bounds_bc = interval(p2_lower, p2_upper)
-
-        x_rem_lower = jnp.broadcast_to(x.remainder.lower, broadcast_shape)
-        x_rem_upper = jnp.broadcast_to(x.remainder.upper, broadcast_shape)
-        y_rem_lower = jnp.broadcast_to(y.remainder.lower, broadcast_shape)
-        y_rem_upper = jnp.broadcast_to(y.remainder.upper, broadcast_shape)
-        x_rem_bc = interval(x_rem_lower, x_rem_upper)
-        y_rem_bc = interval(y_rem_lower, y_rem_upper)
-
-        # Cross terms using Interval multiplication
-        p1_r2 = p1_bounds_bc * y_rem_bc
-        r1_p2 = x_rem_bc * p2_bounds_bc
-        r1_r2 = x_rem_bc * y_rem_bc
+        # Cross terms using Interval multiplication (auto-broadcasts)
+        p1_r2 = p1_bounds * y.remainder
+        r1_p2 = x.remainder * p2_bounds
+        r1_r2 = x.remainder * y.remainder
 
         # Combined remainder
         new_remainder = p1_r2 + r1_p2 + r1_r2 + truncated_remainder
@@ -919,11 +889,8 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         # Scale coefficients
         new_coeffs = alpha_bc[..., None] * x_coeffs
 
-        # Scale remainder
-        x_rem_lower = jnp.broadcast_to(x.remainder.lower, broadcast_shape)
-        x_rem_upper = jnp.broadcast_to(x.remainder.upper, broadcast_shape)
-        alpha_iv = interval(alpha_bc, alpha_bc)
-        new_remainder = alpha_iv * interval(x_rem_lower, x_rem_upper)
+        # Scale remainder (Interval * array auto-broadcasts)
+        new_remainder = x.remainder * alpha
 
         return TaylorModel(
             new_coeffs,
@@ -978,10 +945,10 @@ def _tm_univariate(
     n_flat = math.prod(output_shape) if output_shape else 1
     c_flat = c.reshape(-1) if output_shape else c[None]  # (n_flat,)
 
-    # 1. Compute Taylor coefficients f^(k)(c)/k! using jet
+    # 1. Compute Taylor coefficients f^(k)(c)/k! using jet (univariate)
     def get_coeffs(val):
         primals = (val,)
-        series = (tuple(1.0 if i == 0 else 0.0 for i in range(order)),)
+        series = ((1.,) + (0.,) * (order - 1),)
         f_val, f_series = jet(prim_func, primals, series)
         return jnp.array([f_val] + list(f_series))
 
@@ -1023,7 +990,7 @@ def _tm_univariate(
     def get_deriv_bound(i):
         def deriv_func(v):
             primals = (v,)
-            series = (tuple(1.0 if j == 0 else 0.0 for j in range(order + 1)),)
+            series = ((1.,) + (0.,) * order,)
             _, f_series = jet(prim_func, primals, series)
             return f_series[-1] * fact(order + 1)
 
@@ -1180,52 +1147,6 @@ tm_inclusion_registry[lax.pow_p] = _tm_pow_p
 _needs_max_order.add(lax.pow_p)
 
 
-def _tm_rmatmul_p(self: TaylorModel, other: ArrayLike) -> TaylorModel:
-    """Left matrix multiplication: M @ TM.
-
-    For TM with output shape (n,), M @ TM computes M @ TM for M of shape (m, n).
-    Result has output shape (m,).
-
-    Note: Currently only supports TMs with 1D output shape.
-    """
-    if len(self._output_shape) != 1:
-        raise NotImplementedError(
-            f"Matrix multiplication only supports 1D output TMs, got shape {self._output_shape}"
-        )
-
-    M = jnp.asarray(other)
-    n = self._output_shape[0]
-
-    # M has shape (m, n), coeffs has shape (n, num_monomials)
-    # Result coeffs has shape (m, num_monomials)
-    new_coeffs = M @ self.coeffs
-
-    # Remainder transformation using interval matrix multiplication
-    rem_l = self.remainder.lower  # (n,)
-    rem_u = self.remainder.upper  # (n,)
-
-    # Standard interval matmul: [M] * [r]
-    # lower = M_pos @ r_l + M_neg @ r_u
-    # upper = M_pos @ r_u + M_neg @ r_l
-
-    M_pos = jnp.maximum(M, 0.0)
-    M_neg = jnp.minimum(M, 0.0)
-
-    new_l = M_pos @ rem_l + M_neg @ rem_u
-    new_u = M_pos @ rem_u + M_neg @ rem_l
-
-    new_remainder = interval(new_l, new_u)
-
-    return TaylorModel(
-        new_coeffs,
-        self.exponents,
-        new_remainder,
-        self.domain_center,
-        self.domain_radius,
-        _static_order=self._static_order,
-    )
-
-TaylorModel.__rmatmul__ = _tm_rmatmul_p
 
 
 
@@ -1271,37 +1192,78 @@ tm_inclusion_registry[lax.abs_p] = _tm_abs_p
 
 # --- Linear algebra ---
 
+def _tm_dot_general_array(arr, tm, dim_nums):
+    """Handle dot_general(Array, TM) — the primary Array-TM implementation.
+
+    The monomial axis (last axis of tm.coeffs) is on the rhs, so it
+    naturally ends up at the end of the dot_general output.
+    """
+    from immrax.inclusion.nif import inclusion_registry
+
+    # arr @ (P(x) + R) = arr @ P(x) + arr @ R
+
+    # Linear operation on polynomial is just a linear operation on the coefficients
+    new_coeffs = lax.dot_general(arr, tm.coeffs, dimension_numbers=dim_nums)
+    # Interval arithmetic for remainder (use registry directly — natif would
+    # re-trace lax.dot_general, which fails on dimension_numbers tuples)
+    new_remainder = inclusion_registry[lax.dot_general_p](
+        interval(arr, arr), tm.remainder, dimension_numbers=dim_nums
+    )
+
+    return TaylorModel(
+        new_coeffs, tm.exponents, new_remainder,
+        tm.domain_center, tm.domain_radius, _static_order=tm._static_order,
+    )
+
+
 def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, **kwargs) -> TaylorModel:
-    """Taylor model general dot product with polynomial convolution.
+    """Taylor model general dot product.
 
-    Implements proper polynomial multiplication for contracted dimensions:
-    (Σ aᵢ xᵅ) · (Σ bⱼ xᵝ) = Σ aᵢbⱼ x^(α+β)
-
-    For TMs with output shapes, dot_general contracts specified dimensions
-    while performing polynomial multiplication.
+    Three cases:
+    - Array @ TM: apply dot_general to coefficients, interval dot_general for remainder
+    - TM @ Array: swap to Array @ TM with swapped dimension_numbers, transpose result
+    - TM @ TM: polynomial convolution with proper monomial multiplication
     """
     dimension_numbers = kwargs["dimension_numbers"]
     (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
 
-    # For matrix-vector: A @ x where A is array and x is TM (1D output)
+    # --- Array @ TM ---
     if not istaylormodel(A) and istaylormodel(B):
-        A = jnp.asarray(A)
-        # Use specialized __rmatmul__ for array @ TM with 1D output
-        if len(B._output_shape) == 1:
-            return A @ B
-        # For general case, convert A to TM and use TM @ TM
-        A_tm = _tm_from_interval(interval(A), B.d, B._static_order,
-                                  B.domain_center, B.domain_radius)
-        return _tm_dot_general_p(A_tm, B, max_order=max_order, **kwargs)
+        return _tm_dot_general_array(jnp.asarray(A), B, dimension_numbers)
 
-    # For TM @ array
+    # --- TM @ Array: swap to Array @ TM, then transpose output ---
     if istaylormodel(A) and not istaylormodel(B):
-        B = jnp.asarray(B)
-        B_tm = _tm_from_interval(interval(B), A.d, A._static_order,
-                                  A.domain_center, A.domain_radius)
-        return _tm_dot_general_p(A, B_tm, max_order=max_order, **kwargs)
+        B_arr = jnp.asarray(B)
+        swapped_dims = ((rhs_contracting, lhs_contracting), (rhs_batch, lhs_batch))
+        result = _tm_dot_general_array(B_arr, A, swapped_dims)
 
-    # TM @ TM case with polynomial convolution
+        # Fix output dimension order.
+        # dot_general(A, B) output: (*batch, *rem_A, *rem_B)
+        # dot_general(B, A, swapped) output: (*batch, *rem_B, *rem_A)
+        # For coeffs, monomial axis is at the end in both cases.
+        nb = len(lhs_batch)
+        n_rem_A = len(A._output_shape) - len(lhs_contracting) - len(lhs_batch)
+        n_rem_B = B_arr.ndim - len(rhs_contracting) - len(rhs_batch)
+
+        if n_rem_A > 0 and n_rem_B > 0:
+            # Transpose: (*batch, *rem_B, *rem_A, mono) → (*batch, *rem_A, *rem_B, mono)
+            perm = (
+                *range(nb),
+                *range(nb + n_rem_B, nb + n_rem_B + n_rem_A),
+                *range(nb, nb + n_rem_B),
+                nb + n_rem_A + n_rem_B,  # mono axis
+            )
+            new_coeffs = jnp.transpose(result.coeffs, perm)
+            rem_perm = perm[:-1]  # same without mono axis
+            new_remainder = result.remainder.transpose(*rem_perm)
+            return TaylorModel(
+                new_coeffs, result.exponents, new_remainder,
+                result.domain_center, result.domain_radius,
+                _static_order=result._static_order,
+            )
+        return result
+
+    # --- TM @ TM: polynomial convolution ---
     if istaylormodel(A) and istaylormodel(B):
         if A.d != B.d:
             raise ValueError(f"Domain dimensions must match: {A.d} vs {B.d}")
@@ -1311,46 +1273,30 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         m1 = A.num_monomials
         m2 = B.num_monomials
 
-        # Compute product exponents (same for all output positions)
-        # exp1 (d, m1), exp2 (d, m2) -> product_exp (d, m1*m2)
+        # Compute product exponents: (d, m1*m2)
         product_exp = (A.exponents[:, :, None] + B.exponents[:, None, :]).reshape(d, m1 * m2)
 
-        # Compute product coefficients using double vmap over monomial axes
-        # For each pair of monomials (i, j), compute standard dot_general on coefficients
-        # A.coeffs has shape (*A_shape, m1), B.coeffs has shape (*B_shape, m2)
-        # Result coeffs should have shape (*result_shape, m1*m2)
-
-        # Use vmap to iterate over monomial pairs
+        # Compute product coefficients via double vmap over monomial axes (last axis)
         def contract_mono_pair(a_mono_coeffs, b_mono_coeffs):
-            # a_mono_coeffs has shape (*A_shape,), b_mono_coeffs has shape (*B_shape,)
-            # Perform standard dot_general contraction
             return lax.dot_general(a_mono_coeffs, b_mono_coeffs, dimension_numbers=dimension_numbers)
 
-        # vmap over m2 (B's monomials), then over m1 (A's monomials)
-        # Move monomial axis to front for vmapping
-        A_coeffs_t = jnp.moveaxis(A.coeffs, -1, 0)  # (m1, *A_shape)
-        B_coeffs_t = jnp.moveaxis(B.coeffs, -1, 0)  # (m2, *B_shape)
+        # vmap over m2 (last axis of B.coeffs), then m1 (last axis of A.coeffs)
+        contract_over_m2 = jax.vmap(contract_mono_pair, (None, -1), -1)
+        contract_over_m1m2 = jax.vmap(contract_over_m2, (-1, None), -1)
 
-        # Double vmap: result has shape (m1, m2, *result_shape)
-        contract_over_m2 = jax.vmap(contract_mono_pair, (None, 0), 0)  # over m2
-        contract_over_m1m2 = jax.vmap(contract_over_m2, (0, None), 0)  # over m1
+        result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)  # (*result_shape, m1, m2)
 
-        result_coeffs_mm = contract_over_m1m2(A_coeffs_t, B_coeffs_t)  # (m1, m2, *result_shape)
-
-        # Reshape to (*result_shape, m1*m2)
-        result_shape = result_coeffs_mm.shape[2:]
-        result_coeffs = jnp.moveaxis(result_coeffs_mm.reshape(m1 * m2, *result_shape), 0, -1)
+        # Merge monomial pair axes into single axis: (*result_shape, m1*m2)
+        result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
         # Truncate high-order terms
-        total_orders = jnp.sum(product_exp, axis=0)  # (m1*m2,)
+        total_orders = jnp.sum(product_exp, axis=0)
         keep_mask = total_orders <= effective_order
 
-        # Zero out high-order coefficients
         new_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
-        # Bound truncated terms and add to remainder
+        # Bound truncated terms
         truncated_coeffs = jnp.where(keep_mask, 0.0, result_coeffs)
-
         has_odd = jnp.any(product_exp % 2 == 1, axis=0)
         mono_lower = jnp.where(has_odd, -1.0, 0.0)
         mono_upper = jnp.ones(m1 * m2)
@@ -1360,51 +1306,40 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         term_lower = c_pos * mono_lower + c_neg * mono_upper
         term_upper = c_pos * mono_upper + c_neg * mono_lower
 
-        trunc_lower = jnp.sum(term_lower, axis=-1)
-        trunc_upper = jnp.sum(term_upper, axis=-1)
-        truncated_remainder = interval(trunc_lower, trunc_upper)
+        truncated_remainder = interval(
+            jnp.sum(term_lower, axis=-1),
+            jnp.sum(term_upper, axis=-1),
+        )
 
-        # Compute remainder from polynomial bounds and input remainders
-        # (p_A + r_A) · (p_B + r_B) involves cross terms
+        # Cross terms: (p_A + r_A) · (p_B + r_B) - p_A · p_B
         p_A_bounds = _bound_polynomial(A)
         p_B_bounds = _bound_polynomial(B)
 
-        # Use interval dot_general for remainder computation
         from immrax.inclusion.nif import inclusion_registry
-
-        # Cross term: p_A · r_B
-        p_A_r_B = inclusion_registry[lax.dot_general_p](
-            p_A_bounds, B.remainder, dimension_numbers=dimension_numbers
+        iv_dot = lambda a, b: inclusion_registry[lax.dot_general_p](
+            a, b, dimension_numbers=dimension_numbers
         )
 
-        # Cross term: r_A · p_B
-        r_A_p_B = inclusion_registry[lax.dot_general_p](
-            A.remainder, p_B_bounds, dimension_numbers=dimension_numbers
+        new_remainder = (
+            iv_dot(p_A_bounds, B.remainder)
+            + iv_dot(A.remainder, p_B_bounds)
+            + iv_dot(A.remainder, B.remainder)
+            + truncated_remainder
         )
-
-        # Cross term: r_A · r_B
-        r_A_r_B = inclusion_registry[lax.dot_general_p](
-            A.remainder, B.remainder, dimension_numbers=dimension_numbers
-        )
-
-        # Combined remainder
-        new_remainder = p_A_r_B + r_A_p_B + r_A_r_B + truncated_remainder
 
         result = TaylorModel(
-            new_coeffs,
-            product_exp,
-            new_remainder,
-            A.domain_center,
-            A.domain_radius,
-            _static_order=effective_order,
+            new_coeffs, product_exp, new_remainder,
+            A.domain_center, A.domain_radius, _static_order=effective_order,
         )
-
         return result.to_canonical(effective_order)
 
     return lax.dot_general_p.bind(A, B, **kwargs)
 
 tm_inclusion_registry[lax.dot_general_p] = _tm_dot_general_p
 _needs_max_order.add(lax.dot_general_p)
+
+TaylorModel.__matmul__ = nattm(jnp.matmul)
+TaylorModel.__rmatmul__ = lambda self, other: nattm(jnp.matmul)(other, self)
 
 
 # --- Comparison operations (return intervals/arrays, not TMs) ---
@@ -1474,10 +1409,7 @@ def _tm_reduce_sum_p(x: TaylorModel, *, axes) -> TaylorModel:
     # Sum over specified axes while preserving monomial axis
 
     new_coeffs = jnp.sum(x.coeffs, axis=axes)
-    new_remainder = interval(
-        jnp.sum(x.remainder.lower, axis=axes),
-        jnp.sum(x.remainder.upper, axis=axes)
-    )
+    new_remainder = x.remainder.sum(axis=axes)
 
     return TaylorModel(new_coeffs, x.exponents, new_remainder,
                        x.domain_center, x.domain_radius, _static_order=x._static_order)

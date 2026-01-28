@@ -23,9 +23,9 @@ def timed(f: Callable):
     @wraps(f)
     @api_boundary
     def f_timed(*args, **kwargs):
-        t0 = time.time()
+        t0 = time.perf_counter()
         ret = jax.block_until_ready(f(*args, **kwargs))
-        tf = time.time()
+        tf = time.perf_counter()
         return ret, (tf - t0)
 
     return f_timed

@@ -642,8 +642,8 @@ def _inclusion_log1p_p(x: Interval, accuracy=None) -> Interval :
 
 inclusion_registry[lax.log1p_p] = _inclusion_log1p_p
 
-Interval.__matmul__ = jit(natif(jnp.matmul))
-Interval.__rmatmul__ = jit(natif(jnp.matmul))
+Interval.__matmul__ = natif(jnp.matmul)
+Interval.__rmatmul__ = lambda self, other: natif(jnp.matmul)(other, self)
 
 # Some linear algebra routines
 
