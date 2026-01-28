@@ -793,6 +793,49 @@ TaylorModel.__neg__ = _tm_neg_p
 
 
 
+def _truncate_product(coeffs, exponents, max_order):
+    """Truncate polynomial product terms above max_order into an interval remainder.
+
+    Parameters
+    ----------
+    coeffs : array, shape (*output_shape, num_terms)
+        Product coefficients (e.g. from outer product of two monomial sets).
+    exponents : array, shape (d, num_terms)
+        Product exponents (sum of parent exponents for each term pair).
+    max_order : int
+        Maximum total polynomial order to retain.
+
+    Returns
+    -------
+    kept_coeffs : array, shape (*output_shape, num_terms)
+        Coefficients with high-order terms zeroed out.
+    truncated_remainder : Interval, shape (*output_shape,)
+        Rigorous bound on the contribution of the removed terms.
+    """
+    total_orders = jnp.sum(exponents, axis=0)  # (num_terms,)
+    keep_mask = total_orders <= max_order
+
+    kept_coeffs = jnp.where(keep_mask, coeffs, 0.0)
+    truncated_coeffs = jnp.where(keep_mask, 0.0, coeffs)
+
+    # Bound truncated monomials: odd exponents → [-1, 1], all-even → [0, 1]
+    has_odd = jnp.any(exponents % 2 == 1, axis=0)
+    mono_lower = jnp.where(has_odd, -1.0, 0.0)
+    mono_upper = jnp.ones(exponents.shape[1])
+
+    c_pos = jnp.maximum(truncated_coeffs, 0.0)
+    c_neg = jnp.minimum(truncated_coeffs, 0.0)
+    term_lower = c_pos * mono_lower + c_neg * mono_upper
+    term_upper = c_pos * mono_upper + c_neg * mono_lower
+
+    truncated_remainder = interval(
+        jnp.sum(term_lower, axis=-1),
+        jnp.sum(term_upper, axis=-1),
+    )
+
+    return kept_coeffs, truncated_remainder
+
+
 def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = None) -> TaylorModel:
     """Taylor model element-wise multiplication with broadcasting support."""
     if istaylormodel(x) and istaylormodel(y):
@@ -821,33 +864,10 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         coeff2 = y_coeffs[..., None, :]  # (*broadcast_shape, 1, m2)
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
-        # Compute total order of each product term
-        total_orders = jnp.sum(all_exp, axis=0)  # (m1*m2,)
-
         effective_order = max_order if max_order is not None else max(x._static_order, y._static_order)
 
-        # Mask for terms to keep
-        keep_mask = total_orders <= effective_order  # (m1*m2,)
-
-        # Zero out coefficients above max_order
-        new_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
-
-        # Bound truncated terms and add to remainder
-        truncated_coeffs = jnp.where(keep_mask, 0.0, all_coeffs)
-
-        # Compute monomial bounds
-        has_odd = jnp.any(all_exp % 2 == 1, axis=0)  # (m1*m2,)
-        mono_lower = jnp.where(has_odd, -1.0, 0.0)  # (m1*m2,)
-        mono_upper = jnp.ones(m1 * m2)  # (m1*m2,)
-
-        c_pos = jnp.maximum(truncated_coeffs, 0.0)  # (*broadcast_shape, m1*m2)
-        c_neg = jnp.minimum(truncated_coeffs, 0.0)  # (*broadcast_shape, m1*m2)
-        term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*broadcast_shape, m1*m2)
-        term_upper = c_pos * mono_upper + c_neg * mono_lower  # (*broadcast_shape, m1*m2)
-
-        trunc_lower = jnp.sum(term_lower, axis=-1)  # (*broadcast_shape,)
-        trunc_upper = jnp.sum(term_upper, axis=-1)  # (*broadcast_shape,)
-        truncated_remainder = interval(trunc_lower, trunc_upper)
+        # Truncate high-order product terms into remainder
+        new_coeffs, truncated_remainder = _truncate_product(all_coeffs, all_exp, effective_order)
 
         new_exponents = all_exp
 
@@ -1289,29 +1309,10 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         # Merge monomial pair axes into single axis: (*result_shape, m1*m2)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Truncate high-order terms
-        total_orders = jnp.sum(product_exp, axis=0)
-        keep_mask = total_orders <= effective_order
+        # Truncate high-order product terms into remainder
+        new_coeffs, truncated_remainder = _truncate_product(result_coeffs, product_exp, effective_order)
 
-        new_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
-
-        # Bound truncated terms
-        truncated_coeffs = jnp.where(keep_mask, 0.0, result_coeffs)
-        has_odd = jnp.any(product_exp % 2 == 1, axis=0)
-        mono_lower = jnp.where(has_odd, -1.0, 0.0)
-        mono_upper = jnp.ones(m1 * m2)
-
-        c_pos = jnp.maximum(truncated_coeffs, 0.0)
-        c_neg = jnp.minimum(truncated_coeffs, 0.0)
-        term_lower = c_pos * mono_lower + c_neg * mono_upper
-        term_upper = c_pos * mono_upper + c_neg * mono_lower
-
-        truncated_remainder = interval(
-            jnp.sum(term_lower, axis=-1),
-            jnp.sum(term_upper, axis=-1),
-        )
-
-        # Cross terms: (p_A + r_A) · (p_B + r_B) - p_A · p_B
+        # Cross terms: p_A · r_B + r_A · p_B + r_A · r_B
         p_A_bounds = _bound_polynomial(A)
         p_B_bounds = _bound_polynomial(B)
 

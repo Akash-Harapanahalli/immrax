@@ -36,40 +36,75 @@ def natif(
 ) -> Callable[..., Interval]:
     """Creates a Natural Inclusion Function of f.
 
-    All (non-fixed) positional arguments are assumed to be replaced with interval arguments for the inclusion function.
+    All positional arguments not listed in ``fixed_argnums`` are treated as
+    Interval inputs.  Fixed arguments and all keyword arguments are captured
+    as constants in the traced Jaxpr (they are not intervalized).
 
     Parameters
     ----------
     f : Callable[..., jax.Array]
-        Function to construct Natural Inclusion Function from
-    fixed_argnums : int|Sequence[int]
-        Positional arguments to be treated as jax.Array instead of Interval
+        Function to construct Natural Inclusion Function from.
+    fixed_argnums : int | Sequence[int], optional
+        Positional argument indices to treat as concrete arrays rather than
+        Intervals.  These arguments (together with any kwargs) are closed
+        over before tracing, so they become Jaxpr constants.
+        Default ``None`` means every positional argument is an Interval.
 
     Returns
     -------
     Callable[..., Interval]
         Natural Inclusion Function of f
 
+    Examples
+    --------
+    All arguments as intervals (default)::
+
+        natif(f)(iv_x, iv_y)
+
+    First argument fixed (e.g. a matrix), second is an interval::
+
+        natif(f, fixed_argnums=0)(M, iv_x)
+
+    Multiple fixed arguments::
+
+        natif(f, fixed_argnums=(0, 2))(M, iv_x, dims)
     """
+    # Normalize fixed_argnums to a frozenset
+    if fixed_argnums is None:
+        _fixed: frozenset[int] = frozenset()
+    elif isinstance(fixed_argnums, int):
+        _fixed = frozenset({fixed_argnums})
+    else:
+        _fixed = frozenset(fixed_argnums)
 
     @jit
     @wraps(f)
     def wrapped(*args, **kwargs):
-        """Natural inclusion function.
-        """
-        # Traverse the args and kwargs, replacing intervals with lower bounds.
-        # Convert args to at least jax.Array when they are not interval
+        # Split positional args into fixed (closed over) and interval (traced)
+        interval_args = [arg for i, arg in enumerate(args) if i not in _fixed]
+
+        # Build a partial that closes over fixed args and kwargs
+        def f_interval(*iv_args):
+            full_args = []
+            iv_idx = 0
+            for i in range(len(args)):
+                if i in _fixed:
+                    full_args.append(args[i])
+                else:
+                    full_args.append(iv_args[iv_idx])
+                    iv_idx += 1
+            return f(*full_args, **kwargs)
+
+        # Representative values for tracing (lower bounds of intervals)
         getlower = lambda x: x.lower if isinstance(x, Interval) else jnp.asarray(x)
         isinterval = lambda x: isinstance(x, Interval)
-        buildargs = jax.tree_util.tree_map(getlower, args, is_leaf=isinterval)
-        # kwargs stay not jax.Array
-        getlower = lambda x: x.lower if isinstance(x, Interval) else x
-        buildkwargs = jax.tree_util.tree_map(getlower, kwargs, is_leaf=isinterval)
-        # Build a jaxpr via evaluation on the lower bounds only. TODO: Do we need eqx.filter_make_jaxpr?
-        # closed_jaxpr = jax.make_jaxpr(f)(*buildargs, **buildkwargs)
-        closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
-        # Evaluate the jaxpr on the interval arguments using natif_jaxpr.
-        out = natif_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *args)
+        build_iv_args = jax.tree_util.tree_map(getlower, interval_args, is_leaf=isinterval)
+
+        # Build jaxpr from the partial — fixed args and kwargs become constants
+        closed_jaxpr = eqx.filter_make_jaxpr(f_interval)(*build_iv_args)[0]
+
+        # Evaluate the jaxpr with interval arguments
+        out = natif_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *interval_args)
         if len(out) == 1:
             return out[0]
         return out
