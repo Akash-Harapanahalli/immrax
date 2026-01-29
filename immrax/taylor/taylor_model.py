@@ -972,6 +972,88 @@ def taylor_model_from_function(
     return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=max_order)
 
 
+def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorModel:
+    """Partially evaluate a TaylorModel at a fixed value for one domain variable.
+
+    Given a TM with domain (z_0, ..., z_{d-1}), substitutes z_{var_idx} = value
+    and returns a TM with domain dimension d-1.
+
+    Monomials that share the same reduced exponent (after removing var_idx) are
+    collected and their contributions summed.
+
+    Parameters
+    ----------
+    tm : TaylorModel
+        Input Taylor model with domain dimension d >= 2.
+    var_idx : int
+        Index of the domain variable to evaluate (0-indexed).
+    value : float
+        Value at which to fix the variable.
+
+    Returns
+    -------
+    TaylorModel
+        Taylor model with domain dimension d-1.
+    """
+    d = tm.d
+    if d < 2:
+        raise ValueError("Cannot reduce domain dimension below 1")
+
+    # Normalize value to centered coordinate for the target variable
+    v_norm = (value - tm.domain_center[var_idx]) / tm.domain_radius[var_idx]
+
+    # Compute the scalar factor for each monomial: v_norm^{exp[var_idx]}
+    var_exps = tm.exponents[var_idx, :]  # (m,)
+    # v_norm^k for each monomial
+    var_factors = v_norm ** var_exps  # (m,)
+
+    # Multiply coefficients by the variable factors
+    # coeffs: (*output_shape, m), var_factors: (m,)
+    scaled_coeffs = tm.coeffs * var_factors  # (*output_shape, m)
+
+    # Remove the variable from exponents → reduced exponents (d-1, m)
+    keep = jnp.concatenate([
+        jnp.arange(var_idx),
+        jnp.arange(var_idx + 1, d)
+    ])
+    reduced_exps = tm.exponents[keep, :]  # (d-1, m)
+
+    # Group monomials with identical reduced exponents by hashing
+    new_d = d - 1
+    max_order = tm._static_order
+    canonical_exp = _get_canonical_exponents(new_d, max_order)
+    num_canonical = canonical_exp.shape[1]
+
+    # Hash for grouping
+    base = max_order + 2
+    powers = base ** jnp.arange(new_d)
+    reduced_hash = jnp.sum(reduced_exps * powers[:, None], axis=0)  # (m,)
+    canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)  # (mc,)
+
+    # For each canonical monomial, sum contributions from matching reduced monomials
+    # match[i, j] = True if reduced monomial j maps to canonical monomial i
+    match = (reduced_hash[None, :] == canonical_hash[:, None])  # (mc, m)
+
+    # Sum scaled coefficients for matching monomials
+    # scaled_coeffs: (*output_shape, m), match: (mc, m)
+    new_coeffs = jnp.einsum('...j,ij->...i', scaled_coeffs, match.astype(scaled_coeffs.dtype))
+
+    # New domain: remove var_idx
+    new_center = jnp.concatenate([
+        tm.domain_center[:var_idx],
+        tm.domain_center[var_idx + 1:]
+    ])
+    new_radius = jnp.concatenate([
+        tm.domain_radius[:var_idx],
+        tm.domain_radius[var_idx + 1:]
+    ])
+
+    return TaylorModel(
+        new_coeffs, canonical_exp, tm.remainder,
+        new_center, new_radius, _static_order=max_order
+    )
+
+
 def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "TaylorModel":
     """Concatenate multiple TaylorModels along an output dimension.
 

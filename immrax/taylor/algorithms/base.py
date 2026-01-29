@@ -14,13 +14,12 @@ from immrax.utils import inv_fact
 # ---------------------------------------------------------------------------
 
 class ValidatedSolution:
-    """Result of validated ODE integration.
+    """Result of validated ODE integration (interval-only).
 
     Attributes
     ----------
     times : jax.Array
         Time grid ``[t_0, t_1, …, t_N]``, shape ``(maxsteps+1,)``.
-        Entries beyond ``nsteps`` are padded with ``tmax``.
     flowpipe_lo : jax.Array
         Lower bounds of interval enclosures, shape ``(maxsteps+1, n)``.
     flowpipe_hi : jax.Array
@@ -48,13 +47,59 @@ class ValidatedSolution:
 
     @property
     def flowpipe(self):
-        """Return list of Interval objects for backwards compatibility."""
+        """Return list of Interval objects."""
         n = int(self.nsteps) + 1
         return [interval(self.flowpipe_lo[i], self.flowpipe_hi[i])
                 for i in range(n)]
 
 
 jax.tree_util.register_pytree_node_class(ValidatedSolution)
+
+
+class TMFlowpipe:
+    """Result of validated ODE integration with TaylorModel flowpipe.
+
+    Stores a list of times and a corresponding list of TaylorModels.
+
+    Attributes
+    ----------
+    times : list[float]
+        Time grid ``[t_0, t_1, …, t_N]``.
+    tms : list[TaylorModel]
+        TaylorModel at each step.  Domain variables are ``(dt, x_0)``.
+    nsteps : int
+        Number of real integration steps taken.
+    success : bool
+        ``True`` if every step was validated.
+    """
+
+    def __init__(self, times, tms, nsteps, success):
+        self.times = times
+        self.tms = tms
+        self.nsteps = nsteps
+        self.success = success
+
+    def tree_flatten(self):
+        return (self.tms,), {"times": self.times, "nsteps": self.nsteps,
+                             "success": self.success}
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        (tms,) = children
+        return cls(aux["times"], tms, aux["nsteps"], aux["success"])
+
+    @property
+    def flowpipe(self):
+        """Return the list of TaylorModels."""
+        return self.tms
+
+    @property
+    def flowpipe_intervals(self):
+        """Return list of Interval objects (interval hulls of each TM)."""
+        return [tm.interval_hull() for tm in self.tms]
+
+
+jax.tree_util.register_pytree_node_class(TMFlowpipe)
 
 
 # ---------------------------------------------------------------------------

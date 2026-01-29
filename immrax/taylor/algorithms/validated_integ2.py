@@ -1,40 +1,34 @@
 """Validated ODE integration using epsilon-inflation (Bünger 2019).
 
 Implements the second validated integration algorithm from TaylorModels.jl,
-adapted for JAX and immrax.
+adapted for JAX and immrax.  Each integration step produces a TaylorModel
+whose domain variables are ``(dt, x_0)`` — time elapsed within the step and
+initial-condition parameters.  The polynomial part is obtained by Taylor-
+expanding the flow map jointly in ``(dt, x_0)`` via
+``taylor_model_from_function``, and the remainder is validated using
+epsilon-inflation of the Picard operator.
 
 Algorithm overview
 ------------------
 At each time step:
 
-1. Compute time Taylor coefficients ``x^(k)`` at the centre of the current
-   set using jet-based prolongation.
+1. Extract the centre of the current spatial TaylorModel.
 
-2. Select the step size from Taylor coefficient norms.
+2. Select the step size from derivative norms at the centre.
 
-3. **Validate** the remainder using epsilon-inflation:
+3. Build the flow-map function ``φ(dt, x_0)`` using prolongation +
+   Horner evaluation, and Taylor-expand it jointly in ``(dt, x_0)``
+   with ``taylor_model_from_function``.
 
-   a. Start with ``E = 0`` (zero remainder).
-   b. Compute ``E' = Picard(E)`` including the initial-condition remainder.
-   c. For each subsequent iteration, compute ``E' = Picard(E)`` (without
-      initial remainder) and check componentwise contractivity.
-   d. For every component where ``E'_i ⊄ int(E_i)``, inflate::
+4. **Validate** the remainder using epsilon-inflation of the Picard
+   operator (operating on the interval hull of the TM).
 
-          E_i ← E'_i · (1 ± ε) + [-δ, δ]
+5. Replace the TM remainder with the Picard-validated remainder.
 
-   e. Repeat until contractive or ``validatesteps`` exhausted.
+6. Evaluate the time-space TM at ``dt = h`` to obtain the next
+   spatial TM (initial condition for the following step).
 
-4. Build the flowpipe enclosure from the Taylor polynomial + validated
-   remainder.
-
-5. If validation fails and ``adaptive=True``, shrink the step size and
-   retry.
-
-Key difference from ``validated_integ``
----------------------------------------
-Instead of iterating the Picard operator with a widening strategy (method 1),
-this algorithm *systematically inflates* only the non-contractive components.
-This is generally simpler and converges faster for non-stiff problems.
+7. Store the time-space TM in the solution buffer.
 
 Reference
 ---------
@@ -53,8 +47,14 @@ from jax import lax
 from immrax.inclusion import Interval, interval, natif
 from immrax.utils import inv_fact, prolongation
 
+from immrax.taylor.taylor_model import (
+    TaylorModel,
+    taylor_model_from_interval,
+    evaluate_at_variable,
+    _get_canonical_exponents,
+)
 from immrax.taylor.algorithms.base import (
-    ValidatedSolution,
+    TMFlowpipe,
     _step_size,
     _eval_taylor,
     _eval_taylor_interval,
@@ -71,7 +71,7 @@ def _contractive_mask(delta: Interval, delta_x: Interval):
 
 
 # ---------------------------------------------------------------------------
-# Picard operator
+# Picard operator (operates on interval enclosures)
 # ---------------------------------------------------------------------------
 
 def _picard_remainder(f: Callable, t0, derivs: list,
@@ -91,7 +91,6 @@ def _picard_remainder(f: Callable, t0, derivs: list,
     residual = f_extended - xdot_poly
     picard = h_iv * residual
 
-    # Conditionally add initial remainder (JAX-traceable)
     picard_lo = jnp.where(include_initial_rem,
                           picard.lower + initial_rem.lower, picard.lower)
     picard_hi = jnp.where(include_initial_rem,
@@ -123,8 +122,6 @@ def _validate_step(f: Callable, t0, derivs: list,
     delta_lo = jnp.full(n, -delta, dtype=x_hull.lower.dtype)
     delta_hi = jnp.full(n, delta, dtype=x_hull.lower.dtype)
 
-    # Outer adaptive retry via lax.while_loop
-    # State: (success, E_lo, E_hi, dt, red_abstol, continue_flag)
     def outer_cond(state):
         success, _, _, _, _, continue_flag = state
         return (~success) & continue_flag
@@ -132,13 +129,10 @@ def _validate_step(f: Callable, t0, derivs: list,
     def outer_body(state):
         success, _, _, dt_, ra, _ = state
 
-        # 0-th iteration: include initial remainder
         E = interval(zero_n, zero_n)
         E_prime = _picard_remainder(f, t0, derivs, dt_, order,
                                      E, jnp.bool_(True), initial_rem)
-        # E = E_prime after 0th step
 
-        # Inner inflation loop via lax.scan
         def inner_body(carry, _):
             s, e_lo, e_hi = carry
 
@@ -149,7 +143,6 @@ def _validate_step(f: Callable, t0, derivs: list,
                                          E_cur, jnp.bool_(False), initial_rem)
                 contractive = _is_contractive(E_p, E_cur)
 
-                # Inflate non-contractive components
                 mask = _contractive_mask(E_p, E_cur)
                 inflated_lo = E_p.lower * eps_lo + delta_lo
                 inflated_hi = E_p.upper * eps_hi + delta_hi
@@ -171,7 +164,6 @@ def _validate_step(f: Callable, t0, derivs: list,
             (jnp.bool_(False), E_prime.lower, E_prime.upper),
             None, length=validatesteps)
 
-        # Adaptive reduction if not successful
         new_ra = jnp.where(inner_success, ra, ra / 10.0)
         new_dt = jnp.where(inner_success, dt_, dt_ * 0.1 ** (1.0 / order))
 
@@ -195,15 +187,129 @@ def _validate_step(f: Callable, t0, derivs: list,
 
 
 # ---------------------------------------------------------------------------
+# Flow-map function builder
+# ---------------------------------------------------------------------------
+
+def _make_flow_map(f: Callable, order_time: int):
+    """Build the flow map φ(t0, dt, x0) = eval_taylor(prolongation(f)(t0, x0), dt).
+
+    Returns a function ``(t0, z) -> x`` where ``z = [dt, x0]``.
+    ``t0`` is a separate argument so the function identity is stable
+    across integration steps (avoiding repeated re-tracing).
+    """
+    prolong = prolongation(f, order_time)
+
+    def flow_map(t0, z):
+        dt = z[0]
+        x0 = z[1:]
+        derivs = prolong(t0, x0)
+        return _eval_taylor(derivs, dt, order_time)
+
+    return flow_map
+
+
+def _build_tm_from_flow(f: Callable, order_time: int, n_state: int,
+                         max_order: int):
+    """Pre-build the jacfwd chain for the flow map and return a callable
+    that efficiently computes the TaylorModel at any (t0, center_z, radius_z).
+
+    The expensive jacfwd chain is built once; subsequent calls just evaluate
+    the JIT-compiled derivative functions.
+    """
+    from functools import partial
+
+    prolong = prolongation(f, order_time)
+
+    def flow_map(t0, z):
+        dt = z[0]
+        x0 = z[1:]
+        derivs = prolong(t0, x0)
+        return _eval_taylor(derivs, dt, order_time)
+
+    # Ensure vector output for consistent derivative tensor shapes
+    def flow_vec(t0, z):
+        v = flow_map(t0, z)
+        return jnp.atleast_1d(v)
+
+    # Build jacfwd chain once
+    deriv_fns = [flow_vec]
+    curr_f = flow_vec
+    for k in range(1, max_order + 2):
+        curr_f = jax.jacfwd(curr_f, argnums=1)
+        deriv_fns.append(curr_f)
+
+    # JIT the derivative functions (t0 and z are dynamic)
+    deriv_fns_jit = [jax.jit(fn) for fn in deriv_fns]
+
+    def compute_tm(t0, center_z, radius_z):
+        d = center_z.shape[0]
+        n = n_state
+        dtype = center_z.dtype
+
+        exponents = _get_canonical_exponents(d, max_order)
+        num_monomials = exponents.shape[1]
+
+        # Evaluate derivative tensors at center
+        deriv_tensors = []
+        for k, fn in enumerate(deriv_fns_jit):
+            tensor = fn(t0, center_z)
+            deriv_tensors.append(tensor)
+
+        # Assemble coefficients
+        coeffs = jnp.zeros((n, num_monomials), dtype=dtype)
+
+        for i in range(num_monomials):
+            exp = exponents[:, i]
+            order = int(jnp.sum(exp))
+
+            if order > max_order:
+                continue
+
+            if order == 0:
+                c = deriv_tensors[0]
+            else:
+                idx_list = []
+                for var_idx in range(d):
+                    count = int(exp[var_idx])
+                    idx_list.extend([var_idx] * count)
+                tensor = deriv_tensors[order]
+                full_idx = (slice(None), *idx_list)
+                c = tensor[full_idx]
+
+            fact_prod = jnp.prod(jax.scipy.special.gamma(exp + 1))
+            scale = jnp.prod(radius_z ** exp) / fact_prod
+            coeffs = coeffs.at[:, i].set(c * scale)
+
+        # Lagrange remainder bound
+        next_order = max_order + 1
+        D_next = deriv_tensors[next_order]
+        current_bound = jnp.abs(D_next)
+        for _ in range(next_order):
+            current_bound = jnp.dot(current_bound, radius_z)
+        fact = jax.scipy.special.gamma(next_order + 1)
+        remainder_bound = current_bound / fact
+        remainder = interval(
+            jnp.zeros(n, dtype=dtype) - remainder_bound,
+            jnp.zeros(n, dtype=dtype) + remainder_bound,
+        )
+
+        return TaylorModel(coeffs, exponents, remainder,
+                           center_z, radius_z, _static_order=max_order)
+
+    return compute_tm
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def validated_integ2(
     f: Callable,
-    x0: Interval,
+    x0,
     t0: float,
     tmax: float,
     order_time: int,
+    order_space: int = 2,
     abstol: float = 1e-10,
     maxsteps: int = 2000,
     adaptive: bool = True,
@@ -211,23 +317,29 @@ def validated_integ2(
     epsilon: float = 1e-10,
     delta: float = 1e-6,
     validatesteps: int = 30,
-) -> ValidatedSolution:
-    """Validated ODE integration using epsilon-inflation.
+) -> TMFlowpipe:
+    r"""Validated ODE integration using epsilon-inflation.
 
-    Computes a rigorous flowpipe for ``ẋ = f(t, x)``, ``x(t₀) ∈ X₀``.
+    Computes a rigorous flowpipe for ``ẋ = f(t, x)``, ``x(t₀) ∈ X₀``,
+    propagating TaylorModels between steps to preserve polynomial
+    dependence on initial conditions.
 
     Parameters
     ----------
     f : (float, Array) -> Array
         Right-hand side of the ODE.
-    x0 : Interval
-        Initial condition set (interval box).
+    x0 : Interval or TaylorModel
+        Initial condition set.  If an ``Interval``, it is converted to a
+        ``TaylorModel`` of order ``order_space``.
     t0 : float
         Start time.
     tmax : float
         End time.
     order_time : int
         Order of the Taylor expansion in time.
+    order_space : int
+        Order of the Taylor expansion in initial-condition variables
+        (default 2).
     abstol : float
         Absolute tolerance for step-size selection (default ``1e-10``).
     maxsteps : int
@@ -246,135 +358,169 @@ def validated_integ2(
     Returns
     -------
     ValidatedSolution
-        Contains ``times``, ``flowpipe_lo``, ``flowpipe_hi``, ``nsteps``,
-        and ``success``.
-
-    Example
-    -------
-    >>> import jax.numpy as jnp
-    >>> from immrax.inclusion import icentpert
-    >>> from immrax.taylor.algorithms import validated_integ2
-    >>>
-    >>> f = lambda t, x: -x
-    >>> x0 = icentpert(jnp.array([1.0]), jnp.array([0.1]))
-    >>> sol = validated_integ2(f, x0, 0.0, 1.0, order_time=5)
+        Contains ``times``, TaylorModel buffers, ``nsteps``, and ``success``.
+        Use ``sol.flowpipe`` to get the list of TaylorModels, or
+        ``sol.flowpipe_intervals`` for interval hulls.
     """
-    n = x0.lower.shape[0]
+    # Convert Interval to TaylorModel if needed
+    if isinstance(x0, Interval):
+        x_tm = taylor_model_from_interval(x0, order=order_space)
+    elif isinstance(x0, TaylorModel):
+        x_tm = x0
+    else:
+        raise TypeError(f"x0 must be Interval or TaylorModel, got {type(x0)}")
+
+    n = x_tm.shape[0] if len(x_tm.shape) > 0 else 1
+    d_space = x_tm.d  # spatial domain dimension
+    d_full = 1 + d_space  # time + space
+
     sign = jnp.where(tmax > t0, 1.0, -1.0)
-    t0_arr = jnp.asarray(t0, dtype=jnp.float64 if jax.config.jax_enable_x64 else jnp.float32)
-    tmax_arr = jnp.asarray(tmax, dtype=t0_arr.dtype)
-    abstol_arr = jnp.asarray(abstol, dtype=t0_arr.dtype)
-    minabstol_arr = jnp.asarray(minabstol, dtype=t0_arr.dtype)
+    dtype = x_tm.coeffs.dtype
+    t0_arr = jnp.asarray(t0, dtype=dtype)
+    tmax_arr = jnp.asarray(tmax, dtype=dtype)
+    abstol_arr = jnp.asarray(abstol, dtype=dtype)
+    minabstol_arr = jnp.asarray(minabstol, dtype=dtype)
 
-    # Pre-allocate output arrays
-    times_buf = jnp.full((maxsteps + 1,), tmax, dtype=t0_arr.dtype)
-    times_buf = times_buf.at[0].set(t0_arr)
-    fp_lo_buf = jnp.zeros((maxsteps + 1, n), dtype=x0.lower.dtype)
-    fp_hi_buf = jnp.zeros((maxsteps + 1, n), dtype=x0.lower.dtype)
-    fp_lo_buf = fp_lo_buf.at[0].set(x0.lower)
-    fp_hi_buf = fp_hi_buf.at[0].set(x0.upper)
+    max_order = max(order_time, order_space)
 
-    center0 = x0.center
-    init_rem_lo = x0.lower - center0
-    init_rem_hi = x0.upper - center0
+    # Store initial condition as a time-space TM (zero-width time domain)
+    init_tm_full = _spatial_tm_to_full(x_tm, t0_arr, jnp.zeros((), dtype=dtype),
+                                        max_order)
 
-    init_carry = (
-        t0_arr,
-        x0.lower,
-        x0.upper,
-        init_rem_lo,  # rem_lo
-        init_rem_hi,  # rem_hi
-        abstol_arr,
-        jnp.bool_(True),  # success
-        jnp.bool_(False),  # done
-        jnp.int32(0),  # nsteps
-        times_buf,
-        fp_lo_buf,
-        fp_hi_buf,
+    # Integration state
+    t_cur = float(t0)
+    x_tm_cur = x_tm.to_canonical(max_order)
+    red_abstol = float(abstol)
+    success = True
+    nsteps = 0
+
+    times_list = [t0]
+    tms_list = [init_tm_full]
+
+    sign_f = float(sign)
+    prolong = prolongation(f, order_time)
+
+    # Pre-build the jacfwd chain once (expensive tracing happens here)
+    compute_step_tm = _build_tm_from_flow(f, order_time, n, max_order)
+
+    while t_cur * sign_f < float(tmax) * sign_f:
+        # 1. Centre and interval hull of current spatial TM
+        center = x_tm_cur.constant_term
+        x_hull = x_tm_cur.interval_hull()
+        init_rem = interval(x_hull.lower - center, x_hull.upper - center)
+
+        # 2. Step size from derivative norms at centre
+        t_cur_arr = jnp.asarray(t_cur, dtype=dtype)
+        derivs = prolong(t_cur_arr, center)
+        ra_arr = jnp.asarray(red_abstol, dtype=dtype)
+        dt = _step_size(derivs, ra_arr, order_time)
+        dt = jnp.minimum(dt, sign * (tmax_arr - t_cur_arr))
+        dt = sign * dt
+
+        # 3. Validate via epsilon-inflation (on interval hull)
+        step_ok, remainder, dt, ra_arr = _validate_step(
+            f, t_cur_arr, derivs, x_hull, dt, sign, order_time, init_rem,
+            ra_arr, adaptive, minabstol_arr,
+            epsilon=epsilon, delta=delta, validatesteps=validatesteps)
+
+        # 4. Build the time-space TM via pre-built derivative chain
+        # Time domain is [0, dt]: center at dt/2, radius dt/2
+        abs_dt = jnp.abs(dt)
+        t_half = abs_dt / 2.0
+        center_z = jnp.concatenate([t_half[None], center])
+        radius_z = jnp.concatenate([t_half[None], x_tm_cur.domain_radius])
+        step_tm = compute_step_tm(t_cur_arr, center_z, radius_z)
+
+        # 5. Replace TM remainder with Picard-validated remainder
+        step_tm = TaylorModel(
+            step_tm.coeffs, step_tm.exponents,
+            remainder,
+            step_tm.domain_center, step_tm.domain_radius,
+            _static_order=max_order)
+
+        # 6. Evaluate at dt to get next spatial TM
+        next_tm = evaluate_at_variable(step_tm, 0, float(dt))
+        x_tm_cur = next_tm.to_canonical(max_order)
+
+        t_cur = t_cur + float(dt)
+        nsteps += 1
+        times_list.append(t_cur)
+        tms_list.append(step_tm)
+
+        # Update adaptive tolerance
+        if adaptive:
+            red_abstol = min(abstol, 10.0 * float(ra_arr))
+        else:
+            red_abstol = float(ra_arr)
+
+        success = success and bool(step_ok)
+        if not success:
+            import warnings
+            warnings.warn(f"Validation failed at t={t_cur}")
+            break
+
+        if nsteps >= maxsteps:
+            import warnings
+            warnings.warn("Maximum number of integration steps reached")
+            break
+
+    return TMFlowpipe(
+        times=times_list,
+        tms=tms_list,
+        nsteps=nsteps,
+        success=success,
     )
 
-    def scan_body(carry, _):
-        (t, xh_lo, xh_hi, rem_lo, rem_hi,
-         red_abstol, success, done, nsteps,
-         t_buf, flo_buf, fhi_buf) = carry
 
-        def real_step(carry_in):
-            (t_, xh_lo_, xh_hi_, rem_lo_, rem_hi_,
-             ra_, success_, nsteps_,
-             t_buf_, flo_buf_, fhi_buf_) = carry_in
+def _spatial_tm_to_full(
+    x_tm: TaylorModel, t_center, t_radius, max_order: int
+) -> TaylorModel:
+    """Embed a spatial TM into a time-space TM with zero-width time domain.
 
-            x_hull = interval(xh_lo_, xh_hi_)
-            center = x_hull.center
-            rem = interval(rem_lo_, rem_hi_)
+    Adds a time variable (index 0) to the domain.  All exponents for the
+    time variable are zero (the polynomial doesn't depend on time).
+    """
+    d_space = x_tm.d
+    d_full = 1 + d_space
 
-            # 1. Taylor coefficients
-            derivs = prolongation(f, order_time)(t_, center)
+    # Target canonical exponents for full domain
+    full_exponents = _get_canonical_exponents(d_full, max_order)
+    num_full = full_exponents.shape[1]
 
-            # 2. Step size
-            dt = _step_size(derivs, ra_, order_time)
-            dt = jnp.minimum(dt, sign * (tmax_arr - t_))
-            dt = sign * dt
+    # The spatial exponents correspond to rows 1: of full_exponents
+    # with row 0 (time) == 0.  Map spatial monomials into full monomials.
+    x_tm_canon = x_tm.to_canonical(max_order)
+    space_exponents = _get_canonical_exponents(d_space, max_order)
 
-            # 3. Validate via epsilon-inflation
-            step_ok, remainder, dt, ra_ = _validate_step(
-                f, t_, derivs, x_hull, dt, sign, order_time, rem,
-                ra_, adaptive, minabstol_arr,
-                epsilon=epsilon, delta=delta, validatesteps=validatesteps)
+    # Hash-based matching
+    base = max_order + 2
+    powers_space = base ** jnp.arange(d_space)
+    powers_full = base ** jnp.arange(d_full)
 
-            # 4. Build enclosure
-            x_next_center = _eval_taylor(derivs, dt, order_time)
-            enc_lo = x_next_center + remainder.lower
-            enc_hi = x_next_center + remainder.upper
+    space_hash = jnp.sum(space_exponents * powers_space[:, None], axis=0)
 
-            new_t = t_ + dt
-            new_nsteps = nsteps_ + 1
+    # For full exponents, only consider those with time exponent == 0
+    time_exp = full_exponents[0, :]  # (num_full,)
+    spatial_part = full_exponents[1:, :]  # (d_space, num_full)
+    spatial_hash_full = jnp.sum(spatial_part * powers_space[:, None], axis=0)
 
-            t_buf_ = t_buf_.at[new_nsteps].set(new_t)
-            flo_buf_ = flo_buf_.at[new_nsteps].set(enc_lo)
-            fhi_buf_ = fhi_buf_.at[new_nsteps].set(enc_hi)
+    # Match: for each spatial monomial, find its position in full exponents
+    # (where time exp == 0)
+    match = ((space_hash[:, None] == spatial_hash_full[None, :]) &
+             (time_exp[None, :] == 0))  # (m_space, m_full)
 
-            new_ra = jnp.where(jnp.bool_(adaptive),
-                               jnp.minimum(abstol_arr, 10.0 * ra_), ra_)
-            new_success = success_ & step_ok
+    n_out = x_tm_canon.coeffs.shape[0] if x_tm_canon.coeffs.ndim > 1 else 1
+    coeffs_space = x_tm_canon.coeffs
+    if coeffs_space.ndim == 1:
+        coeffs_space = coeffs_space[None, :]
 
-            return (new_t, enc_lo, enc_hi,
-                    remainder.lower, remainder.upper,
-                    new_ra, new_success, new_nsteps,
-                    t_buf_, flo_buf_, fhi_buf_)
+    # Scatter spatial coefficients into full coefficient array
+    new_coeffs = jnp.einsum('...j,ji->...i', coeffs_space,
+                            match.astype(dtype=coeffs_space.dtype))
 
-        def null_step(carry_in):
-            (t_, xh_lo_, xh_hi_, rem_lo_, rem_hi_,
-             ra_, success_, nsteps_,
-             t_buf_, flo_buf_, fhi_buf_) = carry_in
-            return (t_, xh_lo_, xh_hi_, rem_lo_, rem_hi_,
-                    ra_, success_, nsteps_,
-                    t_buf_, flo_buf_, fhi_buf_)
+    domain_center = jnp.concatenate([t_center[None], x_tm_canon.domain_center])
+    domain_radius = jnp.concatenate([t_radius[None], x_tm_canon.domain_radius])
 
-        inner_carry = (t, xh_lo, xh_hi, rem_lo, rem_hi,
-                       red_abstol, success, nsteps,
-                       t_buf, flo_buf, fhi_buf)
-
-        (new_t, new_xh_lo, new_xh_hi, new_rem_lo, new_rem_hi,
-         new_ra, new_success, new_nsteps,
-         new_t_buf, new_flo_buf, new_fhi_buf) = lax.cond(
-            done, null_step, real_step, inner_carry)
-
-        new_done = done | (~new_success) | (sign * new_t >= sign * tmax_arr)
-
-        new_carry = (new_t, new_xh_lo, new_xh_hi, new_rem_lo, new_rem_hi,
-                     new_ra, new_success, new_done, new_nsteps,
-                     new_t_buf, new_flo_buf, new_fhi_buf)
-        return new_carry, None
-
-    final_carry, _ = lax.scan(scan_body, init_carry, None, length=maxsteps)
-
-    (_, _, _, _, _, _, final_success, _, final_nsteps,
-     final_times, final_flo, final_fhi) = final_carry
-
-    return ValidatedSolution(
-        times=final_times,
-        flowpipe_lo=final_flo,
-        flowpipe_hi=final_fhi,
-        nsteps=final_nsteps,
-        success=final_success,
-    )
+    return TaylorModel(
+        new_coeffs, full_exponents, x_tm_canon.remainder,
+        domain_center, domain_radius, _static_order=max_order)
