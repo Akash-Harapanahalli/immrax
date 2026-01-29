@@ -199,6 +199,40 @@ def get_half_intervals(x: Interval, N=1, ut=False):
 # ================================================================================
 
 
+def prolongation(f: Callable, p: int) -> Callable:
+    """Generate a function that computes the Taylor coefficient series of the flow.
+
+    Uses ``jax.experimental.jet`` to iteratively build the series
+    ``[x^(0), x^(1), …, x^(p)]`` for ``ẋ = f(t, x, *args)``.
+
+    Parameters
+    ----------
+    f : Callable
+        The vector field function f(t, x, *args).
+    p : int
+        Order of the prolongation.  The returned list has ``p + 1``
+        elements: ``[x^(0), x^(1), …, x^(p)]``.
+
+    Returns
+    -------
+    Callable
+        ``f_prolonged(t, x, *args)`` returning ``[x^(0), x^(1), …, x^(p)]``.
+    """
+    from jax.experimental.jet import jet as _jet
+
+    def f_prolonged(t, x, *args):
+        def _f(t, x):
+            return f(t, x, *args)
+        t_series = [t, 1.]
+        x_series = [x, _f(t, x)]
+        for k in range(p - 1):
+            _, out2 = _jet(_f, (t_series[0], x_series[0]), (t_series[1:], x_series[1:]))
+            t_series.append(0.)
+            x_series.append(out2[-1])
+        return x_series
+    return f_prolonged
+
+
 def fact(n):
     """Compute factorial using log-gamma for numerical stability.
 

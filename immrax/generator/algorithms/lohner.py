@@ -50,7 +50,7 @@ class LohnerReachability(BaseSetGenerator):
         super().__init__(sys, dt)
         self.target_order = float(target_order)
         self.taylor_order = taylor_order
-        self._get_series = prolongation(self.sys.f, self.taylor_order - 1)
+        self._get_series = prolongation(self.sys.f, self.taylor_order)
 
     def _enforce_limit(self, Z) -> Any:
         """Ensure constant shape (2n generators) for lax.scan compatibility."""

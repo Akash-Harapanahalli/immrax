@@ -60,8 +60,9 @@ def _bound_polynomial(tm: TaylorModel) -> Interval:
         mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))  # (m,)
         mono_upper = jnp.ones(tm.num_monomials)  # (m,)
 
-        c_pos = jnp.maximum(tm.coeffs, 0.0)  # (*output_shape, m)
-        c_neg = jnp.minimum(tm.coeffs, 0.0)  # (*output_shape, m)
+        zeros = jnp.zeros_like(tm.coeffs)
+        c_pos = jnp.maximum(tm.coeffs, zeros)  # (*output_shape, m)
+        c_neg = jnp.minimum(tm.coeffs, zeros)  # (*output_shape, m)
 
         # Broadcasting: mono_lower/upper (m,) with coeffs (*output_shape, m)
         term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)

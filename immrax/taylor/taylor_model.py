@@ -496,8 +496,9 @@ class TaylorModel:
         # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
         absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
-        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (*output_shape, m)
-        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (*output_shape, m)
+        zeros = jnp.zeros_like(absorb_coeffs)
+        c_pos = jnp.maximum(absorb_coeffs, zeros)  # (*output_shape, m)
+        c_neg = jnp.minimum(absorb_coeffs, zeros)  # (*output_shape, m)
 
         # mono_lower/upper have shape (m,), broadcasting works naturally
         term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)
@@ -546,8 +547,9 @@ class TaylorModel:
         # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
         absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
-        c_pos = jnp.maximum(absorb_coeffs, 0.0)  # (*output_shape, m)
-        c_neg = jnp.minimum(absorb_coeffs, 0.0)  # (*output_shape, m)
+        zeros = jnp.zeros_like(absorb_coeffs)
+        c_pos = jnp.maximum(absorb_coeffs, zeros)  # (*output_shape, m)
+        c_neg = jnp.minimum(absorb_coeffs, zeros)  # (*output_shape, m)
 
         # mono_lower/upper have shape (m,), broadcasting works naturally
         term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)

@@ -7,7 +7,6 @@ all reachability algorithms.
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental.jet import jet
 from jax.tree_util import register_pytree_node_class
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,35 +14,8 @@ from typing import Any, Callable
 
 from ...system import System
 from ...inclusion import Interval, natif
-from ...utils import fact, inv_fact
+from ...utils import fact, inv_fact, prolongation
 from ..sets import Zonotope
-
-
-def prolongation(f: Callable, p: int) -> Callable:
-    """Generate a function that computes the Taylor coefficient series of the flow.
-
-    Parameters
-    ----------
-    f : Callable
-        The vector field function f(t, x, *args)
-    p : int
-        Order of prolongation (number of derivatives beyond the first)
-
-    Returns
-    -------
-    Callable
-        A function that returns the Taylor series coefficients [x, x', x'', ...]
-    """
-    def f_prolonged(t, x, *args):
-        def _f(t, x): return f(t, x, *args)
-        t_series = [t, 1.]
-        x_series = [x, _f(t, x)]
-        for k in range(p):
-            out1, out2 = jet(_f, (t_series[0], x_series[0]), (t_series[1:], x_series[1:]))
-            t_series.append(0.)
-            x_series.append(out2[-1])
-        return x_series
-    return f_prolonged
 
 
 # --- Data Structures ---
