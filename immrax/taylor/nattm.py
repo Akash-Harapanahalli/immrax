@@ -155,6 +155,29 @@ def _bound_polynomial_1d_exact(tm: TaylorModel) -> Interval:
 TaylorModel._bound_polynomial = _bound_polynomial
 
 
+def _tm_polynomial_property(self):
+    """Extract the polynomial part as a TaylorPolynomial (no remainder).
+
+    Coefficients are rescaled from normalized coordinates back to
+    raw ``(x - center)`` coordinates.
+    """
+    from immrax.taylor.taylor_polynomial import TaylorPolynomial
+
+    # TM coeffs are in normalized coords u = (x-c)/r, so monomial alpha
+    # has coeff a_alpha and represents a_alpha * u^alpha = a_alpha / r^alpha * dx^alpha.
+    log_r = jnp.log(jnp.abs(self.domain_radius) + 1e-30)
+    log_scale = self.exponents.T @ log_r  # (m,)
+    inv_scale = jnp.exp(-log_scale)
+    raw_coeffs = self.coeffs * inv_scale
+
+    return TaylorPolynomial(
+        raw_coeffs, self.exponents, self.domain_center,
+        _static_order=self._static_order,
+    )
+
+TaylorModel.polynomial = property(_tm_polynomial_property)
+
+
 # Registry mapping JAX primitives to Taylor model operations
 tm_inclusion_registry = {}
 

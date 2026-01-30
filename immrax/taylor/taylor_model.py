@@ -267,25 +267,9 @@ class TaylorModel:
         # Normalize to centered coordinates
         x_centered = (x - self.domain_center) / self.domain_radius
 
-        # Evaluate each monomial
-        # monomial_i = prod_j x_centered[j]^exponents[j, i]
-        log_abs_x = jnp.log(jnp.abs(x_centered) + 1e-30)
-        log_monomials = self.exponents.T @ log_abs_x
-
-        # Handle signs for negative x values
-        is_negative = x_centered < 0
-        odd_exp = self.exponents % 2
-        sign_flips = odd_exp.T @ is_negative.astype(jnp.float32)
-        signs = jnp.where(sign_flips % 2 == 0, 1.0, -1.0)
-
-        monomials = signs * jnp.exp(log_monomials)  # (num_monomials,)
-
-        # Handle x_centered = 0 cases (0^0 = 1, 0^k = 0 for k > 0)
-        zero_mask = jnp.abs(x_centered) < 1e-30
-        has_zero_exp = jnp.any(
-            (self.exponents > 0) & zero_mask[:, None], axis=0
-        )
-        monomials = jnp.where(has_zero_exp, 0.0, monomials)
+        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
+        # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
+        monomials = jnp.prod(x_centered[:, None] ** self.exponents, axis=0)  # (m,)
 
         # Sum coeffs * monomials along the last (monomial) axis
         # coeffs has shape (*output_shape, m), monomials has shape (m,)
