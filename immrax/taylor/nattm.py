@@ -271,50 +271,13 @@ def nattm_jaxpr(jaxpr: Jaxpr, consts, *args, max_order: int = 2, propagate_sourc
         with source_info_util.user_context(traceback, name_stack=name_stack):
             invars = safe_map(read, eqn.invars)
             if any([istaylormodel(read(iv)) for iv in eqn.invars]):
-                try:
-                    # Pass max_order to registry functions that need it
-                    if eqn.primitive in _needs_max_order:
-                        ans = tm_inclusion_registry[eqn.primitive](
-                            *subfuns, *invars, max_order=max_order, **bind_params
-                        )
-                    else:
-                        ans = tm_inclusion_registry[eqn.primitive](
-                            *subfuns, *invars, **bind_params
-                        )
-                except KeyError:
-                    # Fallback: look up by primitive name
-                    # This handles cases where primitive objects differ but share identity logic or name
-                    found_handler = None
-                    for prim, handler in tm_inclusion_registry.items():
-                        if prim.name == eqn.primitive.name:
-                            found_handler = handler
-                            break
-                    
-                    if found_handler:
-                        # Cache it for next time to avoid loop
-                        tm_inclusion_registry[eqn.primitive] = found_handler
-                        if eqn.primitive in _needs_max_order:
-                            pass # handler is already correct
-                        # Re-try call
-                        if eqn.primitive in _needs_max_order or (found_handler == tm_inclusion_registry.get(lax.mul_p)): # heuristic
-                             # We need to know if handler needs max_order. 
-                             # We can check if the found key was in _needs_max_order
-                             if prim in _needs_max_order:
-                                 ans = found_handler(*subfuns, *invars, max_order=max_order, **bind_params)
-                             else:
-                                 ans = found_handler(*subfuns, *invars, **bind_params)
-                        else:
-                             # Default assumption: checking signature is hard, but most our new ops need it.
-                             # If we found it by name, it likely matches the registered one's signature.
-                             # Let's check _needs_max_order set using the FOUND key 'prim'
-                             if prim in _needs_max_order:
-                                 ans = found_handler(*subfuns, *invars, max_order=max_order, **bind_params)
-                             else:
-                                 ans = found_handler(*subfuns, *invars, **bind_params)
-                    else:
-                        raise NotImplementedError(
-                            f"{eqn.primitive} (name: {eqn.primitive.name}) not in tm_inclusion_registry"
-                        )
+                if eqn.primitive not in tm_inclusion_registry:
+                    raise NotImplementedError(
+                        f"{eqn.primitive} not in tm_inclusion_registry"
+                    )
+                ans = tm_inclusion_registry[eqn.primitive](
+                    *subfuns, *invars, max_order=max_order, **bind_params
+                )
             else:
                 ans = eqn.primitive.bind(*subfuns, *invars, **bind_params)
 
@@ -327,97 +290,54 @@ def nattm_jaxpr(jaxpr: Jaxpr, consts, *args, max_order: int = 2, propagate_sourc
     return safe_map(read, jaxpr.outvars)
 
 
-# Set of primitives that need max_order parameter
-_needs_max_order = set()
-
-# Registry mapping primitives to their corresponding jnp functions for univariate operations
-_univariate_prim_to_func = {}
-
-
-def _register_tm_univariate(primitive: Primitive, func: Callable) -> None:
+def _register_tm_univariate(primitive: Primitive, func: Callable = None) -> None:
     """Register a univariate primitive for Taylor model arithmetic.
 
-    This registers the primitive in three places:
-    1. _univariate_prim_to_func - maps primitive to jnp function for jet
-    2. tm_inclusion_registry - the TM operation handler
-    3. _needs_max_order - marks it as needing max_order parameter
+    Parameters
+    ----------
+    primitive : Primitive
+        The JAX primitive to register.
+    func : Callable, optional
+        The jnp-level function to use for jet tracing. If None, falls back
+        to ``primitive.bind``. Some primitives (e.g. tan, asin, atan) need
+        the jnp function because jet lacks direct rules for them.
     """
-    # Register the jnp function for jet
-    _univariate_prim_to_func[primitive] = func
-
     # Create and register the TM handler
     def _tm_handler(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
-        return _tm_univariate(primitive, x, max_order=max_order)
+        return _tm_univariate(primitive, x, max_order=max_order, func=func)
 
     tm_inclusion_registry[primitive] = _tm_handler
-    _needs_max_order.add(primitive)
+
 
 
 def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
-    """Creates a TM function that applies to the coefficients individually.
+    """Creates a TM handler that applies the primitive to each member separately.
 
-    For structural operations like reshape, slice, etc., we apply them
-    to each row of coefficients (treating each output dimension separately).
+    For operations like copy, convert_element_type, etc., we just apply
+    the primitive independently to coeffs and remainder using tree_map.
     """
-    def _tm_p(*args, **kwargs) -> TaylorModel:
-        gettm = lambda x: x if istaylormodel(x) else None
-        getval = lambda x: x.coeffs if istaylormodel(x) else x
+    def _tm_p(*args, max_order=None, **kwargs) -> TaylorModel:
+        getcoeffs = lambda x: x.coeffs if istaylormodel(x) else x
+        getlower = lambda x: x.remainder.lower if istaylormodel(x) else x
+        getupper = lambda x: x.remainder.upper if istaylormodel(x) else x
 
-        # Find a reference TaylorModel
+        args_coeffs = jax.tree_util.tree_map(getcoeffs, args, is_leaf=istaylormodel)
+        args_lower = jax.tree_util.tree_map(getlower, args, is_leaf=istaylormodel)
+        args_upper = jax.tree_util.tree_map(getupper, args, is_leaf=istaylormodel)
+
+        new_coeffs = primitive.bind(*args_coeffs, **kwargs)
+        new_lower = primitive.bind(*args_lower, **kwargs)
+        new_upper = primitive.bind(*args_upper, **kwargs)
+
         ref_tm = None
         for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylormodel):
             if istaylormodel(arg):
                 ref_tm = arg
                 break
 
-        if ref_tm is None:
-            # No TaylorModel, just apply primitive
-            return primitive.bind(*args, **kwargs)
-
-        # For passthrough ops on TaylorModel, we need to handle them carefully
-        # These ops typically change the output dimension structure
-        # For now, we apply them to the constant term only and wrap result
-        args_const = []
-        for arg in args:
-            if istaylormodel(arg):
-                args_const.append(arg.constant_term)
-            else:
-                args_const.append(arg)
-
-        result_const = primitive.bind(*args_const, **kwargs)
-        n_out = result_const.shape[0] if result_const.ndim > 0 else 1
-
-        # Create output TM with appropriate structure
-        # This is a conservative overapproximation - we lose polynomial info
-        if ref_tm is not None:
-            hull = ref_tm.interval_hull()
-            args_hull = []
-            for arg in args:
-                if istaylormodel(arg):
-                    args_hull.append(arg.interval_hull())
-                else:
-                    args_hull.append(interval(arg))
-
-            # Use interval arithmetic for the remainder
-            from immrax.inclusion.nif import inclusion_registry
-            if primitive in inclusion_registry:
-                result_interval = inclusion_registry[primitive](*args_hull, **kwargs)
-            else:
-                # Fallback: use constant with wide remainder
-                result_interval = interval(result_const)
-
-            # Create TM from interval result
-            return _tm_from_interval(result_interval, ref_tm.d, ref_tm._static_order,
-                                     ref_tm.domain_center, ref_tm.domain_radius)
-
-        # Fallback
-        return taylor_model(
-            result_const.reshape(-1, 1),
-            jnp.zeros((1, 1), dtype=jnp.int32),
-            interval(jnp.zeros(n_out)),
-            jnp.zeros(1),
-            jnp.ones(1),
-        )
+        return TaylorModel(new_coeffs, ref_tm.exponents, interval(new_lower, new_upper),
+                           ref_tm.domain_center, ref_tm.domain_radius,
+                           _static_order=ref_tm._static_order)
 
     return _tm_p
 
@@ -467,245 +387,117 @@ _add_tm_passthrough_to_registry(debug_callback_p)
 
 # --- Reshape operation (preserves polynomial structure) ---
 
-def _tm_reshape_p(x, *, new_sizes, dimensions=None) -> TaylorModel:
-    """Handle reshape of Taylor models, preserving polynomial structure.
+def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
+    """Factory for structural TM operations that preserve polynomial structure.
 
-    Reshapes the output shape while keeping the monomial axis last.
+    These operations act on the output shape of a TaylorModel. The monomial
+    axis (last axis of coeffs) is left unchanged. ``adapt_coeff_kwargs``
+    takes ``(kwargs, tm)`` and returns modified kwargs for the coeffs array
+    (which has the extra trailing monomial axis).
     """
-    if not istaylormodel(x):
-        return lax.reshape_p.bind(x, new_sizes=new_sizes, dimensions=dimensions)
+    def _tm_p(*args, max_order=None, **kwargs):
+        # Find first TM arg
+        ref_tm = None
+        for arg in args:
+            if istaylormodel(arg):
+                ref_tm = arg
+                break
+        if ref_tm is None:
+            return primitive.bind(*args, **kwargs)
 
-    m = x.num_monomials
+        # Apply primitive to coeffs with adapted kwargs
+        coeff_kwargs = adapt_coeff_kwargs(kwargs, ref_tm)
+        args_coeffs = [arg.coeffs if istaylormodel(arg) else arg for arg in args]
+        new_coeffs = primitive.bind(*args_coeffs, **coeff_kwargs)
 
-    # new_sizes is the target output shape
-    # coeffs currently has shape (*old_output_shape, m)
-    # We need to reshape to (*new_sizes, m)
+        # Apply primitive to remainder lower/upper with original kwargs
+        args_lower = [arg.remainder.lower if istaylormodel(arg) else arg for arg in args]
+        args_upper = [arg.remainder.upper if istaylormodel(arg) else arg for arg in args]
+        new_lower = primitive.bind(*args_lower, **kwargs)
+        new_upper = primitive.bind(*args_upper, **kwargs)
 
-    coeff_new_sizes = (*new_sizes, m)
+        return TaylorModel(new_coeffs, ref_tm.exponents, interval(new_lower, new_upper),
+                           ref_tm.domain_center, ref_tm.domain_radius,
+                           _static_order=ref_tm._static_order)
 
-    # Handle dimensions parameter for transposition before reshape
-    if dimensions is not None:
-        # dimensions specifies how to permute before reshape
-        # We need to append the monomial dimension to the permutation
-        coeff_dimensions = (*dimensions, len(x._output_shape))
-        new_coeffs = lax.reshape(x.coeffs, new_sizes=coeff_new_sizes, dimensions=coeff_dimensions)
-    else:
-        new_coeffs = x.coeffs.reshape(*coeff_new_sizes)
-
-    # Reshape remainder
-    new_remainder = x.remainder.reshape(*new_sizes)
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain_center, x.domain_radius, _static_order=x._static_order)
-
-tm_inclusion_registry[lax.reshape_p] = _tm_reshape_p
+    tm_inclusion_registry[primitive] = _tm_p
 
 
-# --- Transpose operation (preserves polynomial structure) ---
+def _adapt_reshape(kwargs, tm):
+    m = tm.num_monomials
+    kw = {**kwargs, 'new_sizes': (*kwargs['new_sizes'], m)}
+    if kwargs.get('dimensions') is not None:
+        kw['dimensions'] = (*kwargs['dimensions'], len(tm._output_shape))
+    return kw
 
-def _tm_transpose_p(x, *, permutation) -> TaylorModel:
-    """Handle transpose of Taylor models, preserving polynomial structure.
+def _adapt_transpose(kwargs, tm):
+    return {**kwargs, 'permutation': (*kwargs['permutation'], len(tm._output_shape))}
 
-    Permutes the output shape dimensions while keeping the monomial axis last.
+def _adapt_squeeze(kwargs, tm):
+    return kwargs  # monomial axis is never size-1
+
+def _adapt_broadcast_in_dim(kwargs, tm):
+    shape = kwargs['shape']
+    return {**kwargs,
+            'shape': (*shape, tm.num_monomials),
+            'broadcast_dimensions': (*kwargs['broadcast_dimensions'], len(shape))}
+
+def _adapt_slice(kwargs, tm):
+    m = tm.num_monomials
+    kw = {**kwargs,
+           'start_indices': (*kwargs['start_indices'], 0),
+           'limit_indices': (*kwargs['limit_indices'], m)}
+    if kwargs.get('strides') is not None:
+        kw['strides'] = (*kwargs['strides'], 1)
+    return kw
+
+def _adapt_concatenate(kwargs, tm):
+    return kwargs  # dimension refers to output axes; monomial axis is last and shared
+
+
+_make_tm_structural_p(lax.reshape_p, _adapt_reshape)
+_make_tm_structural_p(lax.transpose_p, _adapt_transpose)
+_make_tm_structural_p(lax.squeeze_p, _adapt_squeeze)
+_make_tm_structural_p(lax.broadcast_in_dim_p, _adapt_broadcast_in_dim)
+_make_tm_structural_p(lax.slice_p, _adapt_slice)
+_make_tm_structural_p(lax.concatenate_p, _adapt_concatenate)
+
+
+def _tm_dynamic_slice_p(x, *start_indices, slice_sizes, max_order=None) -> TaylorModel:
+    """Handle dynamic slicing of Taylor models.
+
+    start_indices are positional args, so this can't use the structural factory.
     """
-    if not istaylormodel(x):
-        return lax.transpose_p.bind(x, permutation=permutation)
-
-    # permutation applies to output shape dimensions
-    # coeffs has shape (*output_shape, m), so we need to adjust permutation
-    # to keep monomial axis last
-
-    ndim_out = len(x._output_shape)
-
-    # Extend permutation to include monomial axis staying last
-    coeff_permutation = (*permutation, ndim_out)
-
-    new_coeffs = lax.transpose(x.coeffs, permutation=coeff_permutation)
-
-    # Transpose remainder
-    new_remainder = x.remainder.transpose(*permutation)
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain_center, x.domain_radius, _static_order=x._static_order)
-
-tm_inclusion_registry[lax.transpose_p] = _tm_transpose_p
-
-
-# --- Squeeze operation (special handling to preserve polynomial structure) ---
-
-def _tm_squeeze_p(x, *, dimensions) -> TaylorModel:
-    """Handle squeeze of Taylor models, preserving polynomial structure.
-
-    For TMs, squeeze removes size-1 dimensions from the output shape.
-    The monomial axis (last axis of coeffs) is never squeezed.
-    """
-    if not istaylormodel(x):
-        return lax.squeeze_p.bind(x, dimensions=dimensions)
-
-    # Squeeze only affects output shape, not monomial axis
-    # coeffs has shape (*output_shape, m)
-    # We need to squeeze the output shape dimensions
-
-    # Apply squeeze to coeffs (but dimensions refers to output shape, not including monomial axis)
-    new_coeffs = lax.squeeze(x.coeffs, dimensions=dimensions)
-
-    # Apply squeeze to remainder
-    new_remainder = x.remainder.squeeze(axis=dimensions)
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain_center, x.domain_radius, _static_order=x._static_order)
-
-tm_inclusion_registry[lax.squeeze_p] = _tm_squeeze_p
-
-
-# --- Broadcast_in_dim operation (special handling to preserve polynomial structure) ---
-
-def _tm_broadcast_in_dim_p(x, *, shape, broadcast_dimensions, sharding=None) -> TaylorModel:
-    """Handle broadcast_in_dim of Taylor models, preserving polynomial structure.
-
-    This broadcasts the output shape while preserving the monomial axis.
-    The shape parameter refers to the output shape, and we append the monomial count.
-    """
-    if not istaylormodel(x):
-        return lax.broadcast_in_dim_p.bind(x, shape=shape,
-                                            broadcast_dimensions=broadcast_dimensions,
-                                            sharding=sharding)
-
-    m = x.num_monomials
-
-    # Broadcast coeffs: shape is output shape, we need (*shape, m)
-    # broadcast_dimensions maps input dims to output dims
-    # For coeffs (*input_output_shape, m), we broadcast the output shape part
-    # and keep the monomial axis
-
-    # Adjust broadcast_dimensions to account for monomial axis staying last
-    # If input is (*in_shape, m) and output is (*out_shape, m),
-    # broadcast_dimensions for output shape become same for coeffs
-    coeff_shape = (*shape, m)
-    # The monomial axis maps to itself (last axis)
-    coeff_broadcast_dims = (*broadcast_dimensions, len(shape))
-
-    new_coeffs = lax.broadcast_in_dim(x.coeffs, shape=coeff_shape,
-                                       broadcast_dimensions=coeff_broadcast_dims)
-
-    # Broadcast remainder
-    new_remainder = interval(
-        lax.broadcast_in_dim(x.remainder.lower, shape=shape,
-                             broadcast_dimensions=broadcast_dimensions),
-        lax.broadcast_in_dim(x.remainder.upper, shape=shape,
-                             broadcast_dimensions=broadcast_dimensions)
-    )
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain_center, x.domain_radius, _static_order=x._static_order)
-
-tm_inclusion_registry[lax.broadcast_in_dim_p] = _tm_broadcast_in_dim_p
-
-
-# --- Slice operation (special handling) ---
-
-def _tm_slice_p(x, *, start_indices, limit_indices, strides=None) -> TaylorModel:
-    """Handle slicing of Taylor models.
-
-    Slicing applies to the output shape dimensions, not the monomial axis.
-    """
-    if not istaylormodel(x):
-        return lax.slice_p.bind(x, start_indices=start_indices,
-                                 limit_indices=limit_indices, strides=strides)
-
-    m = x.num_monomials
-
-    # Extend indices to include the full monomial axis (last axis of coeffs)
-    coeff_start = (*start_indices, 0)
-    coeff_limit = (*limit_indices, m)
-    coeff_strides = (*strides, 1) if strides else None
-
-    new_coeffs = lax.slice_p.bind(x.coeffs,
-                                   start_indices=coeff_start,
-                                   limit_indices=coeff_limit,
-                                   strides=coeff_strides)
-
-    # Slice the remainder (same indices as original, no monomial axis)
-    new_remainder = interval(
-        lax.slice_p.bind(x.remainder.lower, start_indices=start_indices,
-                         limit_indices=limit_indices, strides=strides),
-        lax.slice_p.bind(x.remainder.upper, start_indices=start_indices,
-                         limit_indices=limit_indices, strides=strides)
-    )
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain_center, x.domain_radius, _static_order=x._static_order)
-
-tm_inclusion_registry[lax.slice_p] = _tm_slice_p
-
-
-def _tm_dynamic_slice_p(x, *start_indices, slice_sizes) -> TaylorModel:
-    """Handle dynamic slicing of Taylor models."""
     if not istaylormodel(x):
         return lax.dynamic_slice_p.bind(x, *start_indices, slice_sizes=slice_sizes)
 
-    # Dynamic slice the coefficients
+    m = x.num_monomials
     new_coeffs = lax.dynamic_slice_p.bind(
-        x.coeffs, start_indices[0], 0,
-        slice_sizes=(slice_sizes[0], x.coeffs.shape[1])
+        x.coeffs, *start_indices, 0,
+        slice_sizes=(*slice_sizes, m)
     )
+    new_lower = lax.dynamic_slice_p.bind(x.remainder.lower, *start_indices, slice_sizes=slice_sizes)
+    new_upper = lax.dynamic_slice_p.bind(x.remainder.upper, *start_indices, slice_sizes=slice_sizes)
 
-    # Slice the remainder
-    new_remainder = interval(
-        lax.dynamic_slice_p.bind(x.remainder.lower, *start_indices, slice_sizes=slice_sizes),
-        lax.dynamic_slice_p.bind(x.remainder.upper, *start_indices, slice_sizes=slice_sizes)
-    )
-
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
+    return TaylorModel(new_coeffs, x.exponents, interval(new_lower, new_upper),
                        x.domain_center, x.domain_radius, _static_order=x._static_order)
 
 tm_inclusion_registry[lax.dynamic_slice_p] = _tm_dynamic_slice_p
 
 
-# --- Concatenation ---
-
-def _tm_concatenate_p(*args, dimension) -> TaylorModel:
-    """Handle concatenation of Taylor models along any output dimension.
-
-    The dimension parameter refers to output shape axes, not the monomial axis.
-    """
-    tms = [arg for arg in args if istaylormodel(arg)]
-
-    if len(tms) == 0:
-        return lax.concatenate_p.bind(*args, dimension=dimension)
-
-    # Convert non-TM args to TMs
-    ref_tm = tms[0]
-    tm_args = []
-    for arg in args:
-        if istaylormodel(arg):
-            tm_args.append(arg.to_canonical(ref_tm._static_order))
-        else:
-            # Wrap scalar/array as constant TM
-            arr = jnp.asarray(arg)
-            tm_args.append(_tm_from_interval(
-                interval(arr), ref_tm.d, ref_tm._static_order,
-                ref_tm.domain_center, ref_tm.domain_radius
-            ))
-
-    return taylor_model_concatenate(tm_args, axis=dimension)
-
-tm_inclusion_registry[lax.concatenate_p] = _tm_concatenate_p
-
-
 # --- Higher-order primitives ---
 
-def _tm_pjit_p(*args, **bind_params) -> TaylorModel:
+def _tm_pjit_p(*args, max_order=None, **bind_params) -> TaylorModel:
     """Handle pjit by evaluating the inner jaxpr."""
     bind_jaxpr = bind_params.pop("jaxpr")
     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
         bind_jaxpr = bind_jaxpr.jaxpr
 
-    # Get max_order from args
-    max_order = 2
-    for arg in args:
-        if istaylormodel(arg):
-            max_order = max(max_order, arg._static_order)
+    if max_order is None:
+        max_order = 2
+        for arg in args:
+            if istaylormodel(arg):
+                max_order = max(max_order, arg._static_order)
 
     return nattm_jaxpr(bind_jaxpr, [], *args, max_order=max_order)
 
@@ -715,7 +507,7 @@ tm_inclusion_registry[jax._src.pjit.pjit_p] = _tm_pjit_p
 # --- Arithmetic operations ---
 
 
-def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
+def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> TaylorModel:
     """Taylor model addition with broadcasting support."""
     if istaylormodel(x) and istaylormodel(y):
         # Check compatible domains
@@ -788,7 +580,7 @@ TaylorModel.__radd__ = _tm_add_p
 
 
 
-def _tm_sub_p(x: TaylorModel, y: TaylorModel | ArrayLike) -> TaylorModel:
+def _tm_sub_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> TaylorModel:
     """Taylor model subtraction."""
     if istaylormodel(y):
         return _tm_add_p(x, _tm_neg_p(y))
@@ -799,7 +591,7 @@ TaylorModel.__sub__ = _tm_sub_p
 TaylorModel.__rsub__ = lambda self, other: _tm_sub_p(other, self)
 
 
-def _tm_neg_p(x: TaylorModel) -> TaylorModel:
+def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model negation."""
     if not istaylormodel(x):
         return -x
@@ -951,7 +743,7 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         return x * y
 
 tm_inclusion_registry[lax.mul_p] = _tm_mul_p
-_needs_max_order.add(lax.mul_p)
+
 TaylorModel.__mul__ = _tm_mul_p
 TaylorModel.__rmul__ = _tm_mul_p
 TaylorModel.multiply = _tm_mul_p
@@ -965,7 +757,8 @@ def _tm_univariate(
     primitive_p: Primitive,
     x: TaylorModel,
     *,
-    max_order: int | None = None
+    max_order: int | None = None,
+    func: Callable | None = None,
 ) -> TaylorModel:
     """Generic implementation for univariate Taylor Model operations.
 
@@ -981,8 +774,7 @@ def _tm_univariate(
     output_shape = x._output_shape
     c = x.constant_term  # (*output_shape,)
 
-    # Get the function for this primitive from the registry, fallback to bind
-    prim_func = _univariate_prim_to_func.get(primitive_p, lambda v: primitive_p.bind(v))
+    prim_func = func if func is not None else (lambda v: primitive_p.bind(v))
 
     # Flatten output shape for processing
     import math
@@ -1107,7 +899,7 @@ def _tm_div_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> Taylo
         return jnp.asarray(x) * recip_y
 
 tm_inclusion_registry[lax.div_p] = _tm_div_p
-_needs_max_order.add(lax.div_p)
+
 
 
 
@@ -1159,7 +951,7 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order: int = None) -> Taylo
         return result
 
 tm_inclusion_registry[lax.integer_pow_p] = _tm_integer_pow_p
-_needs_max_order.add(lax.integer_pow_p)
+
 TaylorModel.__pow__ = _tm_integer_pow_p
 
 
@@ -1170,7 +962,7 @@ def _tm_square_p(x: TaylorModel, *, max_order: int = None) -> TaylorModel:
 
 if hasattr(lax, 'square_p'):
     tm_inclusion_registry[lax.square_p] = _tm_square_p
-    _needs_max_order.add(lax.square_p)
+    pass
 
 
 def _tm_pow_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> TaylorModel:
@@ -1188,7 +980,6 @@ def _tm_pow_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> Taylo
     return _tm_exp_p(y_log_x, max_order=order)
 
 tm_inclusion_registry[lax.pow_p] = _tm_pow_p
-_needs_max_order.add(lax.pow_p)
 
 
 
@@ -1196,18 +987,18 @@ _needs_max_order.add(lax.pow_p)
 
 # --- Transcendental functions ---
 
-_register_tm_univariate(lax.exp_p, jnp.exp)
-_register_tm_univariate(lax.log_p, jnp.log)
-_register_tm_univariate(lax.log1p_p, jnp.log1p)
-_register_tm_univariate(lax.sin_p, jnp.sin)
-_register_tm_univariate(lax.cos_p, jnp.cos)
-_register_tm_univariate(lax.tan_p, jnp.tan)
-_register_tm_univariate(lax.tanh_p, jnp.tanh)
-_register_tm_univariate(lax.sqrt_p, jnp.sqrt)
+_register_tm_univariate(lax.exp_p)
+_register_tm_univariate(lax.log_p)
+_register_tm_univariate(lax.log1p_p)
+_register_tm_univariate(lax.sin_p)
+_register_tm_univariate(lax.cos_p)
+_register_tm_univariate(lax.tan_p, jnp.tan)  # no jet rule for tan
+_register_tm_univariate(lax.tanh_p)
+_register_tm_univariate(lax.sqrt_p)
 
 
 
-def _tm_abs_p(x: TaylorModel) -> TaylorModel:
+def _tm_abs_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model absolute value.
 
     Note: abs is not smooth at 0, so we use interval bounds as fallback.
@@ -1361,7 +1152,6 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
     return lax.dot_general_p.bind(A, B, **kwargs)
 
 tm_inclusion_registry[lax.dot_general_p] = _tm_dot_general_p
-_needs_max_order.add(lax.dot_general_p)
 
 TaylorModel.__matmul__ = nattm(jnp.matmul)
 TaylorModel.__rmatmul__ = lambda self, other: nattm(jnp.matmul)(other, self)
@@ -1369,7 +1159,7 @@ TaylorModel.__rmatmul__ = lambda self, other: nattm(jnp.matmul)(other, self)
 
 # --- Comparison operations (return intervals/arrays, not TMs) ---
 
-def _tm_max_p(x: TaylorModel, y: TaylorModel) -> TaylorModel:
+def _tm_max_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model maximum."""
     if istaylormodel(x):
         x_hull = x.interval_hull()
@@ -1395,7 +1185,7 @@ def _tm_max_p(x: TaylorModel, y: TaylorModel) -> TaylorModel:
 tm_inclusion_registry[lax.max_p] = _tm_max_p
 
 
-def _tm_min_p(x: TaylorModel, y: TaylorModel) -> TaylorModel:
+def _tm_min_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model minimum."""
     if istaylormodel(x):
         x_hull = x.interval_hull()
@@ -1421,7 +1211,7 @@ tm_inclusion_registry[lax.min_p] = _tm_min_p
 
 # --- Reduction operations ---
 
-def _tm_reduce_sum_p(x: TaylorModel, *, axes) -> TaylorModel:
+def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     """Taylor model sum reduction over output shape dimensions.
 
     Sum preserves polynomial structure (sum of polynomials is a polynomial).
@@ -1442,7 +1232,7 @@ def _tm_reduce_sum_p(x: TaylorModel, *, axes) -> TaylorModel:
 tm_inclusion_registry[lax.reduce_sum_p] = _tm_reduce_sum_p
 
 
-def _tm_reduce_max_p(x: TaylorModel, *, axes) -> TaylorModel:
+def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     """Taylor model max reduction.
 
     Max is not polynomial-preserving, so we fall back to interval bounds.
@@ -1462,7 +1252,7 @@ def _tm_reduce_max_p(x: TaylorModel, *, axes) -> TaylorModel:
 tm_inclusion_registry[lax.reduce_max_p] = _tm_reduce_max_p
 
 
-def _tm_reduce_min_p(x: TaylorModel, *, axes) -> TaylorModel:
+def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     """Taylor model min reduction.
 
     Min is not polynomial-preserving, so we fall back to interval bounds.
@@ -1484,8 +1274,8 @@ tm_inclusion_registry[lax.reduce_min_p] = _tm_reduce_min_p
 
 # --- Inverse trig functions ---
 
-_register_tm_univariate(lax.asin_p, jnp.arcsin)
-_register_tm_univariate(lax.atan_p, jnp.arctan)
+_register_tm_univariate(lax.asin_p, jnp.arcsin)  # no jet rule for asin
+_register_tm_univariate(lax.atan_p, jnp.arctan)  # no jet rule for atan
 
 
 

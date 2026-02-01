@@ -662,6 +662,7 @@ inclusion_registry[lax.abs_p] = _inclusion_abs_p
 
 # inclusion_registry[lax.tanh_p] = _inclusion_tanh_p
 _add_passthrough_to_registry(lax.tanh_p)
+_add_passthrough_to_registry(lax.logistic_p)
 
 def _inclusion_log_p(x: Interval, accuracy=None) -> Interval :
     ol = jnp.where((x.lower < 0), -jnp.inf, jnp.log(x.lower))
