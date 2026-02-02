@@ -72,8 +72,9 @@ def _generate_exponents_impl(d: int, max_orders: "tuple[int, ...]") -> Array:
     from itertools import product
 
     ranges = [range(max_orders[i] + 1) for i in range(d)]
+    import numpy as np
     exponents = list(product(*ranges))
-    return jnp.array(exponents, dtype=jnp.int32).T
+    return np.array(exponents, dtype=np.int32).T
 
 
 @register_pytree_node_class
@@ -358,6 +359,21 @@ class TaylorModel:
         """
         poly_val = self.evaluate_polynomial(x)
         return poly_val + self.remainder
+    
+    def __call__(self, x: ArrayLike) -> Interval:
+        """Evaluate the Taylor model at a point, returning an interval.
+
+        Parameters
+        ----------
+        x : ArrayLike
+            Point in the domain, shape (d,)
+
+        Returns
+        -------
+        Interval
+            Interval containing the true value
+        """
+        return self.evaluate(x)
 
     # --- Set operations ---
 
@@ -1145,7 +1161,7 @@ def integrate_variable(
     and *i* = ``var_idx``.  The result is a TaylorModel in the same domain
     variables (with the order of variable *i* incremented by 1).
 
-    The operation decomposes into four parts:
+    The operation decomposes into five parts:
 
     1. **Coefficient shift** – each coefficient :math:`a_\alpha` becomes
        :math:`a_\alpha / (\alpha_i + 1)` with exponent :math:`\alpha_i`
@@ -1158,6 +1174,9 @@ def integrate_variable(
        into the remainder, keeping the polynomial at the original order.
     4. **Remainder integration** – the original remainder interval is multiplied
        by the interval :math:`[x_i - a]` over the domain and added.
+    5. **Order reduction** - if keep_order is True, the highest-degree terms
+       produced by integration are bounded over the domain and absorbed
+       into the remainder, keeping the polynomial at the original order.
 
     Parameters
     ----------

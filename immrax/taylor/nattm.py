@@ -76,7 +76,6 @@ def istaylormodel(x) -> bool:
     """Check if x is a TaylorModel."""
     return isinstance(x, TaylorModel)
 
-
 def nattm(
     f: Callable[..., jax.Array],
     *,
@@ -110,8 +109,8 @@ def nattm(
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorModel :
         """Natural Taylor Model function."""
-        # Get representative values for tracing (use domain centers)
-        geteval = lambda x: x.evaluate_polynomial(x.center) if istaylormodel(x) else jnp.asarray(x)
+        # Get representative values for tracing (use center, a direct pytree leaf)
+        geteval = lambda x: x.center if istaylormodel(x) else jnp.asarray(x)
         buildargs = jax.tree_util.tree_map(geteval, args, is_leaf=istaylormodel)
         buildkwargs = jax.tree_util.tree_map(geteval, kwargs, is_leaf=istaylormodel)
 
@@ -119,7 +118,6 @@ def nattm(
         closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
 
         # Determine max_order from inputs if not specified
-        nonlocal max_order
         effective_order = max_order
         if effective_order is None:
             for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylormodel):
@@ -668,26 +666,23 @@ def _tm_univariate(
     else:
         coeffs_raw_shaped = coeffs_raw[0]  # (order + 1,) for scalar
 
-    # 2. Construct resulting polynomial using Horner's method with lax.scan
+    # 2. Construct resulting polynomial using Horner's method (Python loop)
     # Result = a_0 + z * (a_1 + z * (a_2 + ...)) where z = x - c
     z = x - c
-
-    def horner_step(carry, coeff):
-        # coeff has shape (*output_shape,) for this term
-        term = _tm_constant(coeff, x.d, per_var_order, x.domain, center=x.center)
-        return carry.multiply(z, max_order=per_var_order) + term, None
 
     # Get highest order coefficient
     if output_shape:
         init_coeff = coeffs_raw_shaped[..., order]  # (*output_shape,)
-        # Transpose to (order, *output_shape) then reverse order dimension
-        scan_coeffs = jnp.moveaxis(coeffs_raw_shaped[..., :order], -1, 0)[::-1]
+        # Coefficients in descending order (order-1 down to 0)
+        horner_coeffs = [coeffs_raw_shaped[..., i] for i in range(order - 1, -1, -1)]
     else:
         init_coeff = coeffs_raw_shaped[order]  # scalar
-        scan_coeffs = coeffs_raw_shaped[:order][::-1]  # (order,)
+        horner_coeffs = [coeffs_raw_shaped[i] for i in range(order - 1, -1, -1)]
 
-    init = _tm_constant(init_coeff, x.d, per_var_order, x.domain, center=x.center)
-    result, _ = lax.scan(horner_step, init, scan_coeffs)
+    result = _tm_constant(init_coeff, x.d, per_var_order, x.domain, center=x.center)
+    for coeff in horner_coeffs:
+        term = _tm_constant(coeff, x.d, per_var_order, x.domain, center=x.center)
+        result = result.multiply(z, max_order=per_var_order) + term
 
     # 3. Compute Lagrange remainder: f^(order+1)(xi) / (order+1)! * z^(order+1)
     x_hull = x.interval_hull()
