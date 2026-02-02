@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from immrax.inclusion import interval, nif
 import time
-from immrax.taylor import nattm, taylor_model_from_interval
+from immrax.taylor import nattm, taylor_model_identity
 from immrax.taylor.taylor_model import TaylorModel
 
 def benchmark(fn, input_val, name=""):
@@ -83,7 +83,7 @@ def run_comparison():
         
         # 2. Taylor Model (nattm) - Order 2
         order2 = 2
-        tm_in2 = taylor_model_from_interval(iv, order=order2)
+        tm_in2 = taylor_model_identity(iv, order=order2)
         f_tm2 = nattm(func, max_order=order2)
         ct_tm2, et_tm2, tm_out2 = benchmark(f_tm2, tm_in2, f"nattm(k={order2})")
         hull2 = tm_out2.interval_hull()
@@ -91,7 +91,7 @@ def run_comparison():
         
         # 3. Taylor Model (nattm) - Order 4
         order4 = 4
-        tm_in4 = taylor_model_from_interval(iv, order=order4)
+        tm_in4 = taylor_model_identity(iv, order=order4)
         f_tm4 = nattm(func, max_order=order4)
         ct_tm4, et_tm4, tm_out4 = benchmark(f_tm4, tm_in4, f"nattm(k={order4})")
         hull4 = tm_out4.interval_hull()

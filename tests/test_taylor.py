@@ -4,44 +4,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from immrax.inclusion import Interval, interval, icentpert
+from immrax.inclusion import icentpert
 from immrax.taylor import (
-    TaylorModel,
-    taylor_model,
     taylor_model_from_function,
+    taylor_model_identity,
     nattm,
-    _get_canonical_exponents,
 )
-
-
-# --- Helpers ---
-
-def make_identity_tm(center, radius, order=2):
-    """Create a TM representing the identity function x on a domain.
-
-    p(x) = center + 1*(x - center), remainder = 0, where x in [center-radius, center+radius].
-    Coefficients are in raw (x - center) coordinates.
-    """
-    center = jnp.atleast_1d(jnp.asarray(center, dtype=jnp.float32))
-    radius = jnp.atleast_1d(jnp.asarray(radius, dtype=jnp.float32))
-    d = center.shape[0]
-    n = center.shape[0]
-    exponents = _get_canonical_exponents(d, order)
-    m = exponents.shape[1]
-    coeffs = jnp.zeros((n, m), dtype=jnp.float32)
-    # Set constant term (exponent [0,...,0])
-    const_idx = int(jnp.argmin(jnp.sum(exponents, axis=0)))
-    coeffs = coeffs.at[:, const_idx].set(center)
-    # Set linear terms: for variable i, exponent e_i, coefficient is 1.0 (raw coords)
-    for i in range(d):
-        ei = jnp.zeros(d, dtype=jnp.int32).at[i].set(1)
-        for j in range(m):
-            if jnp.all(exponents[:, j] == ei):
-                coeffs = coeffs.at[i, j].set(1.0)
-                break
-    remainder = interval(jnp.zeros(n, dtype=jnp.float32))
-    domain = icentpert(center, radius)
-    return TaylorModel(coeffs, exponents, remainder, domain, center=center, _static_order=order)
+from immrax.taylor.taylor_model import integrate_variable
 
 
 def tm_hull_contains_samples(f, tm, n_samples=200, atol=1e-5):
@@ -77,10 +46,11 @@ def tm_hull_contains_samples(f, tm, n_samples=200, atol=1e-5):
 def test_univariate_runs(f, center):
     """nattm of a univariate function should produce a valid TM."""
     radius = 0.3
-    tm_x = make_identity_tm(center, radius, order=3)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
     tm_f = nattm(f)(tm_x)
     hull = tm_f.interval_hull()
     assert jnp.all(hull.upper >= hull.lower), "Invalid interval hull"
+    tm_hull_contains_samples(f, tm_f)
 
 
 @pytest.mark.parametrize("f,center", [
@@ -91,7 +61,7 @@ def test_univariate_runs(f, center):
 def test_univariate_no_jet_rule(f, center):
     """Primitives without jet rules should raise KeyError (known limitation)."""
     radius = 0.3
-    tm_x = make_identity_tm(center, radius, order=3)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
     with pytest.raises(KeyError):
         nattm(f)(tm_x)
 
@@ -102,7 +72,7 @@ def test_add():
     f = lambda x: x[0:1] + x[1:2]
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.5, 0.5])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -111,7 +81,7 @@ def test_sub():
     f = lambda x: x[0:1] - x[1:2]
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.5, 0.5])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -120,7 +90,7 @@ def test_mul():
     f = lambda x: x[0:1] * x[1:2]
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.5, 0.5])
-    tm_x = make_identity_tm(center, radius, order=3)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -129,7 +99,7 @@ def test_neg():
     f = lambda x: -x
     center = jnp.array([1.0])
     radius = jnp.array([0.5])
-    tm_x = make_identity_tm(center, radius)
+    tm_x = taylor_model_identity(icentpert(center, radius))
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -138,7 +108,7 @@ def test_scalar_mul():
     f = lambda x: 3.0 * x
     center = jnp.array([1.0])
     radius = jnp.array([0.5])
-    tm_x = make_identity_tm(center, radius)
+    tm_x = taylor_model_identity(icentpert(center, radius))
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -147,7 +117,7 @@ def test_integer_pow():
     f = lambda x: x ** 3
     center = jnp.array([1.0])
     radius = jnp.array([0.5])
-    tm_x = make_identity_tm(center, radius, order=3)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -161,7 +131,7 @@ def test_reshape():
 
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -172,7 +142,7 @@ def test_broadcast():
 
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -183,7 +153,7 @@ def test_slice():
 
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -196,7 +166,7 @@ def test_concatenate():
 
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -210,7 +180,7 @@ def test_passthrough_copy():
 
     center = jnp.array([1.0])
     radius = jnp.array([0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     hull = tm_f.interval_hull()
     assert jnp.all(hull.upper >= hull.lower)
@@ -226,7 +196,7 @@ def test_matvec():
 
     center = jnp.array([1.0, 0.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -239,7 +209,7 @@ def test_reduce_sum():
 
     center = jnp.array([1.0, 2.0])
     radius = jnp.array([0.3, 0.3])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -253,7 +223,7 @@ def test_polynomial_composition():
 
     center = jnp.array([1.0])
     radius = jnp.array([0.5])
-    tm_x = make_identity_tm(center, radius, order=3)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
 
@@ -268,6 +238,60 @@ def test_linear_system():
 
     center = jnp.array([0.0, 0.0])
     radius = jnp.array([1.0, 1.0])
-    tm_x = make_identity_tm(center, radius, order=2)
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
     tm_f = nattm(f)(tm_x)
     tm_hull_contains_samples(f, tm_f)
+
+
+# --- Integration ---
+
+def test_integrate_variable_multidimensional():
+    """Integrate x0 * x1^2 w.r.t. x0 from 0 and verify soundness.
+
+    The exact integral is  x0^2 * x1^2 / 2.
+    We test both keep_order=True (truncates into remainder) and
+    keep_order=False (keeps the higher-order polynomial).
+    """
+    center = jnp.array([0.0, 0.0])
+    radius = jnp.array([1.0, 1.0])
+    domain = icentpert(center, radius)
+
+    # f(x) = x0 * x1^2
+    f = lambda x: jnp.array([x[0] * x[1] ** 2])
+    tm = taylor_model_from_function(f, domain, max_order=3)
+
+    # Exact integral: g(x) = x0^2 * x1^2 / 2
+    g = lambda x: jnp.array([x[0] ** 2 * x[1] ** 2 / 2.0])
+
+    # --- keep_order=False: polynomial order increases, exact result kept ---
+    itm_full = integrate_variable(tm, var_idx=0, start=0.0, keep_order=False)
+    assert itm_full.order[0] == tm.order[0] + 1
+
+    # Polynomial should match the exact integral at sampled points
+    key = jax.random.PRNGKey(42)
+    samples = jax.random.uniform(key, (200, 2), minval=domain.lower, maxval=domain.upper)
+    for i in range(200):
+        poly_val = itm_full.evaluate_polynomial(samples[i])
+        exact_val = g(samples[i])
+        assert jnp.allclose(poly_val, exact_val, atol=1e-4), (
+            f"keep_order=False mismatch at {samples[i]}: {poly_val} vs {exact_val}"
+        )
+
+    # --- keep_order=True: same order, high-degree terms bounded in remainder ---
+    itm_reduced = integrate_variable(tm, var_idx=0, start=0.0, keep_order=True)
+    assert itm_reduced.order == tm.order
+
+    # The interval hull must still contain the exact integral values (soundness)
+    hull = itm_reduced.interval_hull()
+    for i in range(200):
+        exact_val = g(samples[i])
+        assert jnp.all(exact_val >= hull.lower - 1e-5), (
+            f"Below hull at {samples[i]}: {exact_val} < {hull.lower}"
+        )
+        assert jnp.all(exact_val <= hull.upper + 1e-5), (
+            f"Above hull at {samples[i]}: {exact_val} > {hull.upper}"
+        )
+
+    # --- start=None should use center (here 0.0), same as start=0.0 ---
+    itm_none = integrate_variable(tm, var_idx=0, start=None, keep_order=False)
+    assert jnp.allclose(itm_none.coeffs, itm_full.coeffs, atol=1e-6)

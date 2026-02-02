@@ -23,7 +23,7 @@ from ...inclusion import Interval, interval, natif
 from ...utils import fact, inv_fact
 from ...taylor.taylor_model import (
     TaylorModel,
-    taylor_model_from_interval,
+    taylor_model_identity,
     taylor_model_concatenate,
 )
 from ...taylor.nattm import nattm
@@ -251,7 +251,7 @@ class TMFlowpipeGenerator(BaseSetGenerator):
     -------
     >>> from immrax.system import System
     >>> from immrax.inclusion import icentpert
-    >>> from immrax.taylor.taylor_model import taylor_model_from_interval
+    >>> from immrax.taylor.taylor_model import taylor_model_identity
     >>>
     >>> class VanDerPol(System):
     ...     def __init__(self):
@@ -261,7 +261,7 @@ class TMFlowpipeGenerator(BaseSetGenerator):
     >>>
     >>> sys = VanDerPol()
     >>> gen = TMFlowpipeGenerator(sys, dt=0.1, order_time=4, order_state=3)
-    >>> x0 = taylor_model_from_interval(icentpert(jnp.array([1.0, 0.0]), jnp.array([0.1, 0.1])), order=3)
+    >>> x0 = taylor_model_identity(icentpert(jnp.array([1.0, 0.0]), jnp.array([0.1, 0.1])), order=3)
     >>> reach = gen.compute_reach_sets(0.0, 10, x0)
     """
 
@@ -360,7 +360,7 @@ def tm_reachtube(
     """
     # Convert interval to Taylor model if needed
     if isinstance(x0, Interval):
-        x0 = taylor_model_from_interval(x0, order=order_state)
+        x0 = taylor_model_identity(x0, order=order_state)
 
     t0, tf = t_span
     num_steps = int((tf - t0) / dt)

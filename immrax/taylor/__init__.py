@@ -8,7 +8,8 @@ them through functions, similar to natif for intervals.
 from .taylor_model import (
     TaylorModel,
     taylor_model,
-    taylor_model_from_interval,
+    taylor_model_identity,
+    taylor_model_constant,
     taylor_model_from_function,
     taylor_model_concatenate,
     _generate_exponents,
@@ -35,7 +36,8 @@ __all__ = [
     # Taylor Model class and constructors
     "TaylorModel",
     "taylor_model",
-    "taylor_model_from_interval",
+    "taylor_model_identity",
+    "taylor_model_constant",
     "taylor_model_from_function",
     "taylor_model_concatenate",
     # Taylor Polynomial class

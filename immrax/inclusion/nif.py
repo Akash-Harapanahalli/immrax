@@ -402,6 +402,10 @@ def _inclusion_integer_pow_p(x: Interval, y: int) -> Interval:
     if not isinstance(x, Interval):
         return x**y
 
+    # x^0 = 1 for all x
+    if isinstance(y, int) and y == 0:
+        return Interval(jnp.ones_like(x.lower), jnp.ones_like(x.upper))
+
     def _inclusion_integer_pow_impl(x: Interval, y: int) -> Interval:
         l_pow = lax.integer_pow(x.lower, y)
         u_pow = lax.integer_pow(x.upper, y)

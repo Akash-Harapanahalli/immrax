@@ -49,7 +49,7 @@ from immrax.utils import inv_fact, prolongation
 
 from immrax.taylor.taylor_model import (
     TaylorModel,
-    taylor_model_from_interval,
+    taylor_model_identity,
     evaluate_at_variable,
     _get_canonical_exponents,
 )
@@ -232,7 +232,7 @@ def validated_integ2(
     """
     # -- Convert x0 to TaylorModel if needed --
     if isinstance(x0, Interval):
-        x_tm = taylor_model_from_interval(x0, order=order_space)
+        x_tm = taylor_model_identity(x0, order=order_space)
     elif isinstance(x0, TaylorModel):
         x_tm = x0
     else:

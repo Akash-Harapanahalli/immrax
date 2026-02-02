@@ -11,7 +11,7 @@ import numpy as np
 
 import immrax as irx
 from immrax.inclusion import interval, icentpert, natif
-from immrax.taylor.taylor_model import taylor_model_from_interval
+from immrax.taylor.taylor_model import taylor_model_identity
 from immrax.taylor.nattm import nattm
 from immrax.utils import run_times
 
@@ -54,7 +54,7 @@ def to_scalar(x):
 def compare_scalar(name, f, iv, tm_order=4, num_runs=100):
     """Compare natif vs nattm for scalar output functions."""
     # Create inputs
-    tm = taylor_model_from_interval(iv, order=tm_order)
+    tm = taylor_model_identity(iv, order=tm_order)
 
     # Compile and warm up
     natif_f = jax.jit(natif(f))
@@ -95,7 +95,7 @@ def compare_scalar(name, f, iv, tm_order=4, num_runs=100):
 
 def compare_vector(name, f, iv, tm_order=4, num_runs=100):
     """Compare natif vs nattm for vector output functions."""
-    tm = taylor_model_from_interval(iv, order=tm_order)
+    tm = taylor_model_identity(iv, order=tm_order)
 
     # Compile and warm up
     natif_f = jax.jit(natif(f))

@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from immrax import System
 from immrax.generator.algorithms import TaylorModelReachability
-from immrax.generator.sets import taylor_model_from_interval, TaylorModel, taylor_model_concatenate
+from immrax.generator.sets import taylor_model_identity, TaylorModel, taylor_model_concatenate
 from immrax.inclusion import Interval
 import time
 
@@ -42,7 +42,7 @@ def test_reachability():
     # Create initial Taylor Model from interval
     # We use identity polynomial (order 1) to represent the initial set variables
     # x = c + r*u, u in [-1, 1]
-    tm0 = taylor_model_from_interval(
+    tm0 = taylor_model_identity(
         Interval(center - radius, center + radius),
         order=2 # Polynomial order for state dependence
     )
