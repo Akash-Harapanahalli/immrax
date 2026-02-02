@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from immrax.inclusion import Interval, interval
+from immrax.inclusion import Interval, interval, icentpert
 from immrax.taylor import (
     TaylorModel,
     taylor_model,
@@ -17,9 +17,10 @@ from immrax.taylor import (
 # --- Helpers ---
 
 def make_identity_tm(center, radius, order=2):
-    """Create a TM representing the identity function x on a 1D domain.
+    """Create a TM representing the identity function x on a domain.
 
-    p(u) = center + radius * u, remainder = 0, where u in [-1, 1].
+    p(x) = center + 1*(x - center), remainder = 0, where x in [center-radius, center+radius].
+    Coefficients are in raw (x - center) coordinates.
     """
     center = jnp.atleast_1d(jnp.asarray(center, dtype=jnp.float32))
     radius = jnp.atleast_1d(jnp.asarray(radius, dtype=jnp.float32))
@@ -31,15 +32,16 @@ def make_identity_tm(center, radius, order=2):
     # Set constant term (exponent [0,...,0])
     const_idx = int(jnp.argmin(jnp.sum(exponents, axis=0)))
     coeffs = coeffs.at[:, const_idx].set(center)
-    # Set linear terms: for variable i, exponent e_i
+    # Set linear terms: for variable i, exponent e_i, coefficient is 1.0 (raw coords)
     for i in range(d):
         ei = jnp.zeros(d, dtype=jnp.int32).at[i].set(1)
         for j in range(m):
             if jnp.all(exponents[:, j] == ei):
-                coeffs = coeffs.at[i, j].set(radius[i])
+                coeffs = coeffs.at[i, j].set(1.0)
                 break
     remainder = interval(jnp.zeros(n, dtype=jnp.float32))
-    return TaylorModel(coeffs, exponents, remainder, center, radius, _static_order=order)
+    domain = icentpert(center, radius)
+    return TaylorModel(coeffs, exponents, remainder, domain, center=center, _static_order=order)
 
 
 def tm_hull_contains_samples(f, tm, n_samples=200, atol=1e-5):
@@ -48,8 +50,8 @@ def tm_hull_contains_samples(f, tm, n_samples=200, atol=1e-5):
     d = tm.d
     key = jax.random.PRNGKey(0)
     samples = jax.random.uniform(key, (n_samples, d),
-                                  minval=tm.domain_center - tm.domain_radius,
-                                  maxval=tm.domain_center + tm.domain_radius)
+                                  minval=tm.domain.lower,
+                                  maxval=tm.domain.upper)
     for i in range(n_samples):
         val = f(samples[i])
         assert jnp.all(val >= hull.lower - atol), (

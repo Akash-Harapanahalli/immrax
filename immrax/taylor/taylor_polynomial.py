@@ -47,16 +47,23 @@ class TaylorPolynomial:
         coeffs: ArrayLike,
         exponents: ArrayLike,
         domain_center: ArrayLike,
-        _static_order: int | None = None,
+        _static_order: "int | tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
         self.domain_center = jnp.asarray(domain_center)
 
+        d = self.exponents.shape[0]
+
         if _static_order is not None:
-            self._static_order = _static_order
+            if isinstance(_static_order, int):
+                self._static_order = tuple([_static_order] * d)
+            else:
+                self._static_order = tuple(_static_order)
         else:
-            self._static_order = int(jnp.max(jnp.sum(self.exponents, axis=0)))
+            self._static_order = tuple(
+                int(jnp.max(self.exponents[i])) for i in range(d)
+            )
 
         self._output_shape = self.coeffs.shape[:-1]
 
@@ -104,8 +111,8 @@ class TaylorPolynomial:
         return self.coeffs.shape[-1]
 
     @property
-    def order(self) -> int:
-        return int(jnp.max(jnp.sum(self.exponents, axis=0)))
+    def order(self) -> "tuple[int, ...]":
+        return self._static_order
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -189,22 +196,26 @@ class TaylorPolynomial:
 
     # --- Canonicalization and order reduction ---
 
-    def to_canonical(self, target_order: int | None = None) -> "TaylorPolynomial":
+    def to_canonical(self, target_order: "int | tuple[int, ...] | None" = None) -> "TaylorPolynomial":
         """Convert to canonical exponent structure, discarding terms above target_order."""
         if target_order is None:
             target_order = self._static_order
+        if isinstance(target_order, int):
+            target_order = tuple([target_order] * self.d)
+        else:
+            target_order = tuple(target_order)
 
         canonical_exp = _get_canonical_exponents(self.d, target_order)
         num_canonical = canonical_exp.shape[1]
 
-        base = target_order + 2
+        base = max(target_order) + 2
         powers = base ** jnp.arange(self.d)
 
         current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        term_orders = jnp.sum(self.exponents, axis=0)
-        has_match = term_orders <= target_order
+        target_arr = jnp.array(target_order, dtype=jnp.int32)[:, None]
+        has_match = jnp.all(self.exponents <= target_arr, axis=0)
 
         if num_canonical > 50:
             sort_perm = jnp.argsort(canonical_hash)
@@ -225,10 +236,14 @@ class TaylorPolynomial:
             _static_order=target_order,
         )
 
-    def reduce_order(self, target_order: int) -> "TaylorPolynomial":
+    def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorPolynomial":
         """Reduce polynomial order, silently discarding high-order terms."""
-        term_orders = jnp.sum(self.exponents, axis=0)
-        keep_mask = term_orders <= target_order
+        if isinstance(target_order, int):
+            target_order = tuple([target_order] * self.d)
+        else:
+            target_order = tuple(target_order)
+        target_arr = jnp.array(target_order, dtype=jnp.int32)[:, None]
+        keep_mask = jnp.all(self.exponents <= target_arr, axis=0)
         new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorPolynomial(
@@ -260,16 +275,12 @@ class TaylorPolynomial:
             else:
                 remainder = interval(jnp.zeros(self._output_shape, dtype=self.dtype))
 
-        # Rescale coefficients: TaylorModel uses normalized coords u = (x-c)/r,
-        # so a_alpha * dx^alpha = a_alpha * (r*u)^alpha = (a_alpha * r^alpha) * u^alpha
-        log_r = jnp.log(jnp.abs(domain_radius) + 1e-30)
-        log_scale = self.exponents.T @ log_r
-        scale = jnp.exp(log_scale)
-        scaled_coeffs = self.coeffs * scale
+        # Coefficients are already in raw (x - center) coordinates, no rescaling needed.
+        domain = icentpert(self.domain_center, domain_radius)
 
         return TaylorModel(
-            scaled_coeffs, self.exponents, remainder,
-            self.domain_center, domain_radius,
+            self.coeffs, self.exponents, remainder,
+            domain, center=self.domain_center,
             _static_order=self._static_order,
         )
 

@@ -32,6 +32,7 @@ from immrax.taylor.taylor_polynomial import TaylorPolynomial
 from immrax.taylor.taylor_model import (
     _get_canonical_exponents,
     _merge_taylor_terms,
+    _max_order,
 )
 
 
@@ -118,7 +119,7 @@ def nattp(
                     effective_order = (
                         arg._static_order
                         if effective_order is None
-                        else max(effective_order, arg._static_order)
+                        else _max_order(effective_order, arg._static_order)
                     )
             if effective_order is None:
                 effective_order = 2
@@ -348,11 +349,13 @@ def _tp_pjit_p(*args, **bind_params):
     bind_jaxpr = bind_params.pop("jaxpr")
     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
         bind_jaxpr = bind_jaxpr.jaxpr
-    max_order = 2
+    eff_order = None
     for a in args:
         if istaylorpolynomial(a):
-            max_order = max(max_order, a._static_order)
-    return nattp_jaxpr(bind_jaxpr, [], *args, max_order=max_order)
+            eff_order = a._static_order if eff_order is None else _max_order(eff_order, a._static_order)
+    if eff_order is None:
+        eff_order = 2
+    return nattp_jaxpr(bind_jaxpr, [], *args, max_order=eff_order)
 
 tp_inclusion_registry[jax._src.pjit.pjit_p] = _tp_pjit_p
 
@@ -369,7 +372,7 @@ def _tp_add_p(x, y):
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, y.num_monomials))
         new_coeffs, new_exp = _merge_taylor_terms(x_coeffs, x.exponents, y_coeffs, y.exponents)
-        new_order = max(x._static_order, y._static_order)
+        new_order = _max_order(x._static_order, y._static_order)
         result = TaylorPolynomial(new_coeffs, new_exp, x.domain_center, _static_order=new_order)
         return result.to_canonical(new_order)
 
@@ -435,11 +438,15 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         coeff2 = y_coeffs[..., None, :]
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
-        effective_order = max_order if max_order is not None else max(x._static_order, y._static_order)
+        effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
 
-        # Discard HOT (no remainder)
-        total_orders = jnp.sum(all_exp, axis=0)
-        keep_mask = total_orders <= effective_order
+        # Discard HOT (no remainder) — per-variable check
+        if isinstance(effective_order, int):
+            eff_tuple = tuple([effective_order] * d)
+        else:
+            eff_tuple = tuple(effective_order)
+        target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
+        keep_mask = jnp.all(all_exp <= target_arr, axis=0)
         kept_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
 
         result = TaylorPolynomial(kept_coeffs, all_exp, x.domain_center, _static_order=effective_order)
@@ -530,7 +537,7 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         if A.d != B.d:
             raise ValueError(f"Domain dimensions must match: {A.d} vs {B.d}")
 
-        effective_order = max_order if max_order is not None else max(A._static_order, B._static_order)
+        effective_order = max_order if max_order is not None else _max_order(A._static_order, B._static_order)
         d = A.d
         m1 = A.num_monomials
         m2 = B.num_monomials
@@ -545,9 +552,13 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Discard HOT
-        total_orders = jnp.sum(product_exp, axis=0)
-        keep_mask = total_orders <= effective_order
+        # Discard HOT — per-variable check
+        if isinstance(effective_order, int):
+            eff_tuple = tuple([effective_order] * d)
+        else:
+            eff_tuple = tuple(effective_order)
+        target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
+        keep_mask = jnp.all(product_exp <= target_arr, axis=0)
         kept_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
         result = TaylorPolynomial(kept_coeffs, product_exp, A.domain_center,
@@ -628,7 +639,12 @@ def _tp_univariate(
     if not istaylorpolynomial(x):
         return primitive_p.bind(x)
 
-    order = max_order if max_order is not None else x._static_order
+    per_var_order = max_order if max_order is not None else x._static_order
+    # For univariate composition, use max of per-variable orders as expansion depth
+    if isinstance(per_var_order, tuple):
+        order = max(per_var_order)
+    else:
+        order = per_var_order
     output_shape = x._output_shape
     c = x.constant_term
 
@@ -654,8 +670,8 @@ def _tp_univariate(
     z = x - c
 
     def horner_step(carry, coeff):
-        term = _tp_constant(coeff, x.d, order, x.domain_center)
-        return _tp_mul_p(carry, z, max_order=order) + term, None
+        term = _tp_constant(coeff, x.d, per_var_order, x.domain_center)
+        return _tp_mul_p(carry, z, max_order=per_var_order) + term, None
 
     if output_shape:
         init_coeff = coeffs_raw_shaped[..., order]
@@ -664,7 +680,7 @@ def _tp_univariate(
         init_coeff = coeffs_raw_shaped[order]
         scan_coeffs = coeffs_raw_shaped[:order][::-1]
 
-    init = _tp_constant(init_coeff, x.d, order, x.domain_center)
+    init = _tp_constant(init_coeff, x.d, per_var_order, x.domain_center)
     result, _ = lax.scan(horner_step, init, scan_coeffs)
 
     return result
@@ -713,14 +729,16 @@ _tp_needs_max_order.add(lax.div_p)
 
 # --- pow: x^y = exp(y * log(x)) ---
 
-def _tp_pow_p(x, y, *, max_order: int = None):
+def _tp_pow_p(x, y, *, max_order=None):
     order = max_order
     if order is None:
-        order = 2
+        order = None
         if istaylorpolynomial(x):
-            order = max(order, x._static_order)
+            order = x._static_order
         if istaylorpolynomial(y):
-            order = max(order, y._static_order)
+            order = y._static_order if order is None else _max_order(order, y._static_order)
+        if order is None:
+            order = 2
 
     log_x = _tp_univariate(lax.log_p, x, max_order=order)
     y_log_x = _tp_mul_p(y, log_x, max_order=order)

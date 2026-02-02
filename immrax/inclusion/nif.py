@@ -201,6 +201,31 @@ _add_passthrough_to_registry(lax.max_p)
 _add_passthrough_to_registry(lax.min_p)
 _add_passthrough_to_registry(lax.exp_p)
 _add_passthrough_to_registry(lax.reduce_sum_p)
+
+
+def _inclusion_reduce_prod_p(x: Interval, *, axes) -> Interval:
+    """Interval reduce_prod: multiply intervals along specified axes.
+
+    Uses sequential interval multiplication (handles signs correctly).
+    """
+    for axis in sorted(axes, reverse=True):
+        n = x.lower.shape[axis]
+        # Start with the first slice
+        result = interval(
+            jnp.take(x.lower, 0, axis=axis),
+            jnp.take(x.upper, 0, axis=axis),
+        )
+        # Multiply remaining slices using interval arithmetic
+        for i in range(1, n):
+            next_iv = interval(
+                jnp.take(x.lower, i, axis=axis),
+                jnp.take(x.upper, i, axis=axis),
+            )
+            result = result * next_iv
+        x = result
+    return x
+
+inclusion_registry[lax.reduce_prod_p] = _inclusion_reduce_prod_p
 _add_passthrough_to_registry(lax.pad_p)
 _add_passthrough_to_registry(lax.ne_p)
 _add_passthrough_to_registry(lax.lt_p)

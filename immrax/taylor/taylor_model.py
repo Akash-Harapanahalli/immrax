@@ -19,21 +19,60 @@ from immrax.inclusion import Interval, interval, icentpert
 # Zonotope is imported lazily in to_zonotope() to avoid circular import
 
 
+def _normalize_order(order: "int | tuple[int, ...] | None", d: int) -> "tuple[int, ...]":
+    """Normalize an order specification to a tuple of length d.
+
+    Parameters
+    ----------
+    order : int, tuple[int, ...], or None
+        If int, broadcast to all variables.  If tuple, must have length d.
+        If None, raises ValueError.
+    d : int
+        Number of domain variables.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Per-variable order bounds, length d.
+    """
+    if order is None:
+        raise ValueError("order must not be None")
+    if isinstance(order, (int,)):
+        return tuple([order] * d)
+    order = tuple(order)
+    if len(order) != d:
+        raise ValueError(f"order tuple length {len(order)} != d={d}")
+    return order
+
+
+def _max_order(a: "tuple[int, ...]", b: "tuple[int, ...]") -> "tuple[int, ...]":
+    """Element-wise maximum of two order tuples."""
+    return tuple(max(ai, bi) for ai, bi in zip(a, b))
+
+
 # Cache for canonical exponent structures
 @lru_cache(maxsize=128)
-def _get_canonical_exponents(d: int, max_order: int) -> Array:
-    """Get cached canonical exponents for given dimension and order."""
-    return _generate_exponents_impl(d, max_order)
+def _get_canonical_exponents(d: int, max_orders: "int | tuple[int, ...]") -> Array:
+    """Get cached canonical exponents for given dimension and per-variable orders.
+
+    Parameters
+    ----------
+    d : int
+        Number of variables.
+    max_orders : int or tuple[int, ...]
+        Per-variable maximum exponent.  If int, broadcast to all variables.
+    """
+    if isinstance(max_orders, int):
+        max_orders = tuple([max_orders] * d)
+    return _generate_exponents_impl(d, max_orders)
 
 
-def _generate_exponents_impl(d: int, max_order: int) -> Array:
-    """Generate all exponent multi-indices up to given order."""
+def _generate_exponents_impl(d: int, max_orders: "tuple[int, ...]") -> Array:
+    """Generate all exponent multi-indices with per-variable bounds."""
     from itertools import product
 
-    exponents = [
-        exp for exp in product(range(max_order + 1), repeat=d)
-        if sum(exp) <= max_order
-    ]
+    ranges = [range(max_orders[i] + 1) for i in range(d)]
+    exponents = list(product(*ranges))
     return jnp.array(exponents, dtype=jnp.int32).T
 
 
@@ -67,10 +106,9 @@ class TaylorModel:
         Each column is a multi-index α.
     remainder : Interval
         Interval remainder bounds with shape (*output_shape,).
-    domain_center : ArrayLike
-        Center of the domain box, shape (d,)
-    domain_radius : ArrayLike
-        Half-width of the domain box, shape (d,)
+    domain : Interval
+        Domain box with shape (d,). Center and half-width are accessed
+        via ``domain.center`` and ``domain.pert``.
 
     References
     ----------
@@ -83,31 +121,41 @@ class TaylorModel:
     coeffs: Array  # Polynomial coefficients, shape (*output_shape, num_monomials)
     exponents: Array  # Exponent matrix, shape (d, num_monomials)
     remainder: Interval  # Interval remainder, shape (*output_shape,)
-    domain_center: Array  # Domain center, shape (d,)
-    domain_radius: Array  # Domain half-width, shape (d,)
+    domain: Interval  # Domain box, shape (d,)
+    center: Array  # Expansion point, shape (d,)
 
     def __init__(
         self,
         coeffs: ArrayLike,
         exponents: ArrayLike,
         remainder: Interval,
-        domain_center: ArrayLike,
-        domain_radius: ArrayLike,
-        _static_order: int | None = None,
+        domain: Interval,
+        center: ArrayLike = None,
+        _static_order: "int | tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
         self.remainder = remainder
-        self.domain_center = jnp.asarray(domain_center)
-        self.domain_radius = jnp.asarray(domain_radius)
+        self.domain = domain
+        if center is None:
+            self.center = domain.center
+        else:
+            self.center = jnp.asarray(center)
+
+        d = self.exponents.shape[0]
 
         # Store the polynomial order as static data (for JIT compatibility)
-        # If not provided, compute from exponents (only works outside JIT)
+        # _static_order is always a tuple[int, ...] of length d.
         if _static_order is not None:
-            self._static_order = _static_order
+            if isinstance(_static_order, int):
+                self._static_order = tuple([_static_order] * d)
+            else:
+                self._static_order = tuple(_static_order)
         else:
-            # Compute order from exponents (requires concrete values)
-            self._static_order = int(jnp.max(jnp.sum(self.exponents, axis=0)))
+            # Compute per-variable max from exponents (requires concrete values)
+            self._static_order = tuple(
+                int(jnp.max(self.exponents[i])) for i in range(d)
+            )
 
         # Store output shape (all axes except the last monomial axis)
         # Monomials are always the LAST axis of coeffs
@@ -128,29 +176,24 @@ class TaylorModel:
                 f"remainder and coeffs must have same output shape: "
                 f"{self.remainder.shape} vs {self._output_shape}"
             )
-        if self.domain_center.shape[0] != self.exponents.shape[0]:
+        if self.domain.lower.shape[0] != self.exponents.shape[0]:
             raise ValueError(
-                f"domain_center must match exponents dimension: "
-                f"{self.domain_center.shape[0]} vs {self.exponents.shape[0]}"
-            )
-        if self.domain_radius.shape != self.domain_center.shape:
-            raise ValueError(
-                f"domain_radius must match domain_center shape: "
-                f"{self.domain_radius.shape} vs {self.domain_center.shape}"
+                f"domain must match exponents dimension: "
+                f"{self.domain.lower.shape[0]} vs {self.exponents.shape[0]}"
             )
 
     # --- Pytree methods ---
 
     def tree_flatten(
         self,
-    ) -> Tuple[Tuple[Array, Array, Interval, Array, Array], dict]:
+    ) -> Tuple[Tuple[Array, Array, Interval, Interval, Array], dict]:
         return (
             (
                 self.coeffs,
                 self.exponents,
                 self.remainder,
-                self.domain_center,
-                self.domain_radius,
+                self.domain,
+                self.center,
             ),
             {"_static_order": self._static_order, "_output_shape": self._output_shape},
         )
@@ -159,7 +202,8 @@ class TaylorModel:
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
         static_order = aux_data.get("_static_order") if aux_data else None
         # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
-        return cls(*children, _static_order=static_order)
+        coeffs, exponents, remainder, domain, center = children
+        return cls(coeffs, exponents, remainder, domain, center=center, _static_order=static_order)
 
     # --- Properties ---
 
@@ -168,6 +212,21 @@ class TaylorModel:
         """Total number of output elements (product of output_shape)."""
         import math
         return math.prod(self._output_shape) if self._output_shape else 1
+
+    @property
+    def domain_center(self) -> Array:
+        """Center of the domain box, shape (d,). Deprecated: use center or domain.center."""
+        return self.domain.center
+
+    @property
+    def domain_radius(self) -> Array:
+        """Half-width of the domain box, shape (d,). Deprecated: use domain.pert."""
+        return self.domain.pert
+
+    @property
+    def shifted_domain(self) -> Interval:
+        """Domain shifted by center: D - center, for bounding monomials (x - center)^alpha."""
+        return interval(self.domain.lower - self.center, self.domain.upper - self.center)
 
     @property
     def d(self) -> int:
@@ -180,9 +239,9 @@ class TaylorModel:
         return self.coeffs.shape[-1]
 
     @property
-    def order(self) -> int:
-        """Maximum polynomial order (sum of exponents)."""
-        return int(jnp.max(jnp.sum(self.exponents, axis=0)))
+    def order(self) -> "tuple[int, ...]":
+        """Per-variable maximum polynomial order."""
+        return self._static_order
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -219,8 +278,8 @@ class TaylorModel:
                 # Reshape not needed, shapes should match from same indexing
                 pass
 
-        return TaylorModel(c, self.exponents, rem, self.domain_center, self.domain_radius,
-                           _static_order=self._static_order)
+        return TaylorModel(c, self.exponents, rem, self.domain,
+                           center=self.center, _static_order=self._static_order)
 
     def __len__(self) -> int:
         """Length along first axis of output shape."""
@@ -264,8 +323,8 @@ class TaylorModel:
             Polynomial value, shape (*output_shape,)
         """
         x = jnp.asarray(x)
-        # Normalize to centered coordinates
-        x_centered = (x - self.domain_center) / self.domain_radius
+        # Shift to centered coordinates (x - center)
+        x_centered = x - self.center
 
         # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
         # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
@@ -289,9 +348,7 @@ class TaylorModel:
             Interval containing the true value
         """
         poly_val = self.evaluate_polynomial(x)
-        return interval(
-            poly_val + self.remainder.lower, poly_val + self.remainder.upper
-        )
+        return poly_val + self.remainder
 
     # --- Set operations ---
 
@@ -344,26 +401,24 @@ class TaylorModel:
         remainder_center = self.remainder.center
         remainder_radius = self.remainder.pert
 
-        # Vectorized computation of monomial properties
-        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
-        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)  # (m,)
+        # Compute monomial bounds over shifted domain (D - center)
+        mono_bounds = _bound_monomials_over_domain(self.exponents, self.shifted_domain)
+        mono_center = (mono_bounds.lower + mono_bounds.upper) / 2  # (m,)
+        mono_radius = (mono_bounds.upper - mono_bounds.lower) / 2  # (m,)
 
-        # For even monomials (non-constant), we shift center by 0.5*coeff
-        # and scale generators by 0.5
-        even_non_const = ~has_odd & ~is_constant  # (m,)
+        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
+
+        # Center contribution: sum of coeff_i * mono_center_i for non-constant terms
         center_shift = jnp.sum(
-            jnp.where(even_non_const, 0.5 * self.coeffs, 0.0), axis=-1
+            jnp.where(~is_constant, self.coeffs * mono_center, 0.0), axis=-1
         )  # (n,)
 
         ox = self.constant_term + remainder_center + center_shift
 
-        # Generator scaling: 0.5 for even non-constant, 1.0 for odd
-        gen_scale = jnp.where(even_non_const, 0.5, 1.0)  # (m,)
-
-        # Non-constant generators from polynomial terms
+        # Non-constant generators from polynomial terms, scaled by mono_radius
         non_const_mask = ~is_constant  # (m,)
         poly_generators = jnp.where(
-            non_const_mask, self.coeffs * gen_scale, 0.0
+            non_const_mask, self.coeffs * mono_radius, 0.0
         )  # (n, m)
 
         # Remainder generators (axis-aligned)
@@ -395,7 +450,7 @@ class TaylorModel:
 
     def to_canonical(
         self,
-        target_order: int | None = None,
+        target_order: "int | tuple[int, ...] | None" = None,
         method: str | None = None,
     ) -> "TaylorModel":
         """Convert to canonical exponent structure.
@@ -405,8 +460,9 @@ class TaylorModel:
 
         Parameters
         ----------
-        target_order : int, optional
-            Target order. If None, uses current maximum order.
+        target_order : int, tuple[int, ...], or None
+            Target per-variable order. If int, broadcast to all variables.
+            If None, uses current order.
         method : str, optional
             Algorithm for index mapping: "broadcast" (O(m * num_canonical), fast
             for small num_canonical), "searchsorted" (O(m log num_canonical),
@@ -420,6 +476,10 @@ class TaylorModel:
         """
         if target_order is None:
             target_order = self._static_order
+        if isinstance(target_order, int):
+            target_order = tuple([target_order] * self.d)
+        else:
+            target_order = tuple(target_order)
 
         # Generate canonical exponents (uses cached version for JIT compatibility)
         canonical_exp = _get_canonical_exponents(self.d, target_order)
@@ -432,7 +492,7 @@ class TaylorModel:
 
         # Compute a unique hash for each exponent vector
         # Use weighted sum: sum_i exp[i] * (max_order+1)^i
-        base = target_order + 2  # Ensure no collisions
+        base = max(target_order) + 2  # Ensure no collisions
         powers = base ** jnp.arange(self.d)
 
         # Hash current exponents: (m,)
@@ -441,9 +501,9 @@ class TaylorModel:
         # Hash canonical exponents: (num_canonical,)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        # Check if each current term has a match (is within target_order)
-        term_orders = jnp.sum(self.exponents, axis=0)  # (m,)
-        has_match = term_orders <= target_order  # (m,)
+        # Check if each current term fits within per-variable bounds
+        target_arr = jnp.array(target_order, dtype=jnp.int32)[:, None]  # (d, 1)
+        has_match = jnp.all(self.exponents <= target_arr, axis=0)  # (m,)
 
         if method == "broadcast":
             # O(m * num_canonical) - fast for small num_canonical
@@ -467,30 +527,22 @@ class TaylorModel:
         new_coeffs = masked_coeffs @ scatter_matrix  # (*output_shape, num_canonical)
 
         # Bound terms above target_order and add to remainder
-        # Terms with order > target_order need to be absorbed
-        absorb_mask = term_orders > target_order  # (m,)
+        absorb_mask = ~has_match  # (m,)
 
-        # For absorbed terms, compute their bounds
-        # Monomial bounds: odd exponents -> [-1,1], even -> [0,1]
-        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)  # (m,)
-        mono_lower = jnp.where(has_odd, -1.0, 0.0)  # (m,)
-        mono_upper = jnp.ones(self.num_monomials)  # (m,)
+        # Compute monomial bounds over shifted domain (D - center)
+        mono_bounds = _bound_monomials_over_domain(self.exponents, self.shifted_domain)
 
-        # Compute term bounds for absorbed terms
-        # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
         absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
         zeros = jnp.zeros_like(absorb_coeffs)
-        c_pos = jnp.maximum(absorb_coeffs, zeros)  # (*output_shape, m)
-        c_neg = jnp.minimum(absorb_coeffs, zeros)  # (*output_shape, m)
+        c_pos = jnp.maximum(absorb_coeffs, zeros)
+        c_neg = jnp.minimum(absorb_coeffs, zeros)
 
-        # mono_lower/upper have shape (m,), broadcasting works naturally
-        term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)
-        term_upper = c_pos * mono_upper + c_neg * mono_lower  # (*output_shape, m)
+        term_lower = c_pos * mono_bounds.lower + c_neg * mono_bounds.upper
+        term_upper = c_pos * mono_bounds.upper + c_neg * mono_bounds.lower
 
-        # Sum along monomial axis (last axis)
-        absorbed_lower = jnp.sum(term_lower, axis=-1)  # (*output_shape,)
-        absorbed_upper = jnp.sum(term_upper, axis=-1)  # (*output_shape,)
+        absorbed_lower = jnp.sum(term_lower, axis=-1)
+        absorbed_upper = jnp.sum(term_upper, axis=-1)
 
         new_remainder = self.remainder + interval(absorbed_lower, absorbed_upper)
 
@@ -498,34 +550,38 @@ class TaylorModel:
             new_coeffs,
             canonical_exp,
             new_remainder,
-            self.domain_center,
-            self.domain_radius,
-            _static_order=target_order,
+            self.domain,
+            center=self.center,
+            _static_order=tuple(target_order),
         )
 
-    def reduce_order(self, target_order: int) -> "TaylorModel":
+    def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorModel":
         """Reduce polynomial order, absorbing high-order terms into remainder.
 
         Parameters
         ----------
-        target_order : int
-            Target maximum polynomial order
+        target_order : int or tuple[int, ...]
+            Target maximum polynomial order (per-variable or uniform).
 
         Returns
         -------
         TaylorModel
             Reduced order Taylor model (overapproximation)
         """
+        if isinstance(target_order, int):
+            target_order = tuple([target_order] * self.d)
+        else:
+            target_order = tuple(target_order)
+
         # Separate terms to keep and terms to absorb
-        term_orders = jnp.sum(self.exponents, axis=0)  # (m,)
-        keep_mask = term_orders <= target_order  # (m,)
+        target_arr = jnp.array(target_order, dtype=jnp.int32)[:, None]  # (d, 1)
+        keep_mask = jnp.all(self.exponents <= target_arr, axis=0)  # (m,)
         absorb_mask = ~keep_mask  # (m,)
 
-        # Vectorized monomial bounds for absorbed terms
-        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)  # (m,)
-        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
-        mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))  # (m,)
-        mono_upper = jnp.ones(self.num_monomials)  # (m,)
+        # Compute monomial bounds over shifted domain (D - center)
+        mono_bounds_iv = _bound_monomials_over_domain(self.exponents, self.shifted_domain)
+        mono_lower = mono_bounds_iv.lower  # (m,)
+        mono_upper = mono_bounds_iv.upper  # (m,)
 
         # Only absorb terms above target_order
         # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
@@ -556,9 +612,9 @@ class TaylorModel:
             new_coeffs,
             self.exponents,
             new_remainder,
-            self.domain_center,
-            self.domain_radius,
-            _static_order=target_order,
+            self.domain,
+            center=self.center,
+            _static_order=tuple(target_order),
         )
 
     # --- String representation ---
@@ -572,36 +628,71 @@ class TaylorModel:
     def __repr__(self) -> str:
         return (
             f"TaylorModel(coeffs={self.coeffs!r}, exponents={self.exponents!r}, "
-            f"remainder={self.remainder!r}, domain_center={self.domain_center!r}, "
-            f"domain_radius={self.domain_radius!r})"
+            f"remainder={self.remainder!r}, domain={self.domain!r})"
         )
 
 
 # --- Helper functions ---
 
 
-def _bound_monomial(exp: Array) -> Interval:
-    """Bound a monomial over [-1, 1]^d.
+def _bound_monomials_over_domain(exponents: Array, norm_domain: Interval) -> Interval:
+    """Bound each monomial prod_j u_j^{e_j} over a domain interval.
 
     Parameters
     ----------
-    exp : Array
-        Exponent multi-index
+    exponents : Array, shape (d, m)
+    norm_domain : Interval, shape (d,)
+        The normalized domain interval for each variable.
 
     Returns
     -------
     Interval
-        Scalar interval bounding the monomial
+        Monomial bounds, shape (m,).
     """
-    # Constant term (all exponents = 0): x^0 = 1 exactly
-    is_constant = jnp.all(exp == 0)
-    # If any exponent is odd: range is [-1, 1]
-    # If all exponents are even (but not constant): range is [0, 1]
-    has_odd = jnp.any(exp % 2 == 1)
+    d, m = exponents.shape
 
-    lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))
-    upper = 1.0
-    return interval(lower, upper)
+    result_lo = jnp.ones(m)
+    result_hi = jnp.ones(m)
+
+    for j in range(d):
+        u_lo = norm_domain.lower[j]
+        u_hi = norm_domain.upper[j]
+        e = exponents[j]  # (m,) integer exponents
+
+        l_pow = u_lo ** e
+        u_pow = u_hi ** e
+
+        is_even = (e % 2 == 0)
+        contains_zero = (u_lo <= 0) & (u_hi >= 0)
+
+        pow_lo = jnp.where(
+            is_even,
+            jnp.where(contains_zero, jnp.zeros_like(l_pow), jnp.minimum(l_pow, u_pow)),
+            l_pow,
+        )
+        pow_hi = jnp.where(
+            is_even,
+            jnp.maximum(l_pow, u_pow),
+            u_pow,
+        )
+
+        # e == 0 => u^0 = 1
+        is_zero_exp = (e == 0)
+        pow_lo = jnp.where(is_zero_exp, 1.0, pow_lo)
+        pow_hi = jnp.where(is_zero_exp, 1.0, pow_hi)
+
+        # Interval multiplication
+        products = jnp.stack([
+            result_lo * pow_lo,
+            result_lo * pow_hi,
+            result_hi * pow_lo,
+            result_hi * pow_hi,
+        ])
+        result_lo = jnp.min(products, axis=0)
+        result_hi = jnp.max(products, axis=0)
+
+    return interval(result_lo, result_hi)
+
 
 
 def _merge_taylor_terms(
@@ -644,15 +735,15 @@ def _compact_taylor_terms(coeffs: Array, exponents: Array) -> Tuple[Array, Array
     return coeffs_compact, exponents
 
 
-def _generate_exponents(d: int, max_order: int) -> Array:
+def _generate_exponents(d: int, max_order: "int | tuple[int, ...]") -> Array:
     """Generate all exponent multi-indices up to given order.
 
     Parameters
     ----------
     d : int
         Number of variables
-    max_order : int
-        Maximum total degree
+    max_order : int or tuple[int, ...]
+        Maximum per-variable degree (int is broadcast to all variables).
 
     Returns
     -------
@@ -667,8 +758,8 @@ def taylor_model(
     coeffs: ArrayLike,
     exponents: ArrayLike,
     remainder: Interval | None = None,
-    domain_center: ArrayLike | None = None,
-    domain_radius: ArrayLike | None = None,
+    domain: Interval | None = None,
+    center: ArrayLike | None = None,
 ) -> TaylorModel:
     """Create a Taylor model.
 
@@ -681,10 +772,10 @@ def taylor_model(
         Exponent matrix, shape (d, num_monomials)
     remainder : Interval, optional
         Remainder interval with shape (*output_shape,). Default is zero interval.
-    domain_center : ArrayLike, optional
-        Domain center, shape (d,). Default is origin.
-    domain_radius : ArrayLike, optional
-        Domain half-width, shape (d,). Default is ones.
+    domain : Interval, optional
+        Domain box with shape (d,). Default is [-1, 1]^d.
+    center : ArrayLike, optional
+        Expansion point, shape (d,). Default is domain center.
 
     Returns
     -------
@@ -699,31 +790,23 @@ def taylor_model(
 
     if remainder is None:
         if len(output_shape) == 0:
-            # Scalar output
             remainder = interval(jnp.zeros((), dtype=coeffs.dtype))
         else:
             remainder = interval(jnp.zeros(output_shape, dtype=coeffs.dtype))
 
-    if domain_center is None:
-        domain_center = jnp.zeros(d, dtype=coeffs.dtype)
-    else:
-        domain_center = jnp.asarray(domain_center)
+    if domain is None:
+        domain = icentpert(jnp.zeros(d, dtype=coeffs.dtype), jnp.ones(d, dtype=coeffs.dtype))
 
-    if domain_radius is None:
-        domain_radius = jnp.ones(d, dtype=coeffs.dtype)
-    else:
-        domain_radius = jnp.asarray(domain_radius)
-
-    # Compute order from exponents
-    computed_order = int(jnp.max(jnp.sum(exponents, axis=0)))
-    return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=computed_order)
+    # Compute per-variable order from exponents
+    computed_order = tuple(int(jnp.max(exponents[i])) for i in range(d))
+    return TaylorModel(coeffs, exponents, remainder, domain, center=center, _static_order=computed_order)
 
 
-def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
+def taylor_model_from_interval(iv: Interval, order: "int | tuple[int, ...]" = 1) -> TaylorModel:
     """Create a Taylor model representing a box interval.
 
-    Represents the interval [c-r, c+r] as the polynomial p(u) = c + r*u
-    where u in [-1, 1].
+    Represents the interval as the polynomial p(x) = center + 1*(x - center)
+    where x in D = [lower, upper]. Coefficients are in raw (x - center) coordinates.
 
     Parameters
     ----------
@@ -758,8 +841,8 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
     center_flat = center.reshape(-1)
     radius_flat = radius.reshape(-1)
 
-    # For identity: p(x_norm) = center + radius * x_norm
-    # Note: Higher order terms are simply zero.
+    # For identity: p(x) = center + 1 * (x - center)
+    # Coefficients are in raw (x - center) coordinates, so linear coeff is 1.0.
 
     # Generate exponents for full order (d = n = prod(output_shape))
     exponents = _generate_exponents(n, order)
@@ -770,42 +853,34 @@ def taylor_model_from_interval(iv: Interval, order: int = 1) -> TaylorModel:
     is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
 
     # Linear terms: where exponents == e_i for each dimension i
-    # A term is linear in dimension i if exponents[:, j] == e_i
     eye_n = jnp.eye(n, dtype=jnp.int32)  # (n, n)
-    # is_linear[i, j] = True if monomial j is x_i (linear in dim i only)
-    # Compare exponents (d, m) with each unit vector e_i, reduce over d dimension
     is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (n, m)
 
     # Build coefficients matrix (flat first, then reshape)
     # Constant contribution: center broadcasted to constant term column
     const_coeffs = jnp.where(is_constant[None, :], center_flat[:, None], 0.0)  # (n, m)
 
-    # Linear contribution: radius[i] for the x_i term in row i
-    linear_coeffs = jnp.where(is_linear, radius_flat[:, None], 0.0)  # (n, m)
+    # Linear contribution: 1.0 for the (x_i - center_i) term in row i
+    linear_coeffs = jnp.where(is_linear, 1.0, 0.0)  # (n, m)
 
     coeffs_flat = const_coeffs + linear_coeffs  # (n, m)
 
     # Reshape to output shape
     if scalar_output:
-        # For scalar output, coeffs should have shape (m,) not (1, m)
         coeffs = coeffs_flat[0]  # (m,)
         remainder = interval(jnp.zeros((), dtype=center_flat.dtype))
-        domain_center = center_flat
-        domain_radius = radius_flat
     else:
         coeffs = coeffs_flat.reshape(*output_shape, num_monomials)  # (*output_shape, m)
         remainder = interval(jnp.zeros(output_shape, dtype=center_flat.dtype))
-        domain_center = center_flat
-        domain_radius = radius_flat
 
-    return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=order)
+    domain = icentpert(center_flat, radius_flat)
+    return TaylorModel(coeffs, exponents, remainder, domain, center=center_flat, _static_order=order)
 
 
 def taylor_model_from_function(
     f: Callable,
-    domain_center: ArrayLike,
-    domain_radius: ArrayLike,
-    max_order: int,
+    domain: Interval,
+    max_order: "int | tuple[int, ...]",
     n_out: int | None = None,
 ) -> TaylorModel:
     """Create a Taylor model by Taylor expansion of a function.
@@ -816,10 +891,8 @@ def taylor_model_from_function(
     ----------
     f : Callable
         Function to approximate, f: R^d -> R^n
-    domain_center : ArrayLike
-        Expansion point, shape (d,)
-    domain_radius : ArrayLike
-        Domain half-width, shape (d,)
+    domain : Interval
+        Domain box with shape (d,)
     max_order : int
         Maximum Taylor expansion order
     n_out : int, optional
@@ -830,12 +903,12 @@ def taylor_model_from_function(
     TaylorModel
         Taylor model approximation with remainder bounds
     """
-    domain_center = jnp.asarray(domain_center)
-    domain_radius = jnp.asarray(domain_radius)
-    d = domain_center.shape[0]
+    expansion_center = domain.center
+    domain_radius = domain.pert
+    d = expansion_center.shape[0]
 
     # Evaluate at center to get output dimension
-    f_center = f(domain_center)
+    f_center = f(expansion_center)
     if f_center.ndim == 0:
         f_center = f_center[None]
         f = lambda x, _f=f: jnp.atleast_1d(_f(x))
@@ -851,11 +924,11 @@ def taylor_model_from_function(
 
     if max_order == 0:
         return TaylorModel(
-            f(domain_center).reshape(-1, 1),
+            f(expansion_center).reshape(-1, 1),
             jnp.zeros((d, 1), dtype=jnp.int32),
             icentpert(jnp.zeros(n), jnp.zeros(n)),
-            domain_center,
-            domain_radius
+            domain,
+            center=expansion_center,
         )
 
     # Compute higher order derivatives using jacfwd loop
@@ -871,14 +944,14 @@ def taylor_model_from_function(
     deriv_tensors = []
 
     # Order 0
-    val = f(domain_center)
+    val = f(expansion_center)
     if val.ndim == 0:
         val = val[None] # (1,) if scalar
     deriv_tensors.append(val)
 
     # Ensure we strictly differentiate a vector-valued function
     # to maintain consistent tensor shape (n, d, d...)
-    if f(domain_center).ndim == 0:
+    if f(expansion_center).ndim == 0:
         def f_vec(x):
             v = f(x)
             return v[None]
@@ -889,7 +962,7 @@ def taylor_model_from_function(
     # Compute up to max_order + 1
     for k in range(1, max_order + 2):
             curr_f = jax.jacfwd(curr_f)
-            tensor = curr_f(domain_center)
+            tensor = curr_f(expansion_center)
             deriv_tensors.append(tensor)
 
     coeffs = jnp.zeros((n, num_monomials), dtype=f_center.dtype)
@@ -916,7 +989,8 @@ def taylor_model_from_function(
 
         fact_prod = jnp.prod(jax.scipy.special.gamma(exp + 1))
 
-        scale = jnp.prod(domain_radius ** exp) / fact_prod
+        # Coefficients in raw (x - center) coordinates: D^alpha f(c) / alpha!
+        scale = 1.0 / fact_prod
 
         coeffs = coeffs.at[:, i].set(c * scale)
 
@@ -953,7 +1027,7 @@ def taylor_model_from_function(
     # Ensure non-zero for safety if needed, though 0 is valid for exact polynomials
     remainder = icentpert(jnp.zeros(n, dtype=f_center.dtype), remainder_bound)
 
-    return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=max_order)
+    return TaylorModel(coeffs, exponents, remainder, domain, center=expansion_center, _static_order=max_order)
 
 
 def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorModel:
@@ -983,13 +1057,12 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
     if d < 2:
         raise ValueError("Cannot reduce domain dimension below 1")
 
-    # Normalize value to centered coordinate for the target variable
-    v_norm = (value - tm.domain_center[var_idx]) / tm.domain_radius[var_idx]
+    # Compute (value - center[var_idx]) for the target variable
+    v_shifted = value - tm.center[var_idx]
 
-    # Compute the scalar factor for each monomial: v_norm^{exp[var_idx]}
+    # Compute the scalar factor for each monomial: v_shifted^{exp[var_idx]}
     var_exps = tm.exponents[var_idx, :]  # (m,)
-    # v_norm^k for each monomial
-    var_factors = v_norm ** var_exps  # (m,)
+    var_factors = v_shifted ** var_exps  # (m,)
 
     # Multiply coefficients by the variable factors
     # coeffs: (*output_shape, m), var_factors: (m,)
@@ -1004,12 +1077,13 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
 
     # Group monomials with identical reduced exponents by hashing
     new_d = d - 1
-    max_order = tm._static_order
+    # Remove the evaluated variable's order from the per-variable tuple
+    max_order = tuple(o for i, o in enumerate(tm._static_order) if i != var_idx)
     canonical_exp = _get_canonical_exponents(new_d, max_order)
     num_canonical = canonical_exp.shape[1]
 
     # Hash for grouping
-    base = max_order + 2
+    base = max(max_order) + 2 if max_order else 2
     powers = base ** jnp.arange(new_d)
     reduced_hash = jnp.sum(reduced_exps * powers[:, None], axis=0)  # (m,)
     canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)  # (mc,)
@@ -1023,18 +1097,25 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
     new_coeffs = jnp.einsum('...j,ij->...i', scaled_coeffs, match.astype(scaled_coeffs.dtype))
 
     # New domain: remove var_idx
-    new_center = jnp.concatenate([
-        tm.domain_center[:var_idx],
-        tm.domain_center[var_idx + 1:]
+    new_lower = jnp.concatenate([
+        tm.domain.lower[:var_idx],
+        tm.domain.lower[var_idx + 1:]
     ])
-    new_radius = jnp.concatenate([
-        tm.domain_radius[:var_idx],
-        tm.domain_radius[var_idx + 1:]
+    new_upper = jnp.concatenate([
+        tm.domain.upper[:var_idx],
+        tm.domain.upper[var_idx + 1:]
+    ])
+    new_domain = interval(new_lower, new_upper)
+
+    # New center: remove var_idx
+    new_center = jnp.concatenate([
+        tm.center[:var_idx],
+        tm.center[var_idx + 1:]
     ])
 
     return TaylorModel(
         new_coeffs, canonical_exp, tm.remainder,
-        new_center, new_radius, _static_order=max_order
+        new_domain, center=new_center, _static_order=max_order
     )
 
 
@@ -1068,10 +1149,11 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
 
     # Use first TM as reference
     ref = tms[0]
-    domain_center = ref.domain_center
-    domain_radius = ref.domain_radius
+    domain = ref.domain
     exponents = ref.exponents
-    static_order = max(tm._static_order for tm in tms)
+    # Element-wise max of per-variable orders
+    from functools import reduce
+    static_order = reduce(_max_order, (tm._static_order for tm in tms))
 
     # Stack coefficients along specified axis of output shape
     # coeffs have shape (*output_shape, m), so axis applies to output_shape
@@ -1083,4 +1165,4 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
         jnp.concatenate([tm.remainder.upper for tm in tms], axis=axis)
     )
 
-    return TaylorModel(coeffs, exponents, remainder, domain_center, domain_radius, _static_order=static_order)
+    return TaylorModel(coeffs, exponents, remainder, domain, center=ref.center, _static_order=static_order)
