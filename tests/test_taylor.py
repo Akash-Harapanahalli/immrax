@@ -21,15 +21,22 @@ def tm_hull_contains_samples(f, tm, n_samples=200, atol=1e-5):
     samples = jax.random.uniform(key, (n_samples, d),
                                   minval=tm.domain.lower,
                                   maxval=tm.domain.upper)
+
     for i in range(n_samples):
         val = f(samples[i])
+        tm_val = tm(samples[i])
         assert jnp.all(val >= hull.lower - atol), (
             f"Sample {i}: {val} < hull.lower {hull.lower}"
         )
         assert jnp.all(val <= hull.upper + atol), (
             f"Sample {i}: {val} > hull.upper {hull.upper}"
         )
-
+        assert jnp.all(val >= tm_val.lower - atol), (
+            f"Sample {i}: {val} < tm_val.lower {tm_val.lower}"
+        )
+        assert jnp.all(val <= tm_val.upper + atol), (
+            f"Sample {i}: {val} > tm_val.upper {tm_val.upper}"
+        )
 
 # --- Univariate transcendental functions ---
 

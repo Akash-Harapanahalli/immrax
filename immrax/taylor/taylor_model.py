@@ -15,6 +15,7 @@ from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike
 
 from immrax.inclusion import Interval, interval, icentpert
+from immrax.utils import fact, inv_fact
 
 # Zonotope is imported lazily in to_zonotope() to avoid circular import
 
@@ -336,12 +337,13 @@ class TaylorModel:
         # Shift to centered coordinates (x - center)
         x_centered = x - self.center
 
-        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
+        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i] / fact(exponents[j, i])
         # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
-        monomials = jnp.prod(x_centered[:, None] ** self.exponents, axis=0)  # (m,)
+        monomials = jnp.prod(x_centered[:, None] ** self.exponents * inv_fact(self.exponents), axis=0)  # (m,)
 
         # Sum coeffs * monomials along the last (monomial) axis
         # coeffs has shape (*output_shape, m), monomials has shape (m,)
+
         return jnp.sum(self.coeffs * monomials, axis=-1)
 
     def evaluate(self, x: ArrayLike) -> Interval:
