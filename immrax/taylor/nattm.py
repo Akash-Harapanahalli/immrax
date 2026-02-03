@@ -31,11 +31,14 @@ from immrax.inclusion.interval import Interval, interval, icentpert
 from immrax.utils import fact, inv_fact
 from immrax.taylor.taylor_model import (
     TaylorModel,
+    ArgumentStructure,
     taylor_model,
     taylor_model_constant,
     taylor_model_concatenate,
     _generate_exponents,
     _get_canonical_exponents,
+    _get_arg_total_degree_exponents,
+    _check_per_arg_bounds,
     _merge_taylor_terms,
     _max_order,
     _normalize_order,
@@ -389,9 +392,15 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
         new_remainder = x.remainder + y.remainder
 
         new_order = _max_order(x._static_order, y._static_order)
+
+        # Preserve arg_structure if present
+        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
+        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+
         result = TaylorModel(
             new_coeffs, new_exponents, new_remainder, x.domain,
-            center=x.center, _static_order=new_order
+            center=x.center, _static_order=new_order,
+            _arg_structure=arg_structure, _per_arg_order=per_arg_order
         )
         # Convert to canonical form for compatibility
         return result.to_canonical(new_order)
@@ -422,7 +431,8 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
 
         result = TaylorModel(
             new_coeffs, new_exponents, new_remainder, x.domain,
-            center=x.center, _static_order=x._static_order
+            center=x.center, _static_order=x._static_order,
+            _arg_structure=x._arg_structure, _per_arg_order=x._per_arg_order
         )
         return result.to_canonical(x._static_order)
 
@@ -461,6 +471,8 @@ def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         x.domain,
         center=x.center,
         _static_order=x._static_order,
+        _arg_structure=x._arg_structure,
+        _per_arg_order=x._per_arg_order,
     )
 
 tm_inclusion_registry[lax.neg_p] = _tm_neg_p
@@ -468,7 +480,8 @@ TaylorModel.__neg__ = _tm_neg_p
 
 
 
-def _truncate_product(coeffs, exponents, max_order, shifted_domain):
+def _truncate_product(coeffs, exponents, max_order, shifted_domain,
+                      arg_structure=None, per_arg_order=None):
     """Truncate polynomial product terms above max_order into an interval remainder.
 
     Parameters
@@ -478,9 +491,13 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain):
     exponents : array, shape (d, num_terms)
         Product exponents (sum of parent exponents for each term pair).
     max_order : int or tuple[int, ...]
-        Per-variable maximum polynomial order to retain.
+        Per-variable maximum polynomial order to retain (used when arg_structure is None).
     shifted_domain : Interval, shape (d,)
         The shifted domain (D - center) for bounding monomials.
+    arg_structure : ArgumentStructure, optional
+        If provided, use per-argument total degree bounds instead of per-variable.
+    per_arg_order : tuple[int, ...], optional
+        Per-argument total degree bounds. Required if arg_structure is provided.
 
     Returns
     -------
@@ -489,16 +506,23 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain):
     truncated_remainder : Interval, shape (*output_shape,)
         Rigorous bound on the contribution of the removed terms.
     """
-    if isinstance(max_order, int):
-        max_order = tuple([max_order] * exponents.shape[0])
-    target_arr = jnp.array(max_order, dtype=jnp.int32)[:, None]  # (d, 1)
-    keep_mask = jnp.all(exponents <= target_arr, axis=0)  # (num_terms,)
+    # Determine keep mask based on mode
+    if arg_structure is not None and per_arg_order is not None:
+        # Per-argument total degree mode
+        keep_mask = _check_per_arg_bounds(exponents, arg_structure, per_arg_order)
+        static_max = max(per_arg_order) * 2
+    else:
+        # Per-variable mode (original behavior)
+        if isinstance(max_order, int):
+            max_order = tuple([max_order] * exponents.shape[0])
+        target_arr = jnp.array(max_order, dtype=jnp.int32)[:, None]  # (d, 1)
+        keep_mask = jnp.all(exponents <= target_arr, axis=0)  # (num_terms,)
+        static_max = max(max_order) * 2 if isinstance(max_order, tuple) else max_order * 2
 
     kept_coeffs = jnp.where(keep_mask, coeffs, 0.0)
     truncated_coeffs = jnp.where(keep_mask, 0.0, coeffs)
 
     # Bound truncated monomials over shifted domain
-    static_max = max(max_order) * 2 if isinstance(max_order, tuple) else max_order * 2
     mono_bounds = _bound_monomials_over_domain(exponents, shifted_domain, static_max)
     mono_lower = mono_bounds.lower
     mono_upper = mono_bounds.upper
@@ -546,8 +570,18 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
 
         effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
 
+        # Check for multi-argument mode - both TMs should have same arg_structure
+        arg_structure = x._arg_structure
+        per_arg_order = x._per_arg_order
+        if y._arg_structure is not None:
+            arg_structure = y._arg_structure
+            per_arg_order = y._per_arg_order
+
         # Truncate high-order product terms into remainder
-        new_coeffs, truncated_remainder = _truncate_product(all_coeffs, all_exp, effective_order, x.shifted_domain)
+        new_coeffs, truncated_remainder = _truncate_product(
+            all_coeffs, all_exp, effective_order, x.shifted_domain,
+            arg_structure=arg_structure, per_arg_order=per_arg_order
+        )
 
         new_exponents = all_exp
 
@@ -571,6 +605,8 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             x.domain,
             center=x.center,
             _static_order=effective_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order,
         )
 
         return result.to_canonical(effective_order)
@@ -599,6 +635,8 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             x.domain,
             center=x.center,
             _static_order=x._static_order,
+            _arg_structure=x._arg_structure,
+            _per_arg_order=x._per_arg_order,
         )
 
     elif istaylormodel(y):
@@ -898,6 +936,7 @@ def _tm_dot_general_array(arr, tm, dim_nums):
     return TaylorModel(
         new_coeffs, tm.exponents, new_remainder,
         tm.domain, center=tm.center, _static_order=tm._static_order,
+        _arg_structure=tm._arg_structure, _per_arg_order=tm._per_arg_order,
     )
 
 
@@ -945,6 +984,8 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
                 new_coeffs, result.exponents, new_remainder,
                 result.domain, center=result.center,
                 _static_order=result._static_order,
+                _arg_structure=result._arg_structure,
+                _per_arg_order=result._per_arg_order,
             )
         return result
 
@@ -974,8 +1015,15 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         # Merge monomial pair axes into single axis: (*result_shape, m1*m2)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
+        # Check for multi-argument mode
+        arg_structure = A._arg_structure if A._arg_structure is not None else B._arg_structure
+        per_arg_order = A._per_arg_order if A._per_arg_order is not None else B._per_arg_order
+
         # Truncate high-order product terms into remainder
-        new_coeffs, truncated_remainder = _truncate_product(result_coeffs, product_exp, effective_order, A.shifted_domain)
+        new_coeffs, truncated_remainder = _truncate_product(
+            result_coeffs, product_exp, effective_order, A.shifted_domain,
+            arg_structure=arg_structure, per_arg_order=per_arg_order
+        )
 
         # Cross terms: p_A · r_B + r_A · p_B + r_A · r_B
         p_A_bounds = _bound_polynomial(A)
@@ -996,6 +1044,7 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         result = TaylorModel(
             new_coeffs, product_exp, new_remainder,
             A.domain, center=A.center, _static_order=effective_order,
+            _arg_structure=arg_structure, _per_arg_order=per_arg_order,
         )
         return result.to_canonical(effective_order)
 

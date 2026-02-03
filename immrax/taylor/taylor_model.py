@@ -6,7 +6,9 @@ uncertainty through nonlinear functions.
 """
 
 from typing import Callable, Tuple
-from functools import lru_cache
+from dataclasses import dataclass
+from functools import lru_cache, cached_property
+import math
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +18,56 @@ from jaxtyping import Array, ArrayLike
 
 from immrax.inclusion import Interval, interval, icentpert
 from immrax.utils import fact, inv_fact
+
+
+@dataclass(frozen=True)
+class ArgumentStructure:
+    """Metadata mapping domain variables to function arguments.
+
+    For multi-argument Taylor models where f(*args) has arguments with
+    different shapes, this tracks which domain variables correspond to
+    which argument.
+
+    Example
+    -------
+    For f(t, x) where t: () (scalar) and x: (2,):
+    - arg_shapes = ((), (2,))
+    - arg_sizes = (1, 2)
+    - arg_starts = (0, 1)
+    - total_dim = 3
+    """
+    arg_shapes: tuple[tuple[int, ...], ...]  # Shape of each argument
+
+    @cached_property
+    def arg_sizes(self) -> tuple[int, ...]:
+        """Number of scalar domain variables per argument."""
+        return tuple(math.prod(s) if s else 1 for s in self.arg_shapes)
+
+    @cached_property
+    def arg_starts(self) -> tuple[int, ...]:
+        """Starting index in flat domain for each argument."""
+        starts = [0]
+        for size in self.arg_sizes[:-1]:
+            starts.append(starts[-1] + size)
+        return tuple(starts)
+
+    @property
+    def num_args(self) -> int:
+        """Number of arguments."""
+        return len(self.arg_shapes)
+
+    @property
+    def total_dim(self) -> int:
+        """Total number of domain variables across all arguments."""
+        return sum(self.arg_sizes)
+
+    def arg_slice(self, arg_idx: int) -> slice:
+        """Get slice for domain variables of argument arg_idx."""
+        start = self.arg_starts[arg_idx]
+        return slice(start, start + self.arg_sizes[arg_idx])
+
+    def __hash__(self):
+        return hash(self.arg_shapes)
 
 # Zonotope is imported lazily in to_zonotope() to avoid circular import
 
@@ -78,6 +130,108 @@ def _generate_exponents_impl(d: int, max_orders: "tuple[int, ...]") -> Array:
     return np.array(exponents, dtype=np.int32).T
 
 
+def _enumerate_total_degree(dim: int, max_deg: int) -> list[tuple[int, ...]]:
+    """Generate all multi-indices in R^dim with total degree <= max_deg.
+
+    Parameters
+    ----------
+    dim : int
+        Number of variables.
+    max_deg : int
+        Maximum total degree (sum of exponents).
+
+    Returns
+    -------
+    list[tuple[int, ...]]
+        List of exponent tuples, each of length dim.
+    """
+    if dim == 0:
+        return [()]
+    if dim == 1:
+        return [(k,) for k in range(max_deg + 1)]
+    result = []
+    for first in range(max_deg + 1):
+        for rest in _enumerate_total_degree(dim - 1, max_deg - first):
+            result.append((first,) + rest)
+    return result
+
+
+@lru_cache(maxsize=128)
+def _get_arg_total_degree_exponents(
+    arg_structure: ArgumentStructure,
+    per_arg_order: tuple[int, ...]
+) -> Array:
+    """Generate exponents with per-argument total degree bounds.
+
+    For multi-argument functions, this generates all monomials where
+    the total degree of exponents for each argument is bounded separately.
+
+    Parameters
+    ----------
+    arg_structure : ArgumentStructure
+        Metadata about argument shapes and sizes.
+    per_arg_order : tuple[int, ...]
+        Maximum total degree for each argument.
+
+    Returns
+    -------
+    Array
+        Exponent matrix, shape (total_dim, num_monomials).
+
+    Example
+    -------
+    For f(t, x) where t: () and x: (2,), with per_arg_order = (2, 3):
+    - Generates monomials t^a * x1^b1 * x2^b2 where a <= 2 and b1+b2 <= 3
+    - Count: (2+1) * C(2+3, 3) = 3 * 10 = 30 monomials
+    """
+    from itertools import product
+    import numpy as np
+
+    # Generate exponents for each argument separately
+    arg_indices = []
+    for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
+        arg_indices.append(_enumerate_total_degree(size, max_ord))
+
+    # Take Cartesian product across arguments
+    all_exponents = []
+    for combo in product(*arg_indices):
+        # Flatten the tuple of tuples into a single exponent vector
+        flat_exp = [e for arg_exp in combo for e in arg_exp]
+        all_exponents.append(flat_exp)
+
+    return np.array(all_exponents, dtype=np.int32).T
+
+
+def _check_per_arg_bounds(
+    exponents: Array,
+    arg_structure: ArgumentStructure,
+    per_arg_order: tuple[int, ...]
+) -> Array:
+    """Return boolean mask for monomials within per-argument total degree bounds.
+
+    Parameters
+    ----------
+    exponents : Array, shape (d, m)
+        Exponent matrix.
+    arg_structure : ArgumentStructure
+        Metadata about argument structure.
+    per_arg_order : tuple[int, ...]
+        Maximum total degree for each argument.
+
+    Returns
+    -------
+    Array
+        Boolean mask of shape (m,), True for monomials within bounds.
+    """
+    masks = []
+    for arg_idx in range(arg_structure.num_args):
+        slc = arg_structure.arg_slice(arg_idx)
+        # Sum exponents for this argument's variables (total degree for this arg)
+        arg_total = jnp.sum(exponents[slc, :], axis=0)
+        masks.append(arg_total <= per_arg_order[arg_idx])
+    return jnp.all(jnp.stack(masks), axis=0)
+
+
 @register_pytree_node_class
 class TaylorModel:
     r"""Defines a Taylor model set representation with arbitrary output shape.
@@ -134,6 +288,8 @@ class TaylorModel:
         domain: Interval,
         center: ArrayLike = None,
         _static_order: "int | tuple[int, ...] | None" = None,
+        _arg_structure: "ArgumentStructure | None" = None,
+        _per_arg_order: "tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
@@ -162,6 +318,10 @@ class TaylorModel:
         # Store output shape (all axes except the last monomial axis)
         # Monomials are always the LAST axis of coeffs
         self._output_shape = self.coeffs.shape[:-1]
+
+        # Multi-argument support: store argument structure and per-arg order
+        self._arg_structure = _arg_structure
+        self._per_arg_order = _per_arg_order
 
         # Validate dimensions
         if self.coeffs.ndim < 1:
@@ -197,15 +357,28 @@ class TaylorModel:
                 self.domain,
                 self.center,
             ),
-            {"_static_order": self._static_order, "_output_shape": self._output_shape},
+            {
+                "_static_order": self._static_order,
+                "_output_shape": self._output_shape,
+                "_arg_structure": self._arg_structure,
+                "_per_arg_order": self._per_arg_order,
+            },
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
         static_order = aux_data.get("_static_order") if aux_data else None
+        arg_structure = aux_data.get("_arg_structure") if aux_data else None
+        per_arg_order = aux_data.get("_per_arg_order") if aux_data else None
         # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
         coeffs, exponents, remainder, domain, center = children
-        return cls(coeffs, exponents, remainder, domain, center=center, _static_order=static_order)
+        return cls(
+            coeffs, exponents, remainder, domain,
+            center=center,
+            _static_order=static_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order,
+        )
 
     # --- Properties ---
 
@@ -250,6 +423,21 @@ class TaylorModel:
         """Output shape."""
         return self._output_shape
 
+    @property
+    def arg_structure(self) -> "ArgumentStructure | None":
+        """Argument structure for multi-argument Taylor models, or None."""
+        return self._arg_structure
+
+    @property
+    def per_arg_order(self) -> "tuple[int, ...] | None":
+        """Per-argument total degree bounds, or None for per-variable mode."""
+        return self._per_arg_order
+
+    @property
+    def is_multiarg(self) -> bool:
+        """True if this TM uses per-argument total degree bounds."""
+        return self._arg_structure is not None and self._per_arg_order is not None
+
     def __getitem__(self, idx) -> "TaylorModel":
         """Get component(s) of the Taylor Model.
 
@@ -281,7 +469,9 @@ class TaylorModel:
                 pass
 
         return TaylorModel(c, self.exponents, rem, self.domain,
-                           center=self.center, _static_order=self._static_order)
+                           center=self.center, _static_order=self._static_order,
+                           _arg_structure=self._arg_structure,
+                           _per_arg_order=self._per_arg_order)
 
     def __len__(self) -> int:
         """Length along first axis of output shape."""
@@ -485,10 +675,14 @@ class TaylorModel:
         The canonical structure includes all monomials up to target_order,
         sorted consistently. This ensures TMs are compatible for concatenation.
 
+        For multi-argument TMs (with _arg_structure set), this preserves the
+        per-argument total degree structure.
+
         Parameters
         ----------
         target_order : int, tuple[int, ...], or None
-            Target per-variable order. If int, broadcast to all variables.
+            Target per-variable order (for standard TMs) or per-argument order
+            (for multi-arg TMs). If int, broadcast to all variables/arguments.
             If None, uses current order.
         method : str, optional
             Algorithm for index mapping: "broadcast" (O(m * num_canonical), fast
@@ -501,6 +695,11 @@ class TaylorModel:
         TaylorModel
             TM with canonical exponent structure
         """
+        # Handle multi-argument mode
+        if self._arg_structure is not None and self._per_arg_order is not None:
+            return self._to_canonical_per_arg(target_order, method)
+
+        # Standard per-variable mode
         if target_order is None:
             target_order = self._static_order
         if isinstance(target_order, int):
@@ -580,6 +779,106 @@ class TaylorModel:
             self.domain,
             center=self.center,
             _static_order=tuple(target_order),
+        )
+
+    def _to_canonical_per_arg(
+        self,
+        target_order: "tuple[int, ...] | None" = None,
+        method: str | None = None,
+    ) -> "TaylorModel":
+        """Convert to canonical exponent structure for multi-argument mode.
+
+        Uses per-argument total degree bounds instead of per-variable bounds.
+        """
+        arg_structure = self._arg_structure
+
+        # Determine per_arg_order: use target_order only if it has the correct
+        # length (number of arguments), otherwise use stored _per_arg_order.
+        # This handles the case where to_canonical is called with per-variable
+        # order from arithmetic operations.
+        if target_order is not None:
+            if isinstance(target_order, int):
+                per_arg_order = tuple([target_order] * arg_structure.num_args)
+            elif len(target_order) == arg_structure.num_args:
+                per_arg_order = tuple(target_order)
+            else:
+                # target_order has wrong length (probably per-variable order),
+                # use stored per_arg_order instead
+                per_arg_order = self._per_arg_order
+        else:
+            per_arg_order = self._per_arg_order
+
+        per_arg_order = tuple(per_arg_order)
+
+        # Generate canonical exponents with per-arg total degree bounds
+        canonical_exp = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
+        num_canonical = canonical_exp.shape[1]
+
+        # Auto-select method
+        if method is None:
+            method = "searchsorted" if num_canonical > 50 else "broadcast"
+
+        # Compute hash for current and canonical exponents
+        # Need a hash that's unique across all possible exponents
+        max_exp_per_var = max(max(self._static_order), max(per_arg_order)) + 1
+        base = max_exp_per_var + 2
+        powers = base ** jnp.arange(self.d)
+
+        current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
+        canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
+
+        # Check if current terms are within per-arg bounds
+        has_match = _check_per_arg_bounds(self.exponents, arg_structure, per_arg_order)
+
+        if method == "broadcast":
+            match_matrix = current_hash[:, None] == canonical_hash[None, :]
+            scatter_matrix = match_matrix.astype(self.dtype)
+        elif method == "searchsorted":
+            sort_perm = jnp.argsort(canonical_hash)
+            sorted_canonical_hash = canonical_hash[sort_perm]
+            sorted_indices = jnp.searchsorted(sorted_canonical_hash, current_hash)
+            sorted_indices = jnp.clip(sorted_indices, 0, num_canonical - 1)
+            canonical_indices = sort_perm[sorted_indices]
+            scatter_matrix = jax.nn.one_hot(canonical_indices, num_canonical, dtype=self.dtype)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'broadcast' or 'searchsorted'.")
+
+        masked_coeffs = jnp.where(has_match, self.coeffs, 0.0)
+        new_coeffs = masked_coeffs @ scatter_matrix
+
+        # Bound terms above target order
+        absorb_mask = ~has_match
+        mono_bounds = _bound_monomials_over_domain(
+            self.exponents, self.shifted_domain, max(self._static_order)
+        )
+
+        absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)
+        zeros = jnp.zeros_like(absorb_coeffs)
+        c_pos = jnp.maximum(absorb_coeffs, zeros)
+        c_neg = jnp.minimum(absorb_coeffs, zeros)
+
+        term_lower = c_pos * mono_bounds.lower + c_neg * mono_bounds.upper
+        term_upper = c_pos * mono_bounds.upper + c_neg * mono_bounds.lower
+
+        absorbed_lower = jnp.sum(term_lower, axis=-1)
+        absorbed_upper = jnp.sum(term_upper, axis=-1)
+
+        new_remainder = self.remainder + interval(absorbed_lower, absorbed_upper)
+
+        # Compute per-variable order from per-arg order
+        per_var_order = []
+        for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
+            per_var_order.extend([max_ord] * size)
+
+        return TaylorModel(
+            new_coeffs,
+            canonical_exp,
+            new_remainder,
+            self.domain,
+            center=self.center,
+            _static_order=tuple(per_var_order),
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order,
         )
 
     def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorModel":
@@ -907,6 +1206,109 @@ def taylor_model_identity(iv: Interval, order: "int | tuple[int, ...]" = 1) -> T
     domain = icentpert(center_flat, radius_flat)
     return TaylorModel(coeffs, exponents, remainder, domain, center=center_flat, _static_order=order)
 
+
+def taylor_model_multiarg_identity(
+    *arg_domains: Interval,
+    per_arg_order: tuple[int, ...],
+) -> TaylorModel:
+    """Create identity Taylor model for multiple arguments with per-argument total degree bounds.
+
+    For a function f(*args), this creates a Taylor model where each argument
+    can have arbitrary shape, and the polynomial order is specified as
+    per-argument total degree bounds (not per-variable bounds).
+
+    Parameters
+    ----------
+    *arg_domains : Interval
+        Domain intervals for each argument. Each can have arbitrary shape.
+    per_arg_order : tuple[int, ...]
+        Maximum total degree for each argument. Length must match number of
+        arg_domains. For example, (2, 3) means degree ≤ 2 in first argument
+        and degree ≤ 3 in second argument.
+
+    Returns
+    -------
+    TaylorModel
+        Taylor model for identity with:
+        - Flattened domain containing all argument variables
+        - Exponents generated with per-argument total degree bounds
+        - Output shape matching the concatenated flattened arguments
+
+    Example
+    -------
+    For f(t, x) where t: () (scalar) and x: (2,):
+    - per_arg_order = (2, 3) means |alpha_t| <= 2 and |alpha_x| <= 3
+    - Generates monomials t^a * x1^b1 * x2^b2 where a <= 2 and b1 + b2 <= 3
+    - Number of monomials: (2+1) * C(2+3, 3) = 3 * 10 = 30
+    """
+    if len(arg_domains) != len(per_arg_order):
+        raise ValueError(
+            f"Number of arg_domains ({len(arg_domains)}) must match "
+            f"length of per_arg_order ({len(per_arg_order)})"
+        )
+
+    # Build argument structure
+    arg_shapes = tuple(d.lower.shape for d in arg_domains)
+    arg_structure = ArgumentStructure(arg_shapes)
+
+    # Flatten domains to get flat domain vector
+    flat_lowers = []
+    flat_uppers = []
+    for d in arg_domains:
+        if d.lower.shape == ():
+            flat_lowers.append(d.lower[None])
+            flat_uppers.append(d.upper[None])
+        else:
+            flat_lowers.append(d.lower.reshape(-1))
+            flat_uppers.append(d.upper.reshape(-1))
+
+    flat_lower = jnp.concatenate(flat_lowers)
+    flat_upper = jnp.concatenate(flat_uppers)
+    flat_domain = interval(flat_lower, flat_upper)
+    center_flat = flat_domain.center
+
+    total_dim = arg_structure.total_dim
+
+    # Generate exponents with per-argument total degree bounds
+    exponents = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
+    num_monomials = exponents.shape[1]
+
+    # Build identity coefficients:
+    # - Constant term: center_flat[i] for each output i
+    # - Linear term: 1.0 for variable i in output i
+
+    # Identify constant monomial (all zeros)
+    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
+
+    # Identify linear monomials (unit vectors)
+    eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (total_dim, total_dim)
+    is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (total_dim, m)
+
+    # Build coefficients: coeffs[i, j] = center[i] if constant, 1.0 if linear for var i
+    coeffs = (
+        jnp.where(is_constant[None, :], center_flat[:, None], 0.0)
+        + jnp.where(is_linear, 1.0, 0.0)
+    )  # (total_dim, m)
+
+    # Remainder is zero since this is exact
+    remainder = interval(jnp.zeros(total_dim, dtype=center_flat.dtype))
+
+    # Compute per-variable order from per-arg order (for backward compat)
+    per_var_order = []
+    for arg_idx, (size, max_ord) in enumerate(zip(arg_structure.arg_sizes, per_arg_order)):
+        per_var_order.extend([max_ord] * size)
+    per_var_order = tuple(per_var_order)
+
+    return TaylorModel(
+        coeffs,
+        exponents,
+        remainder,
+        flat_domain,
+        center=center_flat,
+        _static_order=per_var_order,
+        _arg_structure=arg_structure,
+        _per_arg_order=per_arg_order,
+    )
 
 
 def taylor_model_from_function(

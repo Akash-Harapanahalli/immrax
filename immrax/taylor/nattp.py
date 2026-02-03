@@ -30,7 +30,10 @@ from jaxtyping import Array, ArrayLike
 
 from immrax.taylor.taylor_polynomial import TaylorPolynomial
 from immrax.taylor.taylor_model import (
+    ArgumentStructure,
     _get_canonical_exponents,
+    _get_arg_total_degree_exponents,
+    _check_per_arg_bounds,
     _merge_taylor_terms,
     _max_order,
 )
@@ -373,7 +376,17 @@ def _tp_add_p(x, y):
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, y.num_monomials))
         new_coeffs, new_exp = _merge_taylor_terms(x_coeffs, x.exponents, y_coeffs, y.exponents)
         new_order = _max_order(x._static_order, y._static_order)
-        result = TaylorPolynomial(new_coeffs, new_exp, x.domain_center, _static_order=new_order)
+
+        # Preserve arg_structure if present
+        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
+        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+
+        result = TaylorPolynomial(
+            new_coeffs, new_exp, x.domain_center,
+            _static_order=new_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order
+        )
         return result.to_canonical(new_order)
 
     elif istaylorpolynomial(x):
@@ -384,7 +397,12 @@ def _tp_add_p(x, y):
         const_coeff = val_broadcast[..., None]
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
         new_coeffs, new_exp = _merge_taylor_terms(x_coeffs, x.exponents, const_coeff, const_exp)
-        result = TaylorPolynomial(new_coeffs, new_exp, x.domain_center, _static_order=x._static_order)
+        result = TaylorPolynomial(
+            new_coeffs, new_exp, x.domain_center,
+            _static_order=x._static_order,
+            _arg_structure=x._arg_structure,
+            _per_arg_order=x._per_arg_order
+        )
         return result.to_canonical(x._static_order)
 
     elif istaylorpolynomial(y):
@@ -401,7 +419,12 @@ TaylorPolynomial.__radd__ = _tp_add_p
 def _tp_neg_p(x):
     if not istaylorpolynomial(x):
         return -x
-    return TaylorPolynomial(-x.coeffs, x.exponents, x.domain_center, _static_order=x._static_order)
+    return TaylorPolynomial(
+        -x.coeffs, x.exponents, x.domain_center,
+        _static_order=x._static_order,
+        _arg_structure=x._arg_structure,
+        _per_arg_order=x._per_arg_order
+    )
 
 tp_inclusion_registry[lax.neg_p] = _tp_neg_p
 TaylorPolynomial.__neg__ = _tp_neg_p
@@ -440,16 +463,31 @@ def _tp_mul_p(x, y, *, max_order: int = None):
 
         effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
 
-        # Discard HOT (no remainder) — per-variable check
-        if isinstance(effective_order, int):
-            eff_tuple = tuple([effective_order] * d)
+        # Check for multi-argument mode
+        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
+        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+
+        # Discard HOT (no remainder) using appropriate mode
+        if arg_structure is not None and per_arg_order is not None:
+            # Per-argument total degree mode
+            keep_mask = _check_per_arg_bounds(all_exp, arg_structure, per_arg_order)
         else:
-            eff_tuple = tuple(effective_order)
-        target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
-        keep_mask = jnp.all(all_exp <= target_arr, axis=0)
+            # Per-variable mode
+            if isinstance(effective_order, int):
+                eff_tuple = tuple([effective_order] * d)
+            else:
+                eff_tuple = tuple(effective_order)
+            target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
+            keep_mask = jnp.all(all_exp <= target_arr, axis=0)
+
         kept_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
 
-        result = TaylorPolynomial(kept_coeffs, all_exp, x.domain_center, _static_order=effective_order)
+        result = TaylorPolynomial(
+            kept_coeffs, all_exp, x.domain_center,
+            _static_order=effective_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order
+        )
         return result.to_canonical(effective_order)
 
     elif istaylorpolynomial(x):
@@ -458,7 +496,12 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         alpha_bc = jnp.broadcast_to(alpha, broadcast_shape)
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
         new_coeffs = alpha_bc[..., None] * x_coeffs
-        return TaylorPolynomial(new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order)
+        return TaylorPolynomial(
+            new_coeffs, x.exponents, x.domain_center,
+            _static_order=x._static_order,
+            _arg_structure=x._arg_structure,
+            _per_arg_order=x._per_arg_order
+        )
 
     elif istaylorpolynomial(y):
         return _tp_mul_p(y, x, max_order=max_order)
@@ -502,7 +545,12 @@ if hasattr(lax, 'square_p'):
 def _tp_dot_general_array(arr, tp, dim_nums):
     """Array @ TP: linear operation on coefficients."""
     new_coeffs = lax.dot_general(arr, tp.coeffs, dimension_numbers=dim_nums)
-    return TaylorPolynomial(new_coeffs, tp.exponents, tp.domain_center, _static_order=tp._static_order)
+    return TaylorPolynomial(
+        new_coeffs, tp.exponents, tp.domain_center,
+        _static_order=tp._static_order,
+        _arg_structure=tp._arg_structure,
+        _per_arg_order=tp._per_arg_order
+    )
 
 
 def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
@@ -529,8 +577,12 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
                 nb + n_rem_A + n_rem_B,
             )
             new_coeffs = jnp.transpose(result.coeffs, perm)
-            return TaylorPolynomial(new_coeffs, result.exponents, result.domain_center,
-                                    _static_order=result._static_order)
+            return TaylorPolynomial(
+                new_coeffs, result.exponents, result.domain_center,
+                _static_order=result._static_order,
+                _arg_structure=result._arg_structure,
+                _per_arg_order=result._per_arg_order
+            )
         return result
 
     if istaylorpolynomial(A) and istaylorpolynomial(B):
@@ -552,17 +604,29 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Discard HOT — per-variable check
-        if isinstance(effective_order, int):
-            eff_tuple = tuple([effective_order] * d)
+        # Check for multi-argument mode
+        arg_structure = A._arg_structure if A._arg_structure is not None else B._arg_structure
+        per_arg_order = A._per_arg_order if A._per_arg_order is not None else B._per_arg_order
+
+        # Discard HOT using appropriate mode
+        if arg_structure is not None and per_arg_order is not None:
+            keep_mask = _check_per_arg_bounds(product_exp, arg_structure, per_arg_order)
         else:
-            eff_tuple = tuple(effective_order)
-        target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
-        keep_mask = jnp.all(product_exp <= target_arr, axis=0)
+            if isinstance(effective_order, int):
+                eff_tuple = tuple([effective_order] * d)
+            else:
+                eff_tuple = tuple(effective_order)
+            target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
+            keep_mask = jnp.all(product_exp <= target_arr, axis=0)
+
         kept_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
-        result = TaylorPolynomial(kept_coeffs, product_exp, A.domain_center,
-                                  _static_order=effective_order)
+        result = TaylorPolynomial(
+            kept_coeffs, product_exp, A.domain_center,
+            _static_order=effective_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order
+        )
         return result.to_canonical(effective_order)
 
     return lax.dot_general_p.bind(A, B, **kwargs)

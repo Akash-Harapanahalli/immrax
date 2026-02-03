@@ -16,7 +16,10 @@ from jaxtyping import Array, ArrayLike
 from immrax.inclusion import Interval, interval, icentpert
 from immrax.taylor.taylor_model import (
     TaylorModel,
+    ArgumentStructure,
     _get_canonical_exponents,
+    _get_arg_total_degree_exponents,
+    _check_per_arg_bounds,
     _merge_taylor_terms,
 )
 
@@ -48,6 +51,8 @@ class TaylorPolynomial:
         exponents: ArrayLike,
         domain_center: ArrayLike,
         _static_order: "int | tuple[int, ...] | None" = None,
+        _arg_structure: "ArgumentStructure | None" = None,
+        _per_arg_order: "tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
@@ -66,6 +71,10 @@ class TaylorPolynomial:
             )
 
         self._output_shape = self.coeffs.shape[:-1]
+
+        # Multi-argument support
+        self._arg_structure = _arg_structure
+        self._per_arg_order = _per_arg_order
 
         if self.coeffs.ndim < 1:
             raise ValueError(f"coeffs must be at least 1D, got shape {self.coeffs.shape}")
@@ -87,13 +96,25 @@ class TaylorPolynomial:
     def tree_flatten(self) -> Tuple[Tuple[Array, Array, Array], dict]:
         return (
             (self.coeffs, self.exponents, self.domain_center),
-            {"_static_order": self._static_order, "_output_shape": self._output_shape},
+            {
+                "_static_order": self._static_order,
+                "_output_shape": self._output_shape,
+                "_arg_structure": self._arg_structure,
+                "_per_arg_order": self._per_arg_order,
+            },
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorPolynomial":
         static_order = aux_data.get("_static_order") if aux_data else None
-        return cls(*children, _static_order=static_order)
+        arg_structure = aux_data.get("_arg_structure") if aux_data else None
+        per_arg_order = aux_data.get("_per_arg_order") if aux_data else None
+        return cls(
+            *children,
+            _static_order=static_order,
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order,
+        )
 
     # --- Properties ---
 
@@ -125,6 +146,21 @@ class TaylorPolynomial:
     @property
     def dtype(self) -> jnp.dtype:
         return self.coeffs.dtype
+
+    @property
+    def arg_structure(self) -> "ArgumentStructure | None":
+        """Argument structure for multi-argument mode, or None."""
+        return self._arg_structure
+
+    @property
+    def per_arg_order(self) -> "tuple[int, ...] | None":
+        """Per-argument total degree bounds, or None for per-variable mode."""
+        return self._per_arg_order
+
+    @property
+    def is_multiarg(self) -> bool:
+        """True if this TP uses per-argument total degree bounds."""
+        return self._arg_structure is not None and self._per_arg_order is not None
 
     @property
     def constant_term(self) -> Array:
@@ -198,6 +234,10 @@ class TaylorPolynomial:
 
     def to_canonical(self, target_order: "int | tuple[int, ...] | None" = None) -> "TaylorPolynomial":
         """Convert to canonical exponent structure, discarding terms above target_order."""
+        # Handle multi-argument mode
+        if self._arg_structure is not None and self._per_arg_order is not None:
+            return self._to_canonical_per_arg(target_order)
+
         if target_order is None:
             target_order = self._static_order
         if isinstance(target_order, int):
@@ -236,6 +276,67 @@ class TaylorPolynomial:
             _static_order=target_order,
         )
 
+    def _to_canonical_per_arg(
+        self,
+        target_order: "tuple[int, ...] | None" = None,
+    ) -> "TaylorPolynomial":
+        """Convert to canonical exponent structure for multi-argument mode."""
+        arg_structure = self._arg_structure
+
+        # Determine per_arg_order: use target_order only if it has the correct
+        # length (number of arguments), otherwise use stored _per_arg_order.
+        if target_order is not None:
+            if isinstance(target_order, int):
+                per_arg_order = tuple([target_order] * arg_structure.num_args)
+            elif len(target_order) == arg_structure.num_args:
+                per_arg_order = tuple(target_order)
+            else:
+                # target_order has wrong length (probably per-variable order),
+                # use stored per_arg_order instead
+                per_arg_order = self._per_arg_order
+        else:
+            per_arg_order = self._per_arg_order
+
+        per_arg_order = tuple(per_arg_order)
+
+        canonical_exp = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
+        num_canonical = canonical_exp.shape[1]
+
+        max_exp_per_var = max(max(self._static_order), max(per_arg_order)) + 1
+        base = max_exp_per_var + 2
+        powers = base ** jnp.arange(self.d)
+
+        current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
+        canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
+
+        has_match = _check_per_arg_bounds(self.exponents, arg_structure, per_arg_order)
+
+        if num_canonical > 50:
+            sort_perm = jnp.argsort(canonical_hash)
+            sorted_canonical_hash = canonical_hash[sort_perm]
+            sorted_indices = jnp.searchsorted(sorted_canonical_hash, current_hash)
+            sorted_indices = jnp.clip(sorted_indices, 0, num_canonical - 1)
+            canonical_indices = sort_perm[sorted_indices]
+            scatter_matrix = jax.nn.one_hot(canonical_indices, num_canonical, dtype=self.dtype)
+        else:
+            match_matrix = current_hash[:, None] == canonical_hash[None, :]
+            scatter_matrix = match_matrix.astype(self.dtype)
+
+        masked_coeffs = jnp.where(has_match, self.coeffs, 0.0)
+        new_coeffs = masked_coeffs @ scatter_matrix
+
+        # Compute per-variable order from per-arg order
+        per_var_order = []
+        for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
+            per_var_order.extend([max_ord] * size)
+
+        return TaylorPolynomial(
+            new_coeffs, canonical_exp, self.domain_center,
+            _static_order=tuple(per_var_order),
+            _arg_structure=arg_structure,
+            _per_arg_order=per_arg_order,
+        )
+
     def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorPolynomial":
         """Reduce polynomial order, silently discarding high-order terms."""
         if isinstance(target_order, int):
@@ -249,6 +350,8 @@ class TaylorPolynomial:
         return TaylorPolynomial(
             new_coeffs, self.exponents, self.domain_center,
             _static_order=target_order,
+            _arg_structure=self._arg_structure,
+            _per_arg_order=self._per_arg_order,
         )
 
     # --- Conversion ---
@@ -282,6 +385,8 @@ class TaylorPolynomial:
             self.coeffs, self.exponents, remainder,
             domain, center=self.domain_center,
             _static_order=self._static_order,
+            _arg_structure=self._arg_structure,
+            _per_arg_order=self._per_arg_order,
         )
 
     # --- Indexing ---
@@ -293,6 +398,8 @@ class TaylorPolynomial:
         return TaylorPolynomial(
             c, self.exponents, self.domain_center,
             _static_order=self._static_order,
+            _arg_structure=self._arg_structure,
+            _per_arg_order=self._per_arg_order,
         )
 
     def __len__(self) -> int:
