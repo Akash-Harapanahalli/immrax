@@ -81,7 +81,9 @@ class TaylorPolynomial:
         self._per_leaf_order = _per_leaf_order
 
         if self.coeffs.ndim < 1:
-            raise ValueError(f"coeffs must be at least 1D, got shape {self.coeffs.shape}")
+            raise ValueError(
+                f"coeffs must be at least 1D, got shape {self.coeffs.shape}"
+            )
         if self.exponents.ndim != 2:
             raise ValueError(f"exponents must be 2D, got shape {self.exponents.shape}")
         if self.coeffs.shape[-1] != self.exponents.shape[1]:
@@ -128,6 +130,7 @@ class TaylorPolynomial:
     @property
     def n(self) -> int:
         import math
+
         return math.prod(self._output_shape) if self._output_shape else 1
 
     @property
@@ -244,7 +247,9 @@ class TaylorPolynomial:
 
     # --- Canonicalization and order reduction ---
 
-    def to_canonical(self, target_order: "int | tuple[int, ...] | None" = None) -> "TaylorPolynomial":
+    def to_canonical(
+        self, target_order: "int | tuple[int, ...] | None" = None
+    ) -> "TaylorPolynomial":
         """Convert to canonical exponent structure, discarding terms above target_order."""
         # Handle structured domain mode
         if self._leaf_shapes is not None and self._per_leaf_order is not None:
@@ -275,7 +280,9 @@ class TaylorPolynomial:
             sorted_indices = jnp.searchsorted(sorted_canonical_hash, current_hash)
             sorted_indices = jnp.clip(sorted_indices, 0, num_canonical - 1)
             canonical_indices = sort_perm[sorted_indices]
-            scatter_matrix = jax.nn.one_hot(canonical_indices, num_canonical, dtype=self.dtype)
+            scatter_matrix = jax.nn.one_hot(
+                canonical_indices, num_canonical, dtype=self.dtype
+            )
         else:
             match_matrix = current_hash[:, None] == canonical_hash[None, :]
             scatter_matrix = match_matrix.astype(self.dtype)
@@ -284,7 +291,9 @@ class TaylorPolynomial:
         new_coeffs = masked_coeffs @ scatter_matrix
 
         return TaylorPolynomial(
-            new_coeffs, canonical_exp, self.domain_center,
+            new_coeffs,
+            canonical_exp,
+            self.domain_center,
             _static_order=target_order,
         )
 
@@ -332,7 +341,9 @@ class TaylorPolynomial:
             sorted_indices = jnp.searchsorted(sorted_canonical_hash, current_hash)
             sorted_indices = jnp.clip(sorted_indices, 0, num_canonical - 1)
             canonical_indices = sort_perm[sorted_indices]
-            scatter_matrix = jax.nn.one_hot(canonical_indices, num_canonical, dtype=self.dtype)
+            scatter_matrix = jax.nn.one_hot(
+                canonical_indices, num_canonical, dtype=self.dtype
+            )
         else:
             match_matrix = current_hash[:, None] == canonical_hash[None, :]
             scatter_matrix = match_matrix.astype(self.dtype)
@@ -347,7 +358,9 @@ class TaylorPolynomial:
             per_var_order.extend([max_ord] * size)
 
         return TaylorPolynomial(
-            new_coeffs, canonical_exp, self.domain_center,
+            new_coeffs,
+            canonical_exp,
+            self.domain_center,
             _static_order=tuple(per_var_order),
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=leaf_shapes,
@@ -365,7 +378,9 @@ class TaylorPolynomial:
         new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorPolynomial(
-            new_coeffs, self.exponents, self.domain_center,
+            new_coeffs,
+            self.exponents,
+            self.domain_center,
             _static_order=target_order,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,
@@ -400,8 +415,11 @@ class TaylorPolynomial:
         domain = icentpert(self.domain_center, domain_radius)
 
         return TaylorModel(
-            self.coeffs, self.exponents, remainder,
-            domain, center=self.domain_center,
+            self.coeffs,
+            self.exponents,
+            remainder,
+            domain,
+            center=self.domain_center,
             _static_order=self._static_order,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,
@@ -415,7 +433,9 @@ class TaylorPolynomial:
         if c.ndim == 0:
             raise ValueError("Cannot index into monomial dimension directly")
         return TaylorPolynomial(
-            c, self.exponents, self.domain_center,
+            c,
+            self.exponents,
+            self.domain_center,
             _static_order=self._static_order,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,

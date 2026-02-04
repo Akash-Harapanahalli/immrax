@@ -381,8 +381,8 @@ class TaylorModel:
         coeffs: ArrayLike,
         exponents: ArrayLike,
         remainder: Interval,
-        domain: Interval,
-        center: ArrayLike,
+        flat_domain: Interval,
+        flat_center: ArrayLike,
         _domain_treedef: PyTreeDef,
         _leaf_shapes: tuple[tuple[int, ...], ...],
         _per_leaf_order: tuple[int, ...],
@@ -397,8 +397,8 @@ class TaylorModel:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
         self.remainder = remainder
-        self.domain = domain
-        self.center = jnp.asarray(center) if center is not None else None
+        self.flat_domain = flat_domain
+        self.flat_center = jnp.asarray(flat_center) if flat_center is not None else None
 
         self._output_shape = self.coeffs.shape[:-1]  # Last axis is monomial axis
 
@@ -430,11 +430,25 @@ class TaylorModel:
                 f"remainder and coeffs must have same output shape: "
                 f"{self.remainder.shape} vs {self._output_shape}"
             )
-        if self.domain.lower.shape[0] != self.exponents.shape[0]:
+        if self.flat_domain.lower.shape[0] != self.exponents.shape[0]:
             raise ValueError(
                 f"domain must match exponents dimension: "
-                f"{self.domain.lower.shape[0]} vs {self.exponents.shape[0]}"
+                f"{self.flat_domain.lower.shape[0]} vs {self.exponents.shape[0]}"
             )
+
+    @property
+    def domain(self):
+        """Structured domain (PyTree of Intervals)."""
+        return _unflatten_array_to_pytree(
+            self._domain_treedef, self._leaf_shapes, self.flat_domain
+        )
+
+    @property
+    def center(self):
+        """Structured center (PyTree of Arrays)."""
+        return _unflatten_array_to_pytree(
+            self._domain_treedef, self._leaf_shapes, self.flat_center
+        )
 
     # --- Pytree methods ---
 
@@ -446,8 +460,8 @@ class TaylorModel:
                 self.coeffs,
                 self.exponents,
                 self.remainder,
-                self.domain,
-                self.center,
+                self.flat_domain,
+                self.flat_center,
             ),
             {
                 "_output_shape": self._output_shape,
@@ -463,13 +477,13 @@ class TaylorModel:
         leaf_shapes = aux_data.get("_leaf_shapes") if aux_data else None
         per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
         # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
-        coeffs, exponents, remainder, domain, center = children
+        coeffs, exponents, remainder, flat_domain, flat_center = children
         return cls(
             coeffs,
             exponents,
             remainder,
-            domain,
-            center=center,
+            flat_domain,
+            flat_center,
             _domain_treedef=domain_treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
@@ -487,7 +501,7 @@ class TaylorModel:
     @property
     def shifted_domain(self) -> Interval:
         """Domain shifted by center: D - center, for bounding monomials (x - center)^alpha."""
-        return self.domain - self.center
+        return self.flat_domain - self.flat_center
 
     @property
     def d(self) -> int:
@@ -573,8 +587,8 @@ class TaylorModel:
             c,
             self.exponents,
             rem,
-            self.domain,
-            center=self.center,
+            self.flat_domain,
+            self.flat_center,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,
             _per_leaf_order=self._per_leaf_order,
@@ -613,7 +627,7 @@ class TaylorModel:
         return TaylorPolynomial(
             self.coeffs,
             self.exponents,
-            self.center,
+            self.flat_center,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,
             _per_leaf_order=self._per_leaf_order,
@@ -634,7 +648,7 @@ class TaylorModel:
         """
         x = jnp.asarray(x)
         # Shift to centered coordinates (x - center)
-        x_centered = x - self.center
+        x_centered = x - self.flat_center
 
         # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
         # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
@@ -883,8 +897,8 @@ class TaylorModel:
             new_coeffs,
             canonical_exp,
             new_remainder,
-            self.domain,
-            center=self.center,
+            self.flat_domain,
+            self.flat_center,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
@@ -951,8 +965,8 @@ class TaylorModel:
             new_coeffs,
             self.exponents,
             new_remainder,
-            self.domain,
-            center=self.center,
+            self.flat_domain,
+            self.flat_center,
             _domain_treedef=self._domain_treedef,
             _leaf_shapes=self._leaf_shapes,
             _per_leaf_order=target_order,
@@ -969,7 +983,8 @@ class TaylorModel:
     def __repr__(self) -> str:
         return (
             f"TaylorModel(coeffs={self.coeffs!r}, exponents={self.exponents!r}, "
-            f"remainder={self.remainder!r}, domain={self.domain!r})"
+            f"remainder={self.remainder!r}, flat_domain={self.flat_domain!r}, "
+            f"flat_center={self.flat_center!r})"
         )
 
 
@@ -1140,12 +1155,22 @@ def taylor_model(
 
     _per_leaf_order = _compute_per_leaf_order_from_exponents(exponents, _leaf_shapes)
 
+    if center is not None:
+        # Flatten center if provided, assuming it matches domain structure
+        # If domain was None (default single interval), center should be flat (Array)
+        if domain is None:
+            flat_center = center
+        else:
+            _, _, flat_center = _pytree_to_flattened_array(center)
+    else:
+        flat_center = None
+
     return TaylorModel(
         coeffs,
         exponents,
         remainder,
         flat_domain,
-        center=center,
+        flat_center,
         _domain_treedef=_domain_treedef,
         _leaf_shapes=_leaf_shapes,
         _per_leaf_order=_per_leaf_order,
@@ -1192,7 +1217,7 @@ def _taylor_model_constant_impl(
         exponents,
         iv - iv.center,
         flat_domain,
-        center=center,
+        center,
         _domain_treedef=_domain_treedef,
         _leaf_shapes=_leaf_shapes,
         _per_leaf_order=_per_leaf_order,
@@ -1239,10 +1264,16 @@ def taylor_model_constant(
     else:
         per_leaf_order = tuple(order)
 
+    if center is not None:
+        _, _, flat_center = _pytree_to_flattened_array(center)
+    else:
+        flat_center = None
+
     return _taylor_model_constant_impl(
         iv,
         flat_domain,
-        center=center,
+        order,
+        center=flat_center,
         _domain_treedef=treedef,
         _leaf_shapes=leaf_shapes,
         _per_leaf_order=per_leaf_order,
@@ -1338,7 +1369,7 @@ def taylor_model_identity(
         exponents,
         remainder,
         flat_domain,
-        center=center_flat,
+        center_flat,
         _domain_treedef=treedef,
         _leaf_shapes=leaf_shapes,
         _per_leaf_order=per_leaf_order,
@@ -1462,7 +1493,7 @@ def taylor_model_from_function(
             jnp.zeros((d, 1), dtype=jnp.int32),
             icentpert(jnp.zeros(n), jnp.zeros(n)),
             flat_domain,
-            center=expansion_center,
+            flat_center=expansion_center,
             _domain_treedef=treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
@@ -1538,7 +1569,7 @@ def taylor_model_from_function(
         exponents,
         remainder,
         flat_domain,
-        center=expansion_center,
+        flat_center=expansion_center,
         _domain_treedef=treedef,
         _leaf_shapes=leaf_shapes,
         _per_leaf_order=per_leaf_order,
@@ -1573,7 +1604,7 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
         raise ValueError("Cannot reduce domain dimension below 1")
 
     # Compute (value - center[var_idx]) for the target variable
-    v_shifted = value - tm.center[var_idx]
+    v_shifted = value - tm.flat_center[var_idx]
 
     # Compute the scalar factor for each monomial: v_shifted^{exp[var_idx]}
     var_exps = tm.exponents[var_idx, :]  # (m,)
@@ -1646,15 +1677,17 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
 
     # New domain: remove var_idx
     new_lower = jnp.concatenate(
-        [tm.domain.lower[:var_idx], tm.domain.lower[var_idx + 1 :]]
+        [tm.flat_domain.lower[:var_idx], tm.flat_domain.lower[var_idx + 1 :]]
     )
     new_upper = jnp.concatenate(
-        [tm.domain.upper[:var_idx], tm.domain.upper[var_idx + 1 :]]
+        [tm.flat_domain.upper[:var_idx], tm.flat_domain.upper[var_idx + 1 :]]
     )
     new_domain = interval(new_lower, new_upper)
 
     # New center: remove var_idx
-    new_center = jnp.concatenate([tm.center[:var_idx], tm.center[var_idx + 1 :]])
+    new_center = jnp.concatenate(
+        [tm.flat_center[:var_idx], tm.flat_center[var_idx + 1 :]]
+    )
 
     # Determine new domain treedef
     if len(new_leaf_shapes) == len(leaf_shapes):
@@ -1671,7 +1704,7 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
         canonical_exp,
         tm.remainder,
         new_domain,
-        center=new_center,
+        flat_center=new_center,
         _domain_treedef=new_domain_treedef,
         _leaf_shapes=new_leaf_shapes,
         _per_leaf_order=new_per_leaf_order,
@@ -1896,8 +1929,8 @@ def integrate_variable(
             kept_coeffs,
             canonical_exp,
             total_remainder,
-            tm.domain,
-            center=tm.center,
+            tm.flat_domain,
+            flat_center=tm.flat_center,
             _domain_treedef=tm._domain_treedef,
             _leaf_shapes=tm._leaf_shapes,
             _per_leaf_order=tm._per_leaf_order,
@@ -1907,8 +1940,8 @@ def integrate_variable(
             new_coeffs,
             canonical_exp,
             integ_remainder,
-            tm.domain,
-            center=tm.center,
+            tm.flat_domain,
+            flat_center=tm.flat_center,
             _domain_treedef=tm._domain_treedef,
             _leaf_shapes=tm._leaf_shapes,
             _per_leaf_order=new_per_leaf_order,
@@ -1945,7 +1978,6 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
 
     # Use first TM as reference
     ref = tms[0]
-    domain = ref.domain
     exponents = ref.exponents
     # Element-wise max of per-leaf orders
     from functools import reduce
@@ -1966,8 +1998,8 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
         coeffs,
         exponents,
         remainder,
-        domain,
-        center=ref.center,
+        ref.flat_domain,
+        flat_center=ref.flat_center,
         _domain_treedef=ref._domain_treedef,
         _leaf_shapes=ref._leaf_shapes,
         _per_leaf_order=per_leaf_order,
