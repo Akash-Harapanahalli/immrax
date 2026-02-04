@@ -129,11 +129,12 @@ def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
     if isinstance(order, int):
         per_leaf_order = tuple([order] * num_leaves)
     else:
-        # order is a pytree - flatten it
-        order_leaves = jax.tree_util.tree_leaves(order)
-        if len(order_leaves) != num_leaves:
+        order_pytree, order_leaves = jax.tree_util.tree_flatten(order)
+        if order_pytree != domain_treedef or len(order_leaves) != num_leaves:
             raise ValueError(
-                f"Order pytree has {len(order_leaves)} leaves but domain has {num_leaves} leaves"
+                "Order pytree structure must match domain pytree structure, got "
+                f"{order_pytree} and {domain_treedef}, and "
+                f"{len(order_leaves)} and {num_leaves} leaves respectively"
             )
         per_leaf_order = tuple(int(o) for o in order_leaves)
 
