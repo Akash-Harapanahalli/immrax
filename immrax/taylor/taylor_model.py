@@ -12,7 +12,7 @@ import math
 import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
-from jaxtyping import Array, ArrayLike
+from jaxtyping import Array, ArrayLike, PyTree, PyTreeDef
 
 import jax.tree_util
 
@@ -20,42 +20,42 @@ from immrax.inclusion import Interval, interval, icentpert, iconcatenate
 
 
 # ---------------------------------------------------------------------------
-# PyTree Domain Helpers
+# PyTree Helpers
 # ---------------------------------------------------------------------------
 
 
-def _is_interval_leaf(x):
+def _is_interval_or_array_leaf(x):
     """Check if x is an Interval (leaf node in domain pytree)."""
-    return isinstance(x, Interval)
+    return isinstance(x, Interval) or isinstance(x, Array)
 
 
-def _get_domain_metadata(domain):
-    """Extract pytree structure and leaf info from domain.
+def _pytree_to_flattened_array(pytree, is_leaf=_is_interval_or_array_leaf):
+    """Extract pytree structure and leaf info from pytree.
+    Essentially a double flattening: PyTree -> Leaves -> Flattened Array/Interval
 
     Parameters
     ----------
-    domain : Interval or PyTree[Interval]
-        Domain intervals. Can be single Interval or any pytree structure
-        (list, dict, nested) with Interval leaves.
+    pytree : PyTree
+        PyTree to flatten.
 
     Returns
     -------
     treedef : jax.tree_util.PyTreeDef
         PyTree structure definition for the domain.
     leaf_shapes : tuple[tuple[int, ...], ...]
-        Shape of each leaf Interval in tree traversal order.
+        Shape of each leaf Array/Interval in tree traversal order.
     flat_domain : Interval
         Single flattened Interval containing all domain variables concatenated.
     """
-    treedef = jax.tree_util.tree_structure(domain, is_leaf=_is_interval_leaf)
-    leaves = jax.tree_util.tree_leaves(domain, is_leaf=_is_interval_leaf)
+    treedef = jax.tree_util.tree_structure(pytree, is_leaf=is_leaf)
+    leaves = jax.tree_util.tree_leaves(pytree, is_leaf=is_leaf)
 
     if len(leaves) == 0:
-        raise ValueError("Domain must contain at least one Interval")
+        raise ValueError("Pytree must contain at least one Interval or Array")
 
-    leaf_shapes = tuple(iv.lower.shape for iv in leaves)
+    leaf_shapes = tuple(iv.shape for iv in leaves)
 
-    # Flatten all leaves into single domain interval
+    # Flatten all leaves into a flattened array
     flat = []
     for iv in leaves:
         if iv.shape == ():
@@ -69,7 +69,7 @@ def _get_domain_metadata(domain):
 
 
 def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
-    """Unflatten a 1D array into a pytree structure matching leaf_shapes.
+    """Unflatten a 1D Array/Interval into a pytree structure matching leaf_shapes and treedef.
 
     Parameters
     ----------
@@ -77,12 +77,12 @@ def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
         Target pytree structure.
     leaf_shapes : tuple[tuple[int, ...], ...]
         Shape of each leaf.
-    flat_array : Array
-        Flattened array to unflatten.
+    flat_array : Array or Interval
+        Flattened array/interval to unflatten.
 
     Returns
     -------
-    PyTree[Array]
+    PyTree[Array or Interval]
         Array data reshaped into the pytree structure.
     """
     if len(leaf_shapes) == 1:
@@ -99,44 +99,6 @@ def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
             leaves.append(flat_array[start])
         else:
             leaves.append(flat_array[start : start + size].reshape(shape))
-        start += size
-
-    return jax.tree_util.tree_unflatten(treedef, leaves)
-
-
-def _get_domain_from_metadata(
-    treedef, leaf_shapes, flat_domain
-) -> "Interval | list | dict":
-    """Reconstruct domain Interval pytree from metadata.
-
-    Parameters
-    ----------
-    treedef : jax.tree_util.PyTreeDef
-        Target pytree structure.
-    leaf_shapes : tuple[tuple[int, ...], ...]
-        Shape of each leaf Interval.
-    flat_domain : Interval
-        Flattened domain interval.
-
-    Returns
-    -------
-    Interval or PyTree[Interval]
-        Domain Intervals reshaped into the pytree structure.
-    """
-    if len(leaf_shapes) == 1:
-        shape = leaf_shapes[0]
-        if shape == ():
-            return flat_domain[0] if flat_domain.shape != () else flat_domain
-        return flat_domain.reshape(shape)
-
-    leaves = []
-    start = 0
-    for shape in leaf_shapes:
-        size = math.prod(shape) if shape else 1
-        if shape == ():
-            leaves.append(flat_domain[start])
-        else:
-            leaves.append(flat_domain[start : start + size].reshape(shape))
         start += size
 
     return jax.tree_util.tree_unflatten(treedef, leaves)
@@ -175,13 +137,7 @@ def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
             )
         per_leaf_order = tuple(int(o) for o in order_leaves)
 
-    # Compute per-variable order from per-leaf order
-    per_var_order = []
-    for shape, leaf_ord in zip(leaf_shapes, per_leaf_order):
-        size = math.prod(shape) if shape else 1
-        per_var_order.extend([leaf_ord] * size)
-
-    return per_leaf_order, tuple(per_var_order)
+    return per_leaf_order
 
 
 def _leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> slice:
@@ -415,6 +371,9 @@ class TaylorModel:
     remainder: Interval  # Interval remainder, shape (*output_shape,)
     domain: Interval  # Domain box, shape (d,)
     center: Array  # Expansion point, shape (d,)
+    _domain_treedef: PyTreeDef
+    _leaf_shapes: tuple[tuple[int, ...], ...]
+    _per_leaf_order: tuple[int, ...]
 
     def __init__(
         self,
@@ -422,39 +381,27 @@ class TaylorModel:
         exponents: ArrayLike,
         remainder: Interval,
         domain: Interval,
-        center: ArrayLike = None,
-        _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
-        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
-        _per_leaf_order: "tuple[int, ...] | None" = None,
+        center: ArrayLike,
+        _domain_treedef: PyTreeDef,
+        _leaf_shapes: tuple[tuple[int, ...], ...],
+        _per_leaf_order: tuple[int, ...],
     ) -> None:
-        self.coeffs = jnp.asarray(coeffs)
-        self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
+        """
+        Initialize a TaylorModel. This is a low-level constructor that should
+        not be used directly by users. Instead, use the high-level constructor
+        :func:`taylor_model`, which performs necessary input validation and
+        normalization.
+        """
+        self.coeffs = coeffs
+        self.exponents = exponents
         self.remainder = remainder
         self.domain = domain
-        if center is None:
-            self.center = domain.center
-        else:
-            self.center = jnp.asarray(center)
+        self.center = center
 
-        d = self.exponents.shape[0]
+        self._output_shape = self.coeffs.shape[:-1]  # Last axis is monomial axis
 
-        # Store output shape (all axes except the last monomial axis)
-        # Monomials are always the LAST axis of coeffs
-        self._output_shape = self.coeffs.shape[:-1]
-
-        # Structured domain support: store pytree metadata
         self._domain_treedef = _domain_treedef
-
-        # For single Interval domains, treat as one leaf with shape matching domain
-        if _leaf_shapes is None:
-            _leaf_shapes = (domain.lower.shape,)
         self._leaf_shapes = _leaf_shapes
-
-        # Compute _per_leaf_order from exponents if not provided
-        if _per_leaf_order is None:
-            _per_leaf_order = _compute_per_leaf_order_from_exponents(
-                self.exponents, self._leaf_shapes
-            )
         self._per_leaf_order = _per_leaf_order
 
         # Validate dimensions
@@ -574,23 +521,14 @@ class TaylorModel:
         return self._per_leaf_order
 
     @property
-    def is_structured(self) -> bool:
-        """True if this TM has a structured domain (pytree of Intervals)."""
-        return self._domain_treedef is not None
-
-    @property
     def structured_center(self):
         """Get the center of the domain as a structured pytree.
 
         Returns the center reshaped to match the original domain pytree structure.
-        For non-structured TaylorModels, returns self.center unchanged.
         """
-        if not self.is_structured:
-            return self.center
-        else:
-            return _unflatten_array_to_pytree(
-                self._domain_treedef, self._leaf_shapes, self.center
-            )
+        return _unflatten_array_to_pytree(
+            self._domain_treedef, self._leaf_shapes, self.center
+        )
 
     def __getitem__(self, idx) -> "TaylorModel":
         """Get component(s) of the Taylor Model.
@@ -1261,12 +1199,17 @@ def taylor_model_constant(
         iv - iv.center,
         domain,
         center=center,
+        _domain_treedef=None,  # TODO: update this and usages of taylor_model_constant
         _leaf_shapes=_leaf_shapes,
         _per_leaf_order=_per_leaf_order,
     )
 
 
-def taylor_model_identity(domain, order=1) -> TaylorModel:
+def taylor_model_identity(
+    domain: "Interval | PyTree[Interval]",
+    center: "ArrayLike | PyTree[ArrayLike]" = None,
+    order: "int | PyTree[int]" = 1,
+) -> TaylorModel:
     """Create a Taylor model representing the identity function over a domain.
 
     Supports domain as a single Interval or any pytree structure of Intervals
@@ -1281,7 +1224,9 @@ def taylor_model_identity(domain, order=1) -> TaylorModel:
         - List of Intervals: [interval_t, interval_x]
         - Dict of Intervals: {'t': interval_t, 'x': interval_x}
         - Any nested pytree with Interval leaves
-    order : int or PyTree[int]
+    center : ArrayLike or PyTree[ArrayLike], optional
+        Expansion point. Default is domain center.
+    order : int or PyTree[int], optional
         Polynomial degree bounds. Can be:
         - int: Same order for all leaves (default: 1)
         - PyTree matching domain structure: Per-leaf total degree bounds
@@ -1294,7 +1239,7 @@ def taylor_model_identity(domain, order=1) -> TaylorModel:
 
     Examples
     --------
-    >>> # Single interval (backward compatible)
+    >>> # Single interval
     >>> tm = taylor_model_identity(interval(x), order=2)
 
     >>> # List of intervals with per-leaf orders
@@ -1303,64 +1248,20 @@ def taylor_model_identity(domain, order=1) -> TaylorModel:
     >>> # Dict of intervals
     >>> tm = taylor_model_identity({'t': interval_t, 'x': interval_x}, order={'t': 2, 'x': 3})
     """
-    # Check if domain is a single Interval (leaf case)
-    if _is_interval_leaf(domain):
-        # Simple case: single Interval domain
-        iv = domain
-        output_shape = iv.center.shape
-        scalar_output = len(output_shape) == 0
+    # domain is a structure of Intervals
+    treedef, leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
+    per_leaf_order = _normalize_order_pytree(order, treedef, leaf_shapes)
 
-        # Flatten to get domain dimension (scalars become 1D)
-        center_flat = iv.center.reshape(-1) if not scalar_output else iv.center[None]
-        radius_flat = iv.pert.reshape(-1) if not scalar_output else iv.pert[None]
-        n = center_flat.shape[0]
-
-        # Single leaf with the domain shape
-        leaf_shapes = (iv.center.shape,)
-        if isinstance(order, int):
-            per_leaf_order = (order,)
-        else:
-            per_leaf_order = tuple(order)
-
-        # Use per-leaf total degree exponents (single leaf = total degree bound)
-        exponents = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
-        num_monomials = exponents.shape[1]
-
-        # Identify constant (all-zero exponent) and linear (unit vector) columns
-        is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
-        eye_n = jnp.eye(n, dtype=jnp.int32)  # (n, n)
-        is_linear = jnp.all(
-            exponents[:, None, :] == eye_n[:, :, None], axis=0
-        )  # (n, m)
-
-        # coeffs[i, j] = center[i] if j is constant, 1.0 if j is linear for variable i
-        coeffs_flat = jnp.where(
-            is_constant[None, :], center_flat[:, None], 0.0
-        ) + jnp.where(is_linear, 1.0, 0.0)  # (n, m)
-
-        if scalar_output:
-            coeffs = coeffs_flat[0]  # (m,)
-            remainder = interval(jnp.zeros((), dtype=center_flat.dtype))
-        else:
-            coeffs = coeffs_flat.reshape(*output_shape, num_monomials)
-            remainder = interval(jnp.zeros(output_shape, dtype=center_flat.dtype))
-
-        flat_domain = icentpert(center_flat, radius_flat)
-        return TaylorModel(
-            coeffs,
-            exponents,
-            remainder,
-            flat_domain,
-            center=center_flat,
-            _leaf_shapes=leaf_shapes,
-            _per_leaf_order=per_leaf_order,
+    if center is None:
+        center_flat = flat_domain.center
+    else:
+        # Make sure center is a pytree matching domain structure
+        center_treedef, center_leaf_shapes, center_flat = _pytree_to_flattened_array(
+            center
         )
+        if center_treedef != treedef or center_leaf_shapes != leaf_shapes:
+            raise ValueError("Center must have the same structure as domain")
 
-    # PyTree case: domain is a structure of Intervals
-    treedef, leaf_shapes, flat_domain = _get_domain_metadata(domain)
-    per_leaf_order, _ = _normalize_order_pytree(order, treedef, leaf_shapes)
-
-    center_flat = flat_domain.center
     total_dim = center_flat.shape[0]
 
     # Generate exponents with per-leaf total degree bounds
@@ -1703,6 +1604,8 @@ def integrate_variable(
 ) -> TaylorModel:
     r"""Integrate a TaylorModel with respect to one domain variable.
 
+    By one domain variable, this is one dimension of the flattened domain.
+
     Computes :math:`\int_{a}^{x_i} \text{tm}(x) \, dx_i` where *a* = ``start``
     and *i* = ``var_idx``.  The result is a TaylorModel in the same domain
     variables (with the order of variable *i* incremented by 1).
@@ -1774,7 +1677,7 @@ def integrate_variable(
             raise ValueError("Both leaf_idx and leaf_var_idx must be provided together")
         if var_idx is not None:
             raise ValueError("Cannot specify both var_idx and leaf_idx/leaf_var_idx")
-        if not tm.is_structured:
+        if not tm.is_structured:  # TODO: remove this check
             raise ValueError(
                 "leaf_idx/leaf_var_idx can only be used with structured domains"
             )

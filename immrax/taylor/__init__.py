@@ -18,8 +18,8 @@ from .taylor_model import (
     _get_leaf_total_degree_exponents,
     _check_per_leaf_bounds,
     _leaf_slice,
-    _is_interval_leaf,
-    _get_domain_metadata,
+    _pytree_to_flattened_array,
+    _unflatten_array_to_pytree,
     _normalize_order_pytree,
 )
 
