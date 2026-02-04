@@ -33,6 +33,7 @@ from immrax.taylor.taylor_model import (
     TaylorModel,
     taylor_model,
     taylor_model_constant,
+    _taylor_model_constant_impl,
     taylor_model_concatenate,
     _generate_exponents,
     _get_canonical_exponents,
@@ -894,22 +895,22 @@ def _tm_univariate(
         init_coeff = coeffs_raw_shaped[order]  # scalar
         horner_coeffs = [coeffs_raw_shaped[i] for i in range(order - 1, -1, -1)]
 
-    result = _tm_constant(
-        init_coeff,
-        x.d,
-        per_leaf_order,
+    result = _taylor_model_constant_impl(
+        interval(init_coeff),
         x.domain,
+        per_leaf_order,
         center=x.center,
+        _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
     )
     for coeff in horner_coeffs:
-        term = _tm_constant(
-            coeff,
-            x.d,
-            per_leaf_order,
+        term = _taylor_model_constant_impl(
+            interval(coeff),
             x.domain,
+            per_leaf_order,
             center=x.center,
+            _domain_treedef=x._domain_treedef,
             _leaf_shapes=x._leaf_shapes,
             _per_leaf_order=x._per_leaf_order,
         )
@@ -1018,26 +1019,6 @@ def _tm_div_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> Taylo
 tm_inclusion_registry[lax.div_p] = _tm_div_p
 
 
-def _tm_constant(
-    value: jax.Array,
-    d: int,
-    order: int,
-    domain: Interval,
-    center=None,
-    _leaf_shapes=None,
-    _per_leaf_order=None,
-) -> TaylorModel:
-    """Create a constant TaylorModel (zero remainder) with arbitrary output shape."""
-    return taylor_model_constant(
-        interval(value),
-        domain,
-        order,
-        center=center,
-        _leaf_shapes=_leaf_shapes,
-        _per_leaf_order=_per_leaf_order,
-    )
-
-
 def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
     """Taylor model integer power."""
     if not istaylormodel(x):
@@ -1046,12 +1027,12 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
     order = max_order if max_order is not None else x._per_leaf_order
 
     if y == 0:
-        return _tm_constant(
-            jnp.ones(x.n, dtype=x.dtype),
-            x.d,
-            order,
+        return _taylor_model_constant_impl(
+            interval(jnp.ones(x.n, dtype=x.dtype)),
             x.domain,
+            order,
             center=x.center,
+            _domain_treedef=x._domain_treedef,
             _leaf_shapes=x._leaf_shapes,
             _per_leaf_order=x._per_leaf_order,
         )
@@ -1059,12 +1040,12 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
         # x^(-n) = 1/x^n
         pos_pow = _tm_integer_pow_p(x, -y, max_order=order)
         return _tm_div_p(
-            _tm_constant(
-                jnp.ones(x.n, dtype=x.dtype),
-                x.d,
-                order,
+            _taylor_model_constant_impl(
+                interval(jnp.ones(x.n, dtype=x.dtype)),
                 x.domain,
+                order,
                 center=x.center,
+                _domain_treedef=x._domain_treedef,
                 _leaf_shapes=x._leaf_shapes,
                 _per_leaf_order=x._per_leaf_order,
             ),
@@ -1152,11 +1133,12 @@ def _tm_abs_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     center = (abs_lower + abs_upper) / 2
     pert = (abs_upper - abs_lower) / 2
 
-    return taylor_model_constant(
+    return _taylor_model_constant_impl(
         icentpert(center, pert),
         x.domain,
         x._per_leaf_order,
         center=x.center,
+        _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
     )
@@ -1373,6 +1355,7 @@ def _tm_max_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
         ref.domain,
         ref._per_leaf_order,
         center=ref.center,
+        _domain_treedef=ref._domain_treedef,
         _leaf_shapes=ref._leaf_shapes,
         _per_leaf_order=ref._per_leaf_order,
     )
@@ -1399,11 +1382,12 @@ def _tm_min_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
 
     ref = x if istaylormodel(x) else y
 
-    return taylor_model_constant(
+    return _taylor_model_constant_impl(
         result_interval,
         ref.domain,
         ref._per_leaf_order,
         center=ref.center,
+        _domain_treedef=ref._domain_treedef,
         _leaf_shapes=ref._leaf_shapes,
         _per_leaf_order=ref._per_leaf_order,
     )
@@ -1456,11 +1440,12 @@ def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     hull = x.interval_hull()
     result = interval(jnp.max(hull.lower, axis=axes), jnp.max(hull.upper, axis=axes))
 
-    return taylor_model_constant(
+    return _taylor_model_constant_impl(
         result,
         x.domain,
         x._per_leaf_order,
         center=x.center,
+        _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
     )
@@ -1480,11 +1465,12 @@ def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     hull = x.interval_hull()
     result = interval(jnp.min(hull.lower, axis=axes), jnp.min(hull.upper, axis=axes))
 
-    return taylor_model_constant(
+    return _taylor_model_constant_impl(
         result,
         x.domain,
         x._per_leaf_order,
         center=x.center,
+        _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
     )
@@ -1507,15 +1493,17 @@ def _tm_reciprocal_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     eff_order = (
         max_order if max_order else (x._per_leaf_order if istaylormodel(x) else (2,))
     )
-    one = _tm_constant(
-        jnp.ones(
-            x.n if istaylormodel(x) else 1,
-            dtype=x.dtype if istaylormodel(x) else jnp.float32,
+    one = _taylor_model_constant_impl(
+        interval(
+            jnp.ones(
+                x.n if istaylormodel(x) else 1,
+                dtype=x.dtype if istaylormodel(x) else jnp.float32,
+            )
         ),
-        x.d if istaylormodel(x) else 1,
-        eff_order,
         x.domain if istaylormodel(x) else icentpert(jnp.zeros(1), jnp.ones(1)),
+        eff_order,
         center=x.center if istaylormodel(x) else None,
+        _domain_treedef=x._domain_treedef if istaylormodel(x) else None,
         _leaf_shapes=x._leaf_shapes if istaylormodel(x) else None,
         _per_leaf_order=x._per_leaf_order if istaylormodel(x) else None,
     )

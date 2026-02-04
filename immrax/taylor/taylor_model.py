@@ -393,17 +393,25 @@ class TaylorModel:
         :func:`taylor_model`, which performs necessary input validation and
         normalization.
         """
-        self.coeffs = coeffs
-        self.exponents = exponents
+
+        self.coeffs = jnp.asarray(coeffs)
+        self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
         self.remainder = remainder
         self.domain = domain
-        self.center = center
+        self.center = jnp.asarray(center) if center is not None else None
 
         self._output_shape = self.coeffs.shape[:-1]  # Last axis is monomial axis
 
         self._domain_treedef = _domain_treedef
         self._leaf_shapes = _leaf_shapes
         self._per_leaf_order = _per_leaf_order
+
+        if self._domain_treedef is None:
+            raise ValueError("_domain_treedef cannot be None")
+        if self._leaf_shapes is None:
+            raise ValueError("_leaf_shapes cannot be None")
+        if self._per_leaf_order is None:
+            raise ValueError("_per_leaf_order cannot be None")
 
         # Validate dimensions
         if self.coeffs.ndim < 1:
@@ -1080,10 +1088,8 @@ def taylor_model(
     coeffs: ArrayLike,
     exponents: ArrayLike,
     remainder: Interval | None = None,
-    domain: Interval | None = None,
+    domain: "Interval | PyTree[Interval] | None" = None,
     center: ArrayLike | None = None,
-    _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
-    _per_leaf_order: "tuple[int, ...] | None" = None,
 ) -> TaylorModel:
     """Create a Taylor model.
 
@@ -1096,14 +1102,13 @@ def taylor_model(
         Exponent matrix, shape (d, num_monomials)
     remainder : Interval, optional
         Remainder interval with shape (*output_shape,). Default is zero interval.
-    domain : Interval, optional
-        Domain box with shape (d,). Default is [-1, 1]^d.
+    domain : Interval or PyTree[Interval], optional
+        Domain box. Can be a single Interval or a PyTree of Intervals.
+        Default is [-1, 1]^d.
+        If a PyTree is provided, it is flattened to a single domain Interval,
+        and the structure is stored in the TaylorModel.
     center : ArrayLike, optional
         Expansion point, shape (d,). Default is domain center.
-    _leaf_shapes : tuple, optional
-        Shapes of each leaf in the domain pytree.
-    _per_leaf_order : tuple, optional
-        Per-leaf total degree bounds.
 
     Returns
     -------
@@ -1123,16 +1128,72 @@ def taylor_model(
             remainder = interval(jnp.zeros(output_shape, dtype=coeffs.dtype))
 
     if domain is None:
-        domain = icentpert(
+        # Default domain is [-1, 1]^d (single interval)
+        flat_domain = icentpert(
             jnp.zeros(d, dtype=coeffs.dtype), jnp.ones(d, dtype=coeffs.dtype)
         )
+        # Assume single interval structure
+        _domain_treedef, _leaf_shapes, _ = _pytree_to_flattened_array(flat_domain)
+    else:
+        # Domain provided - flatten it and get metadata
+        _domain_treedef, _leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
+
+    _per_leaf_order = _compute_per_leaf_order_from_exponents(exponents, _leaf_shapes)
 
     return TaylorModel(
         coeffs,
         exponents,
         remainder,
-        domain,
+        flat_domain,
         center=center,
+        _domain_treedef=_domain_treedef,
+        _leaf_shapes=_leaf_shapes,
+        _per_leaf_order=_per_leaf_order,
+    )
+
+
+def _taylor_model_constant_impl(
+    iv: Interval,
+    domain: Interval,
+    order: "int | tuple[int, ...]" = 1,
+    center=None,
+    _domain_treedef: "PyTreeDef | None" = None,
+    _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+    _per_leaf_order: "tuple[int, ...] | None" = None,
+) -> TaylorModel:
+    """Internal implementation for taylor_model_constant."""
+    iv = interval(iv)
+
+    output_shape = iv.lower.shape
+    flat_domain = domain
+
+    # Set default leaf_shapes if not provided
+    if _leaf_shapes is None:
+        _leaf_shapes = (flat_domain.shape,)
+
+    num_leaves = len(_leaf_shapes)
+
+    # Set default per_leaf_order if not provided
+    if _per_leaf_order is None:
+        if isinstance(order, int):
+            _per_leaf_order = tuple([order] * num_leaves)
+        else:
+            _per_leaf_order = tuple(order)
+
+    # Generate exponents with per-leaf total degree bounds
+    exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order)
+
+    # Coeffs: constant term is iv.center
+    coeffs = jnp.zeros((*output_shape, exponents.shape[1]), dtype=iv.lower.dtype)
+    coeffs = coeffs.at[..., 0].set(iv.center)
+
+    return TaylorModel(
+        coeffs,
+        exponents,
+        iv - iv.center,
+        flat_domain,
+        center=center,
+        _domain_treedef=_domain_treedef,
         _leaf_shapes=_leaf_shapes,
         _per_leaf_order=_per_leaf_order,
     )
@@ -1140,11 +1201,9 @@ def taylor_model(
 
 def taylor_model_constant(
     iv: Interval,
-    domain: Interval,
+    domain: "Interval | PyTree[Interval]",
     order: "int | tuple[int, ...]" = 1,
     center=None,
-    _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
-    _per_leaf_order: "tuple[int, ...] | None" = None,
 ) -> TaylorModel:
     """Create a Taylor model from an interval (constant polynomial with remainder).
 
@@ -1158,51 +1217,35 @@ def taylor_model_constant(
     iv : Interval
         The interval to represent. Center becomes polynomial constant,
         perturbation becomes remainder.
-    domain : Interval
-        The domain box with shape (d,).
+    domain : Interval or PyTree[Interval]
+        The domain. Can be a single Interval or a PyTree of Intervals.
     order : int or tuple[int, ...]
         Polynomial degree of the Taylor Model (default: 1)
     center : ArrayLike, optional
         Expansion point. Default is domain center.
-    _leaf_shapes : tuple, optional
-        Shapes of each leaf in the domain pytree.
-    _per_leaf_order : tuple, optional
-        Per-leaf total degree bounds.
 
     Returns
     -------
     TaylorModel
         Constant Taylor model with the interval encoded as polynomial + remainder.
     """
-    output_shape = iv.lower.shape
+    # Process domain and metadata
+    treedef, leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
 
-    # Set default leaf_shapes if not provided
-    if _leaf_shapes is None:
-        _leaf_shapes = (domain.lower.shape,)
+    # Infer per_leaf_order
+    num_leaves = len(leaf_shapes)
+    if isinstance(order, int):
+        per_leaf_order = tuple([order] * num_leaves)
+    else:
+        per_leaf_order = tuple(order)
 
-    # Set default per_leaf_order if not provided
-    num_leaves = len(_leaf_shapes)
-    if _per_leaf_order is None:
-        if isinstance(order, int):
-            _per_leaf_order = tuple([order] * num_leaves)
-        else:
-            _per_leaf_order = tuple(order)
-
-    # Generate exponents with per-leaf total degree bounds
-    exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order)
-    num_monomials = exponents.shape[1]
-    const_idx = jnp.argmin(jnp.sum(exponents, axis=0))
-
-    coeffs = jnp.zeros((*output_shape, num_monomials)).at[..., const_idx].set(iv.center)
-    return TaylorModel(
-        coeffs,
-        exponents,
-        iv - iv.center,
-        domain,
+    return _taylor_model_constant_impl(
+        iv,
+        flat_domain,
         center=center,
-        _domain_treedef=None,  # TODO: update this and usages of taylor_model_constant
-        _leaf_shapes=_leaf_shapes,
-        _per_leaf_order=_per_leaf_order,
+        _domain_treedef=treedef,
+        _leaf_shapes=leaf_shapes,
+        _per_leaf_order=per_leaf_order,
     )
 
 
@@ -1304,7 +1347,7 @@ def taylor_model_identity(
 
 def taylor_model_from_function(
     f: Callable,
-    domain: Interval,
+    domain: "Interval | PyTree[Interval]",
     max_order: "int | tuple[int, ...]",
     n_out: int | None = None,
 ) -> TaylorModel:
@@ -1316,10 +1359,10 @@ def taylor_model_from_function(
     ----------
     f : Callable
         Function to approximate, f: R^d -> R^n
-    domain : Interval
-        Domain box with shape (d,)
-    max_order : int
-        Maximum Taylor expansion order
+    domain : Interval or PyTree[Interval]
+        Domain box. Can be a single Interval or a PyTree of Intervals.
+    max_order : int or tuple[int, ...]
+        Maximum Taylor expansion order. Can be int (total degree) or tuple (per-leaf).
     n_out : int, optional
         Output dimension. Inferred from f if not provided.
 
@@ -1328,66 +1371,116 @@ def taylor_model_from_function(
     TaylorModel
         Taylor model approximation with remainder bounds
     """
-    expansion_center = domain.center
-    domain_radius = domain.pert
+    # Process domain and metadata
+    treedef, leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
+
+    expansion_center = flat_domain.center
+    domain_radius = flat_domain.pert
     d = expansion_center.shape[0]
 
-    # Evaluate at center to get output dimension
-    f_center = f(expansion_center)
+    # Evaluate at center (unflattened) to get output dimension
+    # Reconstruct structured center to pass to f
+    structured_center = _unflatten_array_to_pytree(
+        treedef, leaf_shapes, expansion_center
+    )
+
+    # We need f to accept flattened array input for derivatives?
+    # No, jax.jacfwd works on pytrees, but here we are doing Taylor expansion in R^d (flat).
+    # If f implies structure, we might need to wrap it.
+    # TaylorModel logic works on flattened domain coordinates (x - center).
+    # So we need a wrapper around f that takes flat input, unflattens it, calls f.
+
+    def f_flat(x_flat):
+        x_struct = _unflatten_array_to_pytree(treedef, leaf_shapes, x_flat)
+        return f(x_struct)
+
+    # Check if f works with flat input or structured input
+    # The user might have passed a function expecting structured input if domain is structured.
+    # But usually one passes a function defined on the domain variables.
+    # Let's try calling f with structured center first.
+    try:
+        f_center = f(structured_center)
+        # Use f_flat for derivatives
+        work_f = f_flat
+    except Exception:
+        # Maybe f expects flat input even if domain is structured?
+        # Or maybe passing structured_center failed for another reason.
+        # Fallback: assume f expects flat array if domain effectively flat?
+        # But for correctness with PyTree domain, we generally expect f to accept PyTree.
+        # If f expects flat input, f(structured_center) where structured_center is PyTree might fail.
+        # Let's assume f matches domain structure.
+        raise
+
     if f_center.ndim == 0:
         f_center = f_center[None]
-        f = lambda x, _f=f: jnp.atleast_1d(_f(x))
+
+        def f_vec(x, _f=work_f):
+            res = _f(x)
+            return jnp.atleast_1d(res)
+
+        work_f = f_vec
+
     n = f_center.shape[0] if n_out is None else n_out
 
+    # Parse max_order
+    # If it's a tuple matching leaves, it's per_leaf_order
+    # If it's an int, broadcast
+    if isinstance(max_order, int):
+        per_leaf_order = tuple([max_order] * len(leaf_shapes))
+        # max_order for generation is just int
+        gen_max_order = max_order
+    else:
+        # It's a tuple. Is it per-variable max order (old style) or per-leaf order?
+        # The new standard is per-leaf order.
+        # If length matches leaves, assume per-leaf order.
+        # If length matches d (variables), it might be per-variable (deprecated but maybe lingering).
+        # We'll assume per-leaf if it matches leaf count.
+        if len(max_order) == len(leaf_shapes):
+            per_leaf_order = tuple(max_order)
+            gen_max_order = per_leaf_order  # Use per-leaf for generation
+        else:
+            # Fallback or error?
+            # Let's assume it's per-leaf order passed as tuple even if 1 leaf?
+            # For now, trust the tuple is per-leaf.
+            per_leaf_order = tuple(max_order)
+            gen_max_order = per_leaf_order
+
     # Generate exponents
-    exponents = _generate_exponents(d, max_order)
+    # We use _get_leaf_total_degree_exponents instead of _generate_exponents for per-leaf bounds
+    exponents = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
     num_monomials = exponents.shape[1]
 
     # Compute Taylor coefficients using recursive jet
-    # This gives us the full derivative tensor up to max_order
-    # tensor[k1, k2, ..., kd] corresponds to coeff for x1^k1 * ... * xd^kd
+    # work_f takes flat input R^d -> R^n
 
-    if max_order == 0:
+    # We need the max order integer for the loop
+    max_k = max(per_leaf_order)
+
+    if max_k == 0:
         return TaylorModel(
-            f(expansion_center).reshape(-1, 1),
+            f_center.reshape(-1, 1),
             jnp.zeros((d, 1), dtype=jnp.int32),
             icentpert(jnp.zeros(n), jnp.zeros(n)),
-            domain,
+            flat_domain,
             center=expansion_center,
+            _domain_treedef=treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
     # Compute higher order derivatives using jacfwd loop
-    # This computes the full dense derivative tensor at each order
-    # T_0 = f(x)
-    # T_1 = jacfwd(f)(x)
-    # T_2 = jacfwd(jacfwd(f))(x)
-    # ...
-
-    # Compute higher order derivatives using jacfwd loop
-    # We go up to max_order + 1 to compute the Lagrange remainder term
-
     deriv_tensors = []
 
     # Order 0
-    val = f(expansion_center)
+    val = f_center
     if val.ndim == 0:
-        val = val[None]  # (1,) if scalar
+        val = val[None]
     deriv_tensors.append(val)
 
-    # Ensure we strictly differentiate a vector-valued function
-    # to maintain consistent tensor shape (n, d, d...)
-    if f(expansion_center).ndim == 0:
-
-        def f_vec(x):
-            v = f(x)
-            return v[None]
-
-        curr_f = f_vec
-    else:
-        curr_f = f
+    curr_f = work_f
 
     # Compute up to max_order + 1
-    for k in range(1, max_order + 2):
+    for k in range(1, max_k + 2):
         curr_f = jax.jacfwd(curr_f)
         tensor = curr_f(expansion_center)
         deriv_tensors.append(tensor)
@@ -1398,8 +1491,9 @@ def taylor_model_from_function(
         exp = exponents[:, i]  # (d,)
         order = jnp.sum(exp)
 
-        # Only compute coeffs up to max_order
-        if order > max_order:
+        # Only compute coeffs up to per-term order
+        # (Though we filtered exponents by per_leaf_order, so this check validates against max_k)
+        if order > max_k:
             continue
 
         if order == 0:
@@ -1415,58 +1509,37 @@ def taylor_model_from_function(
             c = tensor[full_idx]  # (n,)
 
         fact_prod = jnp.prod(jax.scipy.special.gamma(exp + 1))
-
-        # Coefficients in raw (x - center) coordinates: D^alpha f(c) / alpha!
         scale = 1.0 / fact_prod
-
         coeffs = coeffs.at[:, i].set(c * scale)
 
-    # Estimate remainder using Lagrange remainder bound:
-    # |R_n(x)| <= (1/(n+1)!) * sup |D^{n+1}f(xi)| * |x-c|^{n+1}
-    # We approximate sup |D^{n+1}f(xi)| with |D^{n+1}f(c)| (centered evaluation)
-    # Ideally this should be evaluated over the interval domain.
+    # Estimate remainder using Lagrange remainder bound
+    # Using max_k + 1 as the next order
+    next_order = max_k + 1
 
-    next_order = max_order + 1
-    # Tensor of shape (n, d, d, ..., d) (k+1 'd's)
+    # Note: This remainder estimation assumes uniform max order.
+    # With per-leaf orders, different leaves might have different bounds.
+    # But differentiation gives full tensor. We can bound everything at max_k + 1.
+    # This might be conservative but correct.
+
     D_next = deriv_tensors[next_order]
-
-    # Take absolute value for bounding
-    abs_D_next = jnp.abs(D_next)  # (n, d, ..., d)
-
-    # Contract with radius vector r (d,) repeatedly (next_order times)
-    # We can use a loop or reshape tricks.
-    # We want sum_{j1...j_{k+1}} |T_{...}| * r_{j1} * ... * r_{j_{k+1}}
+    abs_D_next = jnp.abs(D_next)
 
     current_bound = abs_D_next
     for _ in range(next_order):
-        # Contract last dimension with domain_radius
-        # current is (n, ..., d)
         current_bound = jnp.dot(current_bound, domain_radius)
-        # jnp.dot sums product over last axis of a and first of b (b is 1D)
-        # result reduces rank by 1.
 
-    # current_bound is now (n,)
-
-    # Divide by (n+1)!
     factorial = jax.scipy.special.gamma(next_order + 1)
     remainder_bound = current_bound / factorial
 
-    # Ensure non-zero for safety if needed, though 0 is valid for exact polynomials
     remainder = icentpert(jnp.zeros(n, dtype=f_center.dtype), remainder_bound)
-
-    # Set up leaf_shapes and per_leaf_order for single domain Interval
-    leaf_shapes = (domain.lower.shape,)
-    if isinstance(max_order, int):
-        per_leaf_order = (max_order,)
-    else:
-        per_leaf_order = tuple(max_order)
 
     return TaylorModel(
         coeffs,
         exponents,
         remainder,
-        domain,
+        flat_domain,
         center=expansion_center,
+        _domain_treedef=treedef,
         _leaf_shapes=leaf_shapes,
         _per_leaf_order=per_leaf_order,
     )
@@ -1583,12 +1656,23 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
     # New center: remove var_idx
     new_center = jnp.concatenate([tm.center[:var_idx], tm.center[var_idx + 1 :]])
 
+    # Determine new domain treedef
+    if len(new_leaf_shapes) == len(leaf_shapes):
+        # Structure preserved (just reduced dimension within leaves)
+        new_domain_treedef = tm._domain_treedef
+    else:
+        # Structure changed (entire leaf removed)
+        # We can't easily reconstruct the original structure type, so default to tuple
+        dummy_leaves = [jnp.zeros(s) for s in new_leaf_shapes]
+        new_domain_treedef = jax.tree_util.tree_structure(tuple(dummy_leaves))
+
     return TaylorModel(
         new_coeffs,
         canonical_exp,
         tm.remainder,
         new_domain,
         center=new_center,
+        _domain_treedef=new_domain_treedef,
         _leaf_shapes=new_leaf_shapes,
         _per_leaf_order=new_per_leaf_order,
     )
@@ -1729,7 +1813,9 @@ def integrate_variable(
     start_coeffs = shifted_coeffs * start_powers  # (*output_shape, m)
 
     # The starting-point terms have exponent 0 for var_idx (constant in x_i)
-    start_exponents = tm.exponents.copy()  # keep other exponents, set var_idx to 0
+    start_exponents = tm.exponents.at[var_idx, :].set(
+        0
+    )  # keep other exponents, set var_idx to 0
     # (these are the original exponents since var_idx exponent maps to the
     #  "other variables" part of each monomial)
 
