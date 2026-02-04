@@ -41,7 +41,6 @@ from immrax.taylor.taylor_model import (
     _leaf_slice,
     _merge_taylor_terms,
     _max_order,
-    _normalize_order,
     _bound_monomials_over_domain,
 )
 
@@ -56,7 +55,9 @@ def _bound_polynomial(tm: TaylorModel) -> Interval:
     For TMs with output shape (*output_shape,), returns Interval with same shape.
     """
     # Bound each monomial over the shifted domain (D - center): shape (m,)
-    mono_bounds = _bound_monomials_over_domain(tm.exponents, tm.shifted_domain, max(tm._static_order))
+    mono_bounds = _bound_monomials_over_domain(
+        tm.exponents, tm.shifted_domain, tm.max_order
+    )
 
     # Combine with coefficients: coeffs (*output_shape, m), mono bounds (m,)
     zeros = jnp.zeros_like(tm.coeffs)
@@ -68,6 +69,7 @@ def _bound_polynomial(tm: TaylorModel) -> Interval:
 
     return interval(jnp.sum(term_lower, axis=-1), jnp.sum(term_upper, axis=-1))
 
+
 TaylorModel._bound_polynomial = _bound_polynomial
 
 
@@ -78,6 +80,7 @@ tm_inclusion_registry = {}
 def istaylormodel(x) -> bool:
     """Check if x is a TaylorModel."""
     return isinstance(x, TaylorModel)
+
 
 def nattm(
     f: Callable[..., jax.Array],
@@ -125,6 +128,7 @@ def nattm(
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorModel:
         """Natural Taylor Model function."""
+
         # Get representative values for tracing
         def geteval(x):
             if istaylormodel(x):
@@ -143,22 +147,35 @@ def nattm(
         if effective_order is None:
             for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylormodel):
                 if istaylormodel(arg):
-                    effective_order = arg._static_order if effective_order is None else _max_order(effective_order, arg._static_order)
+                    effective_order = (
+                        arg._per_leaf_order
+                        if effective_order is None
+                        else _max_order(effective_order, arg._per_leaf_order)
+                    )
             if effective_order is None:
-                effective_order = 2  # Default order (will be broadcast in constructors)
+                effective_order = (
+                    2,
+                )  # Default order as tuple (will be broadcast in constructors)
 
         # Evaluate the jaxpr on the Taylor model arguments
         if structured_center:
             # Pass the single TM and its structure info for invar slicing
             tm = args[0]
             out = nattm_jaxpr(
-                closed_jaxpr.jaxpr, closed_jaxpr.literals, tm,
+                closed_jaxpr.jaxpr,
+                closed_jaxpr.literals,
+                tm,
                 max_order=effective_order,
                 structured_invar=True,
                 leaf_shapes=tm._leaf_shapes,
             )
         else:
-            out = nattm_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *args, max_order=effective_order)
+            out = nattm_jaxpr(
+                closed_jaxpr.jaxpr,
+                closed_jaxpr.literals,
+                *args,
+                max_order=effective_order,
+            )
 
         if len(out) == 1:
             return out[0]
@@ -267,12 +284,14 @@ def _register_tm_univariate(primitive: Primitive, func: Callable = None) -> None
         to ``primitive.bind``. Some primitives (e.g. tan, asin, atan) need
         the jnp function because jet lacks direct rules for them.
     """
+
     # Create and register the TM handler
-    def _tm_handler(x: TaylorModel, *, max_order: int = None, accuracy=None) -> TaylorModel:
+    def _tm_handler(
+        x: TaylorModel, *, max_order: int = None, accuracy=None
+    ) -> TaylorModel:
         return _tm_univariate(primitive, x, max_order=max_order, func=func)
 
     tm_inclusion_registry[primitive] = _tm_handler
-
 
 
 def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
@@ -281,6 +300,7 @@ def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
     For operations like copy, convert_element_type, etc., we just apply
     the primitive independently to coeffs and remainder using tree_map.
     """
+
     def _tm_p(*args, max_order=None, **kwargs) -> TaylorModel:
         getcoeffs = lambda x: x.coeffs if istaylormodel(x) else x
         getlower = lambda x: x.remainder.lower if istaylormodel(x) else x
@@ -300,9 +320,16 @@ def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
                 ref_tm = arg
                 break
 
-        return TaylorModel(new_coeffs, ref_tm.exponents, interval(new_lower, new_upper),
-                           ref_tm.domain, center=ref_tm.center,
-                           _static_order=ref_tm._static_order)
+        return TaylorModel(
+            new_coeffs,
+            ref_tm.exponents,
+            interval(new_lower, new_upper),
+            ref_tm.domain,
+            center=ref_tm.center,
+            _domain_treedef=ref_tm._domain_treedef,
+            _leaf_shapes=ref_tm._leaf_shapes,
+            _per_leaf_order=ref_tm._per_leaf_order,
+        )
 
     return _tm_p
 
@@ -321,6 +348,7 @@ _add_tm_passthrough_to_registry(debug_callback_p)
 
 # --- Reshape operation (preserves polynomial structure) ---
 
+
 def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
     """Factory for structural TM operations that preserve polynomial structure.
 
@@ -329,6 +357,7 @@ def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
     takes ``(kwargs, tm)`` and returns modified kwargs for the coeffs array
     (which has the extra trailing monomial axis).
     """
+
     def _tm_p(*args, max_order=None, **kwargs):
         # Find first TM arg
         ref_tm = None
@@ -345,45 +374,65 @@ def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
         new_coeffs = primitive.bind(*args_coeffs, **coeff_kwargs)
 
         # Apply primitive to remainder lower/upper with original kwargs
-        args_lower = [arg.remainder.lower if istaylormodel(arg) else arg for arg in args]
-        args_upper = [arg.remainder.upper if istaylormodel(arg) else arg for arg in args]
+        args_lower = [
+            arg.remainder.lower if istaylormodel(arg) else arg for arg in args
+        ]
+        args_upper = [
+            arg.remainder.upper if istaylormodel(arg) else arg for arg in args
+        ]
         new_lower = primitive.bind(*args_lower, **kwargs)
         new_upper = primitive.bind(*args_upper, **kwargs)
 
-        return TaylorModel(new_coeffs, ref_tm.exponents, interval(new_lower, new_upper),
-                           ref_tm.domain, center=ref_tm.center,
-                           _static_order=ref_tm._static_order)
+        return TaylorModel(
+            new_coeffs,
+            ref_tm.exponents,
+            interval(new_lower, new_upper),
+            ref_tm.domain,
+            center=ref_tm.center,
+            _domain_treedef=ref_tm._domain_treedef,
+            _leaf_shapes=ref_tm._leaf_shapes,
+            _per_leaf_order=ref_tm._per_leaf_order,
+        )
 
     tm_inclusion_registry[primitive] = _tm_p
 
 
 def _adapt_reshape(kwargs, tm):
     m = tm.num_monomials
-    kw = {**kwargs, 'new_sizes': (*kwargs['new_sizes'], m)}
-    if kwargs.get('dimensions') is not None:
-        kw['dimensions'] = (*kwargs['dimensions'], len(tm._output_shape))
+    kw = {**kwargs, "new_sizes": (*kwargs["new_sizes"], m)}
+    if kwargs.get("dimensions") is not None:
+        kw["dimensions"] = (*kwargs["dimensions"], len(tm._output_shape))
     return kw
 
+
 def _adapt_transpose(kwargs, tm):
-    return {**kwargs, 'permutation': (*kwargs['permutation'], len(tm._output_shape))}
+    return {**kwargs, "permutation": (*kwargs["permutation"], len(tm._output_shape))}
+
 
 def _adapt_squeeze(kwargs, tm):
     return kwargs  # monomial axis is never size-1
 
+
 def _adapt_broadcast_in_dim(kwargs, tm):
-    shape = kwargs['shape']
-    return {**kwargs,
-            'shape': (*shape, tm.num_monomials),
-            'broadcast_dimensions': (*kwargs['broadcast_dimensions'], len(shape))}
+    shape = kwargs["shape"]
+    return {
+        **kwargs,
+        "shape": (*shape, tm.num_monomials),
+        "broadcast_dimensions": (*kwargs["broadcast_dimensions"], len(shape)),
+    }
+
 
 def _adapt_slice(kwargs, tm):
     m = tm.num_monomials
-    kw = {**kwargs,
-           'start_indices': (*kwargs['start_indices'], 0),
-           'limit_indices': (*kwargs['limit_indices'], m)}
-    if kwargs.get('strides') is not None:
-        kw['strides'] = (*kwargs['strides'], 1)
+    kw = {
+        **kwargs,
+        "start_indices": (*kwargs["start_indices"], 0),
+        "limit_indices": (*kwargs["limit_indices"], m),
+    }
+    if kwargs.get("strides") is not None:
+        kw["strides"] = (*kwargs["strides"], 1)
     return kw
+
 
 def _adapt_concatenate(kwargs, tm):
     return kwargs  # dimension refers to output axes; monomial axis is last and shared
@@ -407,19 +456,32 @@ def _tm_dynamic_slice_p(x, *start_indices, slice_sizes, max_order=None) -> Taylo
 
     m = x.num_monomials
     new_coeffs = lax.dynamic_slice_p.bind(
-        x.coeffs, *start_indices, 0,
-        slice_sizes=(*slice_sizes, m)
+        x.coeffs, *start_indices, 0, slice_sizes=(*slice_sizes, m)
     )
-    new_lower = lax.dynamic_slice_p.bind(x.remainder.lower, *start_indices, slice_sizes=slice_sizes)
-    new_upper = lax.dynamic_slice_p.bind(x.remainder.upper, *start_indices, slice_sizes=slice_sizes)
+    new_lower = lax.dynamic_slice_p.bind(
+        x.remainder.lower, *start_indices, slice_sizes=slice_sizes
+    )
+    new_upper = lax.dynamic_slice_p.bind(
+        x.remainder.upper, *start_indices, slice_sizes=slice_sizes
+    )
 
-    return TaylorModel(new_coeffs, x.exponents, interval(new_lower, new_upper),
-                       x.domain, center=x.center, _static_order=x._static_order)
+    return TaylorModel(
+        new_coeffs,
+        x.exponents,
+        interval(new_lower, new_upper),
+        x.domain,
+        center=x.center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
+    )
+
 
 tm_inclusion_registry[lax.dynamic_slice_p] = _tm_dynamic_slice_p
 
 
 # --- Higher-order primitives ---
+
 
 def _tm_pjit_p(*args, max_order=None, **bind_params) -> TaylorModel:
     """Handle pjit by evaluating the inner jaxpr."""
@@ -431,11 +493,16 @@ def _tm_pjit_p(*args, max_order=None, **bind_params) -> TaylorModel:
         max_order = None
         for arg in args:
             if istaylormodel(arg):
-                max_order = arg._static_order if max_order is None else _max_order(max_order, arg._static_order)
+                max_order = (
+                    arg._per_leaf_order
+                    if max_order is None
+                    else _max_order(max_order, arg._per_leaf_order)
+                )
         if max_order is None:
-            max_order = 2
+            max_order = (2,)
 
     return nattm_jaxpr(bind_jaxpr, [], *args, max_order=max_order)
+
 
 tm_inclusion_registry[jax._src.pjit.pjit_p] = _tm_pjit_p
 
@@ -443,7 +510,9 @@ tm_inclusion_registry[jax._src.pjit.pjit_p] = _tm_pjit_p
 # --- Arithmetic operations ---
 
 
-def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> TaylorModel:
+def _tm_add_p(
+    x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None
+) -> TaylorModel:
     """Taylor model addition with broadcasting support."""
     if istaylormodel(x) and istaylormodel(y):
         # Check compatible domains
@@ -465,21 +534,25 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
         # Add remainders (Interval addition auto-broadcasts)
         new_remainder = x.remainder + y.remainder
 
-        new_order = _max_order(x._static_order, y._static_order)
-
         # Preserve structured domain info if present
-        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        domain_treedef = (
+            x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        )
         leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
-        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
+        per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
 
         result = TaylorModel(
-            new_coeffs, new_exponents, new_remainder, x.domain,
-            center=x.center, _static_order=new_order,
-            _domain_treedef=domain_treedef, _leaf_shapes=leaf_shapes,
-            _per_leaf_order=per_leaf_order
+            new_coeffs,
+            new_exponents,
+            new_remainder,
+            x.domain,
+            center=x.center,
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
         # Convert to canonical form for compatibility
-        return result.to_canonical(new_order)
+        return result.to_canonical(per_leaf_order)
 
     elif istaylormodel(x):
         # TM + Array
@@ -506,12 +579,16 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
         new_remainder = x.remainder.broadcast_to(broadcast_shape)
 
         result = TaylorModel(
-            new_coeffs, new_exponents, new_remainder, x.domain,
-            center=x.center, _static_order=x._static_order,
-            _domain_treedef=x._domain_treedef, _leaf_shapes=x._leaf_shapes,
-            _per_leaf_order=x._per_leaf_order
+            new_coeffs,
+            new_exponents,
+            new_remainder,
+            x.domain,
+            center=x.center,
+            _domain_treedef=x._domain_treedef,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order,
         )
-        return result.to_canonical(x._static_order)
+        return result.to_canonical(x._per_leaf_order)
 
     elif istaylormodel(y):
         # Array + TM
@@ -519,18 +596,21 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
     else:
         return x + y
 
+
 tm_inclusion_registry[lax.add_p] = _tm_add_p
 tm_inclusion_registry[ad_util.add_any_p] = _tm_add_p
 TaylorModel.__add__ = _tm_add_p
 TaylorModel.__radd__ = _tm_add_p
 
 
-
-def _tm_sub_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> TaylorModel:
+def _tm_sub_p(
+    x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None
+) -> TaylorModel:
     """Taylor model subtraction."""
     if istaylormodel(y):
         return _tm_add_p(x, _tm_neg_p(y))
     return _tm_add_p(x, -jnp.asarray(y))
+
 
 tm_inclusion_registry[lax.sub_p] = _tm_sub_p
 TaylorModel.__sub__ = _tm_sub_p
@@ -547,19 +627,19 @@ def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         -x.remainder,
         x.domain,
         center=x.center,
-        _static_order=x._static_order,
         _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
     )
 
+
 tm_inclusion_registry[lax.neg_p] = _tm_neg_p
 TaylorModel.__neg__ = _tm_neg_p
 
 
-
-def _truncate_product(coeffs, exponents, max_order, shifted_domain,
-                      leaf_shapes=None, per_leaf_order=None):
+def _truncate_product(
+    coeffs, exponents, max_order, shifted_domain, leaf_shapes=None, per_leaf_order=None
+):
     """Truncate polynomial product terms above max_order into an interval remainder.
 
     Parameters
@@ -595,7 +675,9 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain,
             max_order = tuple([max_order] * exponents.shape[0])
         target_arr = jnp.array(max_order, dtype=jnp.int32)[:, None]  # (d, 1)
         keep_mask = jnp.all(exponents <= target_arr, axis=0)  # (num_terms,)
-        static_max = max(max_order) * 2 if isinstance(max_order, tuple) else max_order * 2
+        static_max = (
+            max(max_order) * 2 if isinstance(max_order, tuple) else max_order * 2
+        )
 
     kept_coeffs = jnp.where(keep_mask, coeffs, 0.0)
     truncated_coeffs = jnp.where(keep_mask, 0.0, coeffs)
@@ -618,7 +700,9 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain,
     return kept_coeffs, truncated_remainder
 
 
-def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = None) -> TaylorModel:
+def _tm_mul_p(
+    x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = None
+) -> TaylorModel:
     """Taylor model element-wise multiplication with broadcasting support."""
     if istaylormodel(x) and istaylormodel(y):
         if x.d != y.d:
@@ -646,17 +730,25 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
         coeff2 = y_coeffs[..., None, :]  # (*broadcast_shape, 1, m2)
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
-        effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
-
         # Check for structured domain mode - both TMs should have same structure
-        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        domain_treedef = (
+            x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        )
         leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
-        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
+        effective_order = (
+            max_order
+            if max_order is not None
+            else _max_order(x._per_leaf_order, y._per_leaf_order)
+        )
 
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
-            all_coeffs, all_exp, effective_order, x.shifted_domain,
-            leaf_shapes=leaf_shapes, per_leaf_order=per_leaf_order
+            all_coeffs,
+            all_exp,
+            effective_order,
+            x.shifted_domain,
+            leaf_shapes=leaf_shapes,
+            per_leaf_order=effective_order,
         )
 
         new_exponents = all_exp
@@ -680,10 +772,9 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             new_remainder,
             x.domain,
             center=x.center,
-            _static_order=effective_order,
             _domain_treedef=domain_treedef,
             _leaf_shapes=leaf_shapes,
-            _per_leaf_order=per_leaf_order,
+            _per_leaf_order=effective_order,
         )
 
         return result.to_canonical(effective_order)
@@ -711,7 +802,6 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             new_remainder,
             x.domain,
             center=x.center,
-            _static_order=x._static_order,
             _domain_treedef=x._domain_treedef,
             _leaf_shapes=x._leaf_shapes,
             _per_leaf_order=x._per_leaf_order,
@@ -722,6 +812,7 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
     else:
         return x * y
 
+
 tm_inclusion_registry[lax.mul_p] = _tm_mul_p
 
 TaylorModel.__mul__ = _tm_mul_p
@@ -729,9 +820,9 @@ TaylorModel.__rmul__ = _tm_mul_p
 TaylorModel.multiply = _tm_mul_p
 
 
-
 from jax.experimental.jet import jet
 from immrax.inclusion.nif import natif
+
 
 def _tm_univariate(
     primitive_p: Primitive,
@@ -750,12 +841,12 @@ def _tm_univariate(
     if not istaylormodel(x):
         return primitive_p.bind(x)
 
-    per_var_order = max_order if max_order is not None else x._static_order
-    # For univariate composition, use max of per-variable orders as expansion depth
-    if isinstance(per_var_order, tuple):
-        order = max(per_var_order)
+    per_leaf_order = max_order if max_order is not None else x._per_leaf_order
+    # For univariate composition, use max of per-leaf orders as expansion depth
+    if isinstance(per_leaf_order, tuple):
+        order = max(per_leaf_order)
     else:
-        order = per_var_order
+        order = per_leaf_order
     output_shape = x._output_shape
     c = x.constant_term  # (*output_shape,)
 
@@ -763,17 +854,23 @@ def _tm_univariate(
 
     # Flatten output shape for processing
     import math
+
     n_flat = math.prod(output_shape) if output_shape else 1
     c_flat = c.reshape(-1) if output_shape else c[None]  # (n_flat,)
 
     # 1. Compute Taylor coefficients f^(k)(c)/k! using jet (univariate)
     def get_coeffs(val):
         primals = (val,)
-        series = ((1.,) + (0.,) * (order - 1),)
+        series = ((1.0,) + (0.0,) * (order - 1),)
         f_val, f_series = jet(prim_func, primals, series)
         # jet returns raw derivatives [f', f'', f''', ...], need to divide by k! for Taylor coefficients
-        taylor_coeffs = [f_val] + [f_series[k] * inv_fact(k + 1) for k in range(len(f_series))]
-        return jnp.array(taylor_coeffs)
+        # taylor_coeffs = [f_val] + [f_series[k] * inv_fact(k + 1) for k in range(len(f_series))]
+        return jnp.concatenate(
+            (
+                jnp.asarray([f_val]),
+                jnp.asarray(f_series) * inv_fact(jnp.arange(1, order + 1)),
+            )
+        )
 
     # Vectorize over flattened output dimensions, shape: (n_flat, order + 1)
     coeffs_raw = jax.vmap(get_coeffs)(c_flat)
@@ -797,10 +894,26 @@ def _tm_univariate(
         init_coeff = coeffs_raw_shaped[order]  # scalar
         horner_coeffs = [coeffs_raw_shaped[i] for i in range(order - 1, -1, -1)]
 
-    result = _tm_constant(init_coeff, x.d, per_var_order, x.domain, center=x.center)
+    result = _tm_constant(
+        init_coeff,
+        x.d,
+        per_leaf_order,
+        x.domain,
+        center=x.center,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
+    )
     for coeff in horner_coeffs:
-        term = _tm_constant(coeff, x.d, per_var_order, x.domain, center=x.center)
-        result = result.multiply(z, max_order=per_var_order) + term
+        term = _tm_constant(
+            coeff,
+            x.d,
+            per_leaf_order,
+            x.domain,
+            center=x.center,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order,
+        )
+        result = result.multiply(z, max_order=per_leaf_order) + term
 
     # 3. Compute Lagrange remainder: f^(order+1)(xi) / (order+1)! * z^(order+1)
     x_hull = x.interval_hull()
@@ -810,7 +923,7 @@ def _tm_univariate(
     def get_deriv_bound(i):
         def deriv_func(v):
             primals = (v,)
-            series = ((1.,) + (0.,) * order,)
+            series = ((1.0,) + (0.0,) * order,)
             _, f_series = jet(prim_func, primals, series)
             # jet returns raw derivative f^(order+1)(v), not normalized by factorial
             return f_series[-1]
@@ -822,14 +935,14 @@ def _tm_univariate(
     deriv_bounds = [get_deriv_bound(i) for i in range(n_flat)]
     deriv_bound_flat = interval(
         jnp.stack([b.lower for b in deriv_bounds]),
-        jnp.stack([b.upper for b in deriv_bounds])
+        jnp.stack([b.upper for b in deriv_bounds]),
     )
 
     # Reshape deriv_bound back to output_shape
     if output_shape:
         deriv_bound = interval(
             deriv_bound_flat.lower.reshape(*output_shape),
-            deriv_bound_flat.upper.reshape(*output_shape)
+            deriv_bound_flat.upper.reshape(*output_shape),
         )
     else:
         deriv_bound = interval(deriv_bound_flat.lower[0], deriv_bound_flat.upper[0])
@@ -867,44 +980,62 @@ def _tm_univariate(
     # Final remainder is intersection of lagrange_remainder and r_compat
     final_remainder = lagrange_remainder & r_compat
 
-    return TaylorModel(result.coeffs, result.exponents, final_remainder,
-                       result.domain, center=result.center, _static_order=per_var_order,
-                       _domain_treedef=x._domain_treedef,
-                       _leaf_shapes=x._leaf_shapes,
-                       _per_leaf_order=x._per_leaf_order)
+    return TaylorModel(
+        result.coeffs,
+        result.exponents,
+        final_remainder,
+        result.domain,
+        center=result.center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
+    )
 
 
 # Re-implement TM primitives using _tm_univariate
 
+
 def _tm_div_p(x: TaylorModel, y: TaylorModel, *, max_order: int = None) -> TaylorModel:
     """Taylor model division: x / y = x * (1/y)."""
-    
+
     # We need a primitive for reciprocal to pass to _tm_univariate
     # We can't pass a class method or lambda directly if it's not a Primitive or doesn't have bind?
     # _tm_univariate calls primitive_p.bind(v).
     # We create a dummy object with a bind method.
-    
+
     class ReciprocalPrimitive:
         def bind(self, val):
             return 1.0 / val
-            
+
     recip_y = _tm_univariate(ReciprocalPrimitive(), y, max_order=max_order)
-    
+
     if istaylormodel(x):
         return x.multiply(recip_y, max_order=max_order)
     else:
         return jnp.asarray(x) * recip_y
 
+
 tm_inclusion_registry[lax.div_p] = _tm_div_p
 
 
-
-
-
-def _tm_constant(value: jax.Array, d: int, order: int,
-                  domain: Interval, center=None) -> TaylorModel:
+def _tm_constant(
+    value: jax.Array,
+    d: int,
+    order: int,
+    domain: Interval,
+    center=None,
+    _leaf_shapes=None,
+    _per_leaf_order=None,
+) -> TaylorModel:
     """Create a constant TaylorModel (zero remainder) with arbitrary output shape."""
-    return taylor_model_constant(interval(value), domain, order, center=center)
+    return taylor_model_constant(
+        interval(value),
+        domain,
+        order,
+        center=center,
+        _leaf_shapes=_leaf_shapes,
+        _per_leaf_order=_per_leaf_order,
+    )
 
 
 def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
@@ -912,34 +1043,52 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
     if not istaylormodel(x):
         return lax.integer_pow(x, y)
 
-    order = max_order if max_order is not None else x._static_order
+    order = max_order if max_order is not None else x._per_leaf_order
 
     if y == 0:
-        return _tm_constant(jnp.ones(x.n, dtype=x.dtype), x.d, order,
-                            x.domain, center=x.center)
+        return _tm_constant(
+            jnp.ones(x.n, dtype=x.dtype),
+            x.d,
+            order,
+            x.domain,
+            center=x.center,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order,
+        )
     elif y < 0:
         # x^(-n) = 1/x^n
         pos_pow = _tm_integer_pow_p(x, -y, max_order=order)
-        return _tm_div_p(_tm_constant(jnp.ones(x.n, dtype=x.dtype), x.d, order,
-                                       x.domain, center=x.center),
-                          pos_pow, max_order=order)
+        return _tm_div_p(
+            _tm_constant(
+                jnp.ones(x.n, dtype=x.dtype),
+                x.d,
+                order,
+                x.domain,
+                center=x.center,
+                _leaf_shapes=x._leaf_shapes,
+                _per_leaf_order=x._per_leaf_order,
+            ),
+            pos_pow,
+            max_order=order,
+        )
     else:
         result = x
         for _ in range(y - 1):
             result = result.multiply(x, max_order=order)
         return result
 
+
 tm_inclusion_registry[lax.integer_pow_p] = _tm_integer_pow_p
 
 TaylorModel.__pow__ = _tm_integer_pow_p
-
 
 
 def _tm_square_p(x: TaylorModel, *, max_order: int = None) -> TaylorModel:
     """Taylor model square."""
     return _tm_integer_pow_p(x, 2, max_order=max_order)
 
-if hasattr(lax, 'square_p'):
+
+if hasattr(lax, "square_p"):
     tm_inclusion_registry[lax.square_p] = _tm_square_p
     pass
 
@@ -950,20 +1099,22 @@ def _tm_pow_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     if order is None:
         order = None
         if istaylormodel(x):
-            order = x._static_order
+            order = x._per_leaf_order
         if istaylormodel(y):
-            order = y._static_order if order is None else _max_order(order, y._static_order)
+            order = (
+                y._per_leaf_order
+                if order is None
+                else _max_order(order, y._per_leaf_order)
+            )
         if order is None:
-            order = 2
+            order = (2,)
 
     log_x = _tm_log_p(x, max_order=order)
     y_log_x = _tm_mul_p(y, log_x, max_order=order)
     return _tm_exp_p(y_log_x, max_order=order)
 
+
 tm_inclusion_registry[lax.pow_p] = _tm_pow_p
-
-
-
 
 
 # --- Transcendental functions ---
@@ -976,7 +1127,6 @@ _register_tm_univariate(lax.cos_p)
 _register_tm_univariate(lax.tan_p, jnp.tan)  # no jet rule for tan
 _register_tm_univariate(lax.tanh_p)
 _register_tm_univariate(lax.sqrt_p)
-
 
 
 def _tm_abs_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
@@ -994,19 +1144,29 @@ def _tm_abs_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     contains_zero = jnp.logical_and(hull.lower <= 0, hull.upper >= 0)
 
     # Conservative: return interval hull as TM
-    abs_lower = jnp.where(contains_zero, 0.0, jnp.minimum(jnp.abs(hull.lower), jnp.abs(hull.upper)))
+    abs_lower = jnp.where(
+        contains_zero, 0.0, jnp.minimum(jnp.abs(hull.lower), jnp.abs(hull.upper))
+    )
     abs_upper = jnp.maximum(jnp.abs(hull.lower), jnp.abs(hull.upper))
 
     center = (abs_lower + abs_upper) / 2
     pert = (abs_upper - abs_lower) / 2
 
-    return taylor_model_constant(icentpert(center, pert), x.domain, x._static_order,
-                                  center=x.center)
+    return taylor_model_constant(
+        icentpert(center, pert),
+        x.domain,
+        x._per_leaf_order,
+        center=x.center,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
+    )
+
 
 tm_inclusion_registry[lax.abs_p] = _tm_abs_p
 
 
 # --- Linear algebra ---
+
 
 def _tm_dot_general_array(arr, tm, dim_nums):
     """Handle dot_general(Array, TM) — the primary Array-TM implementation.
@@ -1027,14 +1187,20 @@ def _tm_dot_general_array(arr, tm, dim_nums):
     )
 
     return TaylorModel(
-        new_coeffs, tm.exponents, new_remainder,
-        tm.domain, center=tm.center, _static_order=tm._static_order,
-        _domain_treedef=tm._domain_treedef, _leaf_shapes=tm._leaf_shapes,
+        new_coeffs,
+        tm.exponents,
+        new_remainder,
+        tm.domain,
+        center=tm.center,
+        _domain_treedef=tm._domain_treedef,
+        _leaf_shapes=tm._leaf_shapes,
         _per_leaf_order=tm._per_leaf_order,
     )
 
 
-def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, **kwargs) -> TaylorModel:
+def _tm_dot_general_p(
+    A: TaylorModel, B: TaylorModel, *, max_order: int = None, **kwargs
+) -> TaylorModel:
     """Taylor model general dot product.
 
     Three cases:
@@ -1075,9 +1241,11 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
             rem_perm = perm[:-1]  # same without mono axis
             new_remainder = result.remainder.transpose(*rem_perm)
             return TaylorModel(
-                new_coeffs, result.exponents, new_remainder,
-                result.domain, center=result.center,
-                _static_order=result._static_order,
+                new_coeffs,
+                result.exponents,
+                new_remainder,
+                result.domain,
+                center=result.center,
                 _domain_treedef=result._domain_treedef,
                 _leaf_shapes=result._leaf_shapes,
                 _per_leaf_order=result._per_leaf_order,
@@ -1089,36 +1257,54 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         if A.d != B.d:
             raise ValueError(f"Domain dimensions must match: {A.d} vs {B.d}")
 
-        effective_order = max_order if max_order is not None else _max_order(A._static_order, B._static_order)
+        effective_order = (
+            max_order
+            if max_order is not None
+            else _max_order(A._per_leaf_order, B._per_leaf_order)
+        )
         d = A.d
         m1 = A.num_monomials
         m2 = B.num_monomials
 
         # Compute product exponents: (d, m1*m2)
-        product_exp = (A.exponents[:, :, None] + B.exponents[:, None, :]).reshape(d, m1 * m2)
+        product_exp = (A.exponents[:, :, None] + B.exponents[:, None, :]).reshape(
+            d, m1 * m2
+        )
 
         # Compute product coefficients via double vmap over monomial axes (last axis)
         def contract_mono_pair(a_mono_coeffs, b_mono_coeffs):
-            return lax.dot_general(a_mono_coeffs, b_mono_coeffs, dimension_numbers=dimension_numbers)
+            return lax.dot_general(
+                a_mono_coeffs, b_mono_coeffs, dimension_numbers=dimension_numbers
+            )
 
         # vmap over m2 (last axis of B.coeffs), then m1 (last axis of A.coeffs)
         contract_over_m2 = jax.vmap(contract_mono_pair, (None, -1), -1)
         contract_over_m1m2 = jax.vmap(contract_over_m2, (-1, None), -1)
 
-        result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)  # (*result_shape, m1, m2)
+        result_coeffs_mm = contract_over_m1m2(
+            A.coeffs, B.coeffs
+        )  # (*result_shape, m1, m2)
 
         # Merge monomial pair axes into single axis: (*result_shape, m1*m2)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
         # Check for structured domain mode
-        domain_treedef = A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
+        domain_treedef = (
+            A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
+        )
         leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
-        per_leaf_order = A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
+        per_leaf_order = (
+            A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
+        )
 
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
-            result_coeffs, product_exp, effective_order, A.shifted_domain,
-            leaf_shapes=leaf_shapes, per_leaf_order=per_leaf_order
+            result_coeffs,
+            product_exp,
+            effective_order,
+            A.shifted_domain,
+            leaf_shapes=leaf_shapes,
+            per_leaf_order=per_leaf_order,
         )
 
         # Cross terms: p_A · r_B + r_A · p_B + r_A · r_B
@@ -1126,6 +1312,7 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         p_B_bounds = _bound_polynomial(B)
 
         from immrax.inclusion.nif import inclusion_registry
+
         iv_dot = lambda a, b: inclusion_registry[lax.dot_general_p](
             a, b, dimension_numbers=dimension_numbers
         )
@@ -1138,14 +1325,19 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         )
 
         result = TaylorModel(
-            new_coeffs, product_exp, new_remainder,
-            A.domain, center=A.center, _static_order=effective_order,
-            _domain_treedef=domain_treedef, _leaf_shapes=leaf_shapes,
-            _per_leaf_order=per_leaf_order,
+            new_coeffs,
+            product_exp,
+            new_remainder,
+            A.domain,
+            center=A.center,
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=effective_order,
         )
         return result.to_canonical(effective_order)
 
     return lax.dot_general_p.bind(A, B, **kwargs)
+
 
 tm_inclusion_registry[lax.dot_general_p] = _tm_dot_general_p
 
@@ -1154,6 +1346,7 @@ TaylorModel.__rmatmul__ = lambda self, other: nattm(jnp.matmul)(other, self)
 
 
 # --- Comparison operations (return intervals/arrays, not TMs) ---
+
 
 def _tm_max_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model maximum."""
@@ -1175,8 +1368,15 @@ def _tm_max_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     # Get reference TM for domain info
     ref = x if istaylormodel(x) else y
 
-    return taylor_model_constant(result_interval, ref.domain, ref._static_order,
-                                  center=ref.center)
+    return taylor_model_constant(
+        result_interval,
+        ref.domain,
+        ref._per_leaf_order,
+        center=ref.center,
+        _leaf_shapes=ref._leaf_shapes,
+        _per_leaf_order=ref._per_leaf_order,
+    )
+
 
 tm_inclusion_registry[lax.max_p] = _tm_max_p
 
@@ -1199,13 +1399,21 @@ def _tm_min_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
 
     ref = x if istaylormodel(x) else y
 
-    return taylor_model_constant(result_interval, ref.domain, ref._static_order,
-                                  center=ref.center)
+    return taylor_model_constant(
+        result_interval,
+        ref.domain,
+        ref._per_leaf_order,
+        center=ref.center,
+        _leaf_shapes=ref._leaf_shapes,
+        _per_leaf_order=ref._per_leaf_order,
+    )
+
 
 tm_inclusion_registry[lax.min_p] = _tm_min_p
 
 
 # --- Reduction operations ---
+
 
 def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     """Taylor model sum reduction over output shape dimensions.
@@ -1222,8 +1430,17 @@ def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     new_coeffs = jnp.sum(x.coeffs, axis=axes)
     new_remainder = x.remainder.sum(axis=axes)
 
-    return TaylorModel(new_coeffs, x.exponents, new_remainder,
-                       x.domain, center=x.center, _static_order=x._static_order)
+    return TaylorModel(
+        new_coeffs,
+        x.exponents,
+        new_remainder,
+        x.domain,
+        center=x.center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
+    )
+
 
 tm_inclusion_registry[lax.reduce_sum_p] = _tm_reduce_sum_p
 
@@ -1237,13 +1454,17 @@ def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
         return lax.reduce_max_p.bind(x, axes=axes)
 
     hull = x.interval_hull()
-    result = interval(
-        jnp.max(hull.lower, axis=axes),
-        jnp.max(hull.upper, axis=axes)
+    result = interval(jnp.max(hull.lower, axis=axes), jnp.max(hull.upper, axis=axes))
+
+    return taylor_model_constant(
+        result,
+        x.domain,
+        x._per_leaf_order,
+        center=x.center,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
-    return taylor_model_constant(result, x.domain, x._static_order,
-                                  center=x.center)
 
 tm_inclusion_registry[lax.reduce_max_p] = _tm_reduce_max_p
 
@@ -1257,13 +1478,17 @@ def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
         return lax.reduce_min_p.bind(x, axes=axes)
 
     hull = x.interval_hull()
-    result = interval(
-        jnp.min(hull.lower, axis=axes),
-        jnp.min(hull.upper, axis=axes)
+    result = interval(jnp.min(hull.lower, axis=axes), jnp.min(hull.upper, axis=axes))
+
+    return taylor_model_constant(
+        result,
+        x.domain,
+        x._per_leaf_order,
+        center=x.center,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
-    return taylor_model_constant(result, x.domain, x._static_order,
-                                  center=x.center)
 
 tm_inclusion_registry[lax.reduce_min_p] = _tm_reduce_min_p
 
@@ -1274,15 +1499,24 @@ _register_tm_univariate(lax.asin_p, jnp.arcsin)  # no jet rule for asin
 _register_tm_univariate(lax.atan_p, jnp.arctan)  # no jet rule for atan
 
 
-
 # --- Reciprocal ---
+
 
 def _tm_reciprocal_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model reciprocal: 1/x."""
-    eff_order = max_order if max_order else (x._static_order if istaylormodel(x) else 2)
-    one = _tm_constant(jnp.ones(x.n if istaylormodel(x) else 1, dtype=x.dtype if istaylormodel(x) else jnp.float32),
-                       x.d if istaylormodel(x) else 1,
-                       eff_order,
-                       x.domain if istaylormodel(x) else icentpert(jnp.zeros(1), jnp.ones(1)),
-                       center=x.center if istaylormodel(x) else None)
+    eff_order = (
+        max_order if max_order else (x._per_leaf_order if istaylormodel(x) else (2,))
+    )
+    one = _tm_constant(
+        jnp.ones(
+            x.n if istaylormodel(x) else 1,
+            dtype=x.dtype if istaylormodel(x) else jnp.float32,
+        ),
+        x.d if istaylormodel(x) else 1,
+        eff_order,
+        x.domain if istaylormodel(x) else icentpert(jnp.zeros(1), jnp.ones(1)),
+        center=x.center if istaylormodel(x) else None,
+        _leaf_shapes=x._leaf_shapes if istaylormodel(x) else None,
+        _per_leaf_order=x._per_leaf_order if istaylormodel(x) else None,
+    )
     return _tm_div_p(one, x, max_order=max_order)
