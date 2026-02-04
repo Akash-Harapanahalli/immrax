@@ -6,8 +6,7 @@ uncertainty through nonlinear functions.
 """
 
 from typing import Callable, Tuple
-from dataclasses import dataclass
-from functools import lru_cache, cached_property
+from functools import lru_cache
 import math
 
 import jax
@@ -18,7 +17,6 @@ from jaxtyping import Array, ArrayLike
 import jax.tree_util
 
 from immrax.inclusion import Interval, interval, icentpert, iconcatenate
-from immrax.utils import inv_fact
 
 
 # ---------------------------------------------------------------------------
@@ -203,62 +201,6 @@ def _leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> sl
     return slice(start, start + sizes[leaf_idx])
 
 
-# ---------------------------------------------------------------------------
-# Legacy ArgumentStructure (deprecated, for backward compatibility)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ArgumentStructure:
-    """Metadata mapping domain variables to function arguments.
-
-    For multi-argument Taylor models where f(*args) has arguments with
-    different shapes, this tracks which domain variables correspond to
-    which argument.
-
-    Example
-    -------
-    For f(t, x) where t: () (scalar) and x: (2,):
-    - arg_shapes = ((), (2,))
-    - arg_sizes = (1, 2)
-    - arg_starts = (0, 1)
-    - total_dim = 3
-    """
-    arg_shapes: tuple[tuple[int, ...], ...]  # Shape of each argument
-
-    @cached_property
-    def arg_sizes(self) -> tuple[int, ...]:
-        """Number of scalar domain variables per argument."""
-        return tuple(math.prod(s) if s else 1 for s in self.arg_shapes)
-
-    @cached_property
-    def arg_starts(self) -> tuple[int, ...]:
-        """Starting index in flat domain for each argument."""
-        starts = [0]
-        for size in self.arg_sizes[:-1]:
-            starts.append(starts[-1] + size)
-        return tuple(starts)
-
-    @property
-    def num_args(self) -> int:
-        """Number of arguments."""
-        return len(self.arg_shapes)
-
-    @property
-    def total_dim(self) -> int:
-        """Total number of domain variables across all arguments."""
-        return sum(self.arg_sizes)
-
-    def arg_slice(self, arg_idx: int) -> slice:
-        """Get slice for domain variables of argument arg_idx."""
-        start = self.arg_starts[arg_idx]
-        return slice(start, start + self.arg_sizes[arg_idx])
-
-    def __hash__(self):
-        return hash(self.arg_shapes)
-
-# Zonotope is imported lazily in to_zonotope() to avoid circular import
-
-
 def _normalize_order(order: "int | tuple[int, ...] | None", d: int) -> "tuple[int, ...]":
     """Normalize an order specification to a tuple of length d.
 
@@ -424,17 +366,6 @@ def _check_per_leaf_bounds(
     return jnp.all(jnp.stack(masks), axis=0)
 
 
-# Backward compatibility aliases
-def _get_arg_total_degree_exponents(arg_structure, per_arg_order):
-    """Deprecated: Use _get_leaf_total_degree_exponents instead."""
-    return _get_leaf_total_degree_exponents(arg_structure.arg_shapes, per_arg_order)
-
-
-def _check_per_arg_bounds(exponents, arg_structure, per_arg_order):
-    """Deprecated: Use _check_per_leaf_bounds instead."""
-    return _check_per_leaf_bounds(exponents, arg_structure.arg_shapes, per_arg_order)
-
-
 @register_pytree_node_class
 class TaylorModel:
     r"""Defines a Taylor model set representation with arbitrary output shape.
@@ -597,19 +528,9 @@ class TaylorModel:
         return math.prod(self._output_shape) if self._output_shape else 1
 
     @property
-    def domain_center(self) -> Array:
-        """Center of the domain box, shape (d,). Deprecated: use center or domain.center."""
-        return self.domain.center
-
-    @property
-    def domain_radius(self) -> Array:
-        """Half-width of the domain box, shape (d,). Deprecated: use domain.pert."""
-        return self.domain.pert
-
-    @property
     def shifted_domain(self) -> Interval:
         """Domain shifted by center: D - center, for bounding monomials (x - center)^alpha."""
-        return interval(self.domain.lower - self.center, self.domain.upper - self.center)
+        return self.domain - self.center
 
     @property
     def d(self) -> int:
@@ -665,57 +586,6 @@ class TaylorModel:
                 self._domain_treedef, self._leaf_shapes, self.center
             )
 
-    def unpack_to_pytree(self) -> "TaylorModel | list | dict":
-        """Unpack a structured TaylorModel into a pytree of sub-TaylorModels.
-
-        For a TaylorModel created from a pytree domain (e.g., list or dict of Intervals),
-        this returns a matching pytree of TaylorModels, where each sub-TM represents
-        the identity over the corresponding leaf interval.
-
-        For non-structured TaylorModels, returns self unchanged.
-
-        Returns
-        -------
-        TaylorModel or PyTree[TaylorModel]
-            If structured: pytree of sub-TaylorModels matching domain structure.
-            If not structured: self.
-        """
-        if not self.is_structured:
-            return self
-
-        # Extract sub-TMs for each leaf
-        sub_tms = []
-        start = 0
-        for leaf_idx, shape in enumerate(self._leaf_shapes):
-            size = math.prod(shape) if shape else 1
-            end = start + size
-
-            # Slice coefficients and remainder for this leaf's outputs
-            if size == 1:
-                sub_coeffs = self.coeffs[start]  # scalar output
-                sub_remainder = self.remainder[start]
-            else:
-                sub_coeffs = self.coeffs[start:end]
-                sub_remainder = self.remainder[start:end]
-
-            # Create sub-TM (shares the full domain but only represents this leaf's outputs)
-            sub_tm = TaylorModel(
-                sub_coeffs,
-                self.exponents,
-                sub_remainder,
-                self.domain,
-                center=self.center,
-                _static_order=self._static_order,
-                _domain_treedef=self._domain_treedef,
-                _leaf_shapes=self._leaf_shapes,
-                _per_leaf_order=self._per_leaf_order,
-            )
-            sub_tms.append(sub_tm)
-            start = end
-
-        # Reconstruct the pytree structure
-        return jax.tree_util.tree_unflatten(self._domain_treedef, sub_tms)
-            
 
     def __getitem__(self, idx) -> "TaylorModel":
         """Get component(s) of the Taylor Model.
@@ -1553,53 +1423,6 @@ def taylor_model_identity(domain, order=1) -> TaylorModel:
     )
 
 
-def taylor_model_multiarg_identity(
-    *arg_domains: Interval,
-    per_arg_order: tuple[int, ...],
-) -> TaylorModel:
-    """Create identity Taylor model for multiple arguments with per-argument total degree bounds.
-
-    .. deprecated::
-        Use ``taylor_model_identity(list(arg_domains), order=list(per_arg_order))`` instead.
-
-    For a function f(*args), this creates a Taylor model where each argument
-    can have arbitrary shape, and the polynomial order is specified as
-    per-argument total degree bounds (not per-variable bounds).
-
-    Parameters
-    ----------
-    *arg_domains : Interval
-        Domain intervals for each argument. Each can have arbitrary shape.
-    per_arg_order : tuple[int, ...]
-        Maximum total degree for each argument. Length must match number of
-        arg_domains. For example, (2, 3) means degree ≤ 2 in first argument
-        and degree ≤ 3 in second argument.
-
-    Returns
-    -------
-    TaylorModel
-        Taylor model for identity with:
-        - Flattened domain containing all argument variables
-        - Exponents generated with per-argument total degree bounds
-        - Output shape matching the concatenated flattened arguments
-
-    Example
-    -------
-    For f(t, x) where t: () (scalar) and x: (2,):
-    - per_arg_order = (2, 3) means |alpha_t| <= 2 and |alpha_x| <= 3
-    - Generates monomials t^a * x1^b1 * x2^b2 where a <= 2 and b1 + b2 <= 3
-    - Number of monomials: (2+1) * C(2+3, 3) = 3 * 10 = 30
-    """
-    if len(arg_domains) != len(per_arg_order):
-        raise ValueError(
-            f"Number of arg_domains ({len(arg_domains)}) must match "
-            f"length of per_arg_order ({len(per_arg_order)})"
-        )
-
-    # Delegate to unified taylor_model_identity
-    return taylor_model_identity(list(arg_domains), order=list(per_arg_order))
-
-
 def taylor_model_from_function(
     f: Callable,
     domain: Interval,
@@ -1844,9 +1667,12 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
 
 def integrate_variable(
     tm: TaylorModel,
-    var_idx: int,
+    var_idx: int | None = None,
     start: float | None = None,
     keep_order: bool = True,
+    *,
+    leaf_idx: int | None = None,
+    leaf_var_idx: int | None = None,
 ) -> TaylorModel:
     r"""Integrate a TaylorModel with respect to one domain variable.
 
@@ -1875,8 +1701,10 @@ def integrate_variable(
     ----------
     tm : TaylorModel
         Input Taylor model.
-    var_idx : int
-        Index of the domain variable to integrate over (0-indexed).
+    var_idx : int or None
+        Index of the domain variable to integrate over (0-indexed into the
+        flattened domain). Either ``var_idx`` or both ``leaf_idx`` and
+        ``leaf_var_idx`` must be provided.
     start : float or None
         Lower limit of integration (the upper limit is the variable itself).
         If None, defaults to ``tm.center[var_idx]``.
@@ -1885,13 +1713,70 @@ def integrate_variable(
         are bounded and absorbed into the remainder so the output has the
         same polynomial order as the input.  If False, the output order for
         variable ``var_idx`` is incremented by 1.
+    leaf_idx : int or None
+        For structured domains: index of the leaf in the domain pytree.
+        Must be used together with ``leaf_var_idx``.
+    leaf_var_idx : int or None
+        For structured domains: index of the variable within the specified
+        leaf (0-indexed into the flattened leaf). Must be used together
+        with ``leaf_idx``.
 
     Returns
     -------
     TaylorModel
-        Integrated Taylor model.
+        Integrated Taylor model. For structured domains, the result preserves
+        the pytree metadata.
+
+    Examples
+    --------
+    Flat domain (original API):
+
+    >>> tm_result = integrate_variable(tm, var_idx=0)
+
+    Structured domain with leaf/variable indices:
+
+    >>> # For domain = [interval_t, interval_x] where t is leaf 0, x is leaf 1
+    >>> tm_result = integrate_variable(tm, leaf_idx=0, leaf_var_idx=0)  # integrate over t
+    >>> tm_result = integrate_variable(tm, leaf_idx=1, leaf_var_idx=1)  # integrate over x[1]
     """
     d = tm.d
+
+    # --- Resolve var_idx from leaf_idx/leaf_var_idx if provided ---
+    if leaf_idx is not None or leaf_var_idx is not None:
+        if leaf_idx is None or leaf_var_idx is None:
+            raise ValueError(
+                "Both leaf_idx and leaf_var_idx must be provided together"
+            )
+        if var_idx is not None:
+            raise ValueError(
+                "Cannot specify both var_idx and leaf_idx/leaf_var_idx"
+            )
+        if not tm.is_structured:
+            raise ValueError(
+                "leaf_idx/leaf_var_idx can only be used with structured domains"
+            )
+
+        leaf_shapes = tm._leaf_shapes
+        num_leaves = len(leaf_shapes)
+        if leaf_idx < 0 or leaf_idx >= num_leaves:
+            raise ValueError(
+                f"leaf_idx={leaf_idx} out of range for {num_leaves} leaves"
+            )
+
+        leaf_size = math.prod(leaf_shapes[leaf_idx]) if leaf_shapes[leaf_idx] else 1
+        if leaf_var_idx < 0 or leaf_var_idx >= leaf_size:
+            raise ValueError(
+                f"leaf_var_idx={leaf_var_idx} out of range for leaf with size {leaf_size}"
+            )
+
+        # Compute flat var_idx from leaf_idx and leaf_var_idx
+        slc = _leaf_slice(leaf_shapes, leaf_idx)
+        var_idx = slc.start + leaf_var_idx
+    elif var_idx is None:
+        raise ValueError(
+            "Either var_idx or both leaf_idx and leaf_var_idx must be provided"
+        )
+
     if var_idx < 0 or var_idx >= d:
         raise ValueError(f"var_idx={var_idx} out of range for d={d}")
 
@@ -1975,11 +1860,30 @@ def integrate_variable(
         return TaylorModel(
             kept_coeffs, canonical_exp, total_remainder, tm.domain,
             center=tm.center, _static_order=tm._static_order,
+            _domain_treedef=tm._domain_treedef,
+            _leaf_shapes=tm._leaf_shapes,
+            _per_leaf_order=tm._per_leaf_order,
         )
     else:
+        # For structured domains, compute updated per_leaf_order
+        new_per_leaf_order = None
+        if tm.is_structured:
+            # Find which leaf contains var_idx and increment its order
+            leaf_shapes = tm._leaf_shapes
+            per_leaf_order = list(tm._per_leaf_order)
+            for li in range(len(leaf_shapes)):
+                slc = _leaf_slice(leaf_shapes, li)
+                if slc.start <= var_idx < slc.stop:
+                    per_leaf_order[li] += 1
+                    break
+            new_per_leaf_order = tuple(per_leaf_order)
+
         return TaylorModel(
             new_coeffs, canonical_exp, integ_remainder, tm.domain,
             center=tm.center, _static_order=new_order,
+            _domain_treedef=tm._domain_treedef,
+            _leaf_shapes=tm._leaf_shapes,
+            _per_leaf_order=new_per_leaf_order,
         )
 
 

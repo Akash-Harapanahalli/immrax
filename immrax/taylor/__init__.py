@@ -9,7 +9,6 @@ from .taylor_model import (
     TaylorModel,
     taylor_model,
     taylor_model_identity,
-    taylor_model_multiarg_identity,  # Deprecated, use taylor_model_identity
     taylor_model_constant,
     taylor_model_from_function,
     taylor_model_concatenate,
@@ -45,7 +44,6 @@ __all__ = [
     "TaylorModel",
     "taylor_model",
     "taylor_model_identity",
-    "taylor_model_multiarg_identity",  # Deprecated
     "taylor_model_constant",
     "taylor_model_from_function",
     "taylor_model_concatenate",
