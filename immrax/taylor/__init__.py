@@ -7,17 +7,21 @@ them through functions, similar to natif for intervals.
 
 from .taylor_model import (
     TaylorModel,
-    ArgumentStructure,
     taylor_model,
     taylor_model_identity,
-    taylor_model_multiarg_identity,
+    taylor_model_multiarg_identity,  # Deprecated, use taylor_model_identity
     taylor_model_constant,
     taylor_model_from_function,
     taylor_model_concatenate,
+    integrate_variable,
     _generate_exponents,
     _get_canonical_exponents,
-    _get_arg_total_degree_exponents,
-    _check_per_arg_bounds,
+    _get_leaf_total_degree_exponents,
+    _check_per_leaf_bounds,
+    _leaf_slice,
+    _is_interval_leaf,
+    _get_domain_metadata,
+    _normalize_order_pytree,
 )
 
 from .taylor_polynomial import TaylorPolynomial
@@ -39,13 +43,13 @@ from .nattp import (
 __all__ = [
     # Taylor Model class and constructors
     "TaylorModel",
-    "ArgumentStructure",
     "taylor_model",
     "taylor_model_identity",
-    "taylor_model_multiarg_identity",
+    "taylor_model_multiarg_identity",  # Deprecated
     "taylor_model_constant",
     "taylor_model_from_function",
     "taylor_model_concatenate",
+    "integrate_variable",
     # Taylor Polynomial class
     "TaylorPolynomial",
     # Natural Taylor Model function

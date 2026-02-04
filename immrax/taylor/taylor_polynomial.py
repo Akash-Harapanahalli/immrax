@@ -14,12 +14,14 @@ from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike
 
 from immrax.inclusion import Interval, interval, icentpert
+import jax.tree_util
+
 from immrax.taylor.taylor_model import (
     TaylorModel,
-    ArgumentStructure,
     _get_canonical_exponents,
-    _get_arg_total_degree_exponents,
-    _check_per_arg_bounds,
+    _get_leaf_total_degree_exponents,
+    _check_per_leaf_bounds,
+    _leaf_slice,
     _merge_taylor_terms,
 )
 
@@ -51,8 +53,9 @@ class TaylorPolynomial:
         exponents: ArrayLike,
         domain_center: ArrayLike,
         _static_order: "int | tuple[int, ...] | None" = None,
-        _arg_structure: "ArgumentStructure | None" = None,
-        _per_arg_order: "tuple[int, ...] | None" = None,
+        _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
+        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+        _per_leaf_order: "tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
@@ -72,9 +75,10 @@ class TaylorPolynomial:
 
         self._output_shape = self.coeffs.shape[:-1]
 
-        # Multi-argument support
-        self._arg_structure = _arg_structure
-        self._per_arg_order = _per_arg_order
+        # Structured domain support
+        self._domain_treedef = _domain_treedef
+        self._leaf_shapes = _leaf_shapes
+        self._per_leaf_order = _per_leaf_order
 
         if self.coeffs.ndim < 1:
             raise ValueError(f"coeffs must be at least 1D, got shape {self.coeffs.shape}")
@@ -99,21 +103,24 @@ class TaylorPolynomial:
             {
                 "_static_order": self._static_order,
                 "_output_shape": self._output_shape,
-                "_arg_structure": self._arg_structure,
-                "_per_arg_order": self._per_arg_order,
+                "_domain_treedef": self._domain_treedef,
+                "_leaf_shapes": self._leaf_shapes,
+                "_per_leaf_order": self._per_leaf_order,
             },
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorPolynomial":
         static_order = aux_data.get("_static_order") if aux_data else None
-        arg_structure = aux_data.get("_arg_structure") if aux_data else None
-        per_arg_order = aux_data.get("_per_arg_order") if aux_data else None
+        domain_treedef = aux_data.get("_domain_treedef") if aux_data else None
+        leaf_shapes = aux_data.get("_leaf_shapes") if aux_data else None
+        per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
         return cls(
             *children,
             _static_order=static_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order,
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
     # --- Properties ---
@@ -148,19 +155,24 @@ class TaylorPolynomial:
         return self.coeffs.dtype
 
     @property
-    def arg_structure(self) -> "ArgumentStructure | None":
-        """Argument structure for multi-argument mode, or None."""
-        return self._arg_structure
+    def domain_treedef(self) -> "jax.tree_util.PyTreeDef | None":
+        """PyTree structure of the original domain, or None for single Interval."""
+        return self._domain_treedef
 
     @property
-    def per_arg_order(self) -> "tuple[int, ...] | None":
-        """Per-argument total degree bounds, or None for per-variable mode."""
-        return self._per_arg_order
+    def leaf_shapes(self) -> "tuple[tuple[int, ...], ...] | None":
+        """Shapes of each leaf Interval in the domain pytree, or None."""
+        return self._leaf_shapes
 
     @property
-    def is_multiarg(self) -> bool:
-        """True if this TP uses per-argument total degree bounds."""
-        return self._arg_structure is not None and self._per_arg_order is not None
+    def per_leaf_order(self) -> "tuple[int, ...] | None":
+        """Per-leaf total degree bounds, or None for per-variable mode."""
+        return self._per_leaf_order
+
+    @property
+    def is_structured(self) -> bool:
+        """True if this TP uses per-leaf total degree bounds (structured domain)."""
+        return self._domain_treedef is not None
 
     @property
     def constant_term(self) -> Array:
@@ -234,9 +246,9 @@ class TaylorPolynomial:
 
     def to_canonical(self, target_order: "int | tuple[int, ...] | None" = None) -> "TaylorPolynomial":
         """Convert to canonical exponent structure, discarding terms above target_order."""
-        # Handle multi-argument mode
-        if self._arg_structure is not None and self._per_arg_order is not None:
-            return self._to_canonical_per_arg(target_order)
+        # Handle structured domain mode
+        if self._leaf_shapes is not None and self._per_leaf_order is not None:
+            return self._to_canonical_per_leaf(target_order)
 
         if target_order is None:
             target_order = self._static_order
@@ -276,40 +288,43 @@ class TaylorPolynomial:
             _static_order=target_order,
         )
 
-    def _to_canonical_per_arg(
+    def _to_canonical_per_leaf(
         self,
         target_order: "tuple[int, ...] | None" = None,
     ) -> "TaylorPolynomial":
-        """Convert to canonical exponent structure for multi-argument mode."""
-        arg_structure = self._arg_structure
+        """Convert to canonical exponent structure for structured domain mode."""
+        import math
 
-        # Determine per_arg_order: use target_order only if it has the correct
-        # length (number of arguments), otherwise use stored _per_arg_order.
+        leaf_shapes = self._leaf_shapes
+        num_leaves = len(leaf_shapes)
+
+        # Determine per_leaf_order: use target_order only if it has the correct
+        # length (number of leaves), otherwise use stored _per_leaf_order.
         if target_order is not None:
             if isinstance(target_order, int):
-                per_arg_order = tuple([target_order] * arg_structure.num_args)
-            elif len(target_order) == arg_structure.num_args:
-                per_arg_order = tuple(target_order)
+                per_leaf_order = tuple([target_order] * num_leaves)
+            elif len(target_order) == num_leaves:
+                per_leaf_order = tuple(target_order)
             else:
                 # target_order has wrong length (probably per-variable order),
-                # use stored per_arg_order instead
-                per_arg_order = self._per_arg_order
+                # use stored per_leaf_order instead
+                per_leaf_order = self._per_leaf_order
         else:
-            per_arg_order = self._per_arg_order
+            per_leaf_order = self._per_leaf_order
 
-        per_arg_order = tuple(per_arg_order)
+        per_leaf_order = tuple(per_leaf_order)
 
-        canonical_exp = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
+        canonical_exp = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
         num_canonical = canonical_exp.shape[1]
 
-        max_exp_per_var = max(max(self._static_order), max(per_arg_order)) + 1
+        max_exp_per_var = max(max(self._static_order), max(per_leaf_order)) + 1
         base = max_exp_per_var + 2
         powers = base ** jnp.arange(self.d)
 
         current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        has_match = _check_per_arg_bounds(self.exponents, arg_structure, per_arg_order)
+        has_match = _check_per_leaf_bounds(self.exponents, leaf_shapes, per_leaf_order)
 
         if num_canonical > 50:
             sort_perm = jnp.argsort(canonical_hash)
@@ -325,16 +340,18 @@ class TaylorPolynomial:
         masked_coeffs = jnp.where(has_match, self.coeffs, 0.0)
         new_coeffs = masked_coeffs @ scatter_matrix
 
-        # Compute per-variable order from per-arg order
+        # Compute per-variable order from per-leaf order
         per_var_order = []
-        for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
+        leaf_sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
+        for size, max_ord in zip(leaf_sizes, per_leaf_order):
             per_var_order.extend([max_ord] * size)
 
         return TaylorPolynomial(
             new_coeffs, canonical_exp, self.domain_center,
             _static_order=tuple(per_var_order),
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
     def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorPolynomial":
@@ -350,8 +367,9 @@ class TaylorPolynomial:
         return TaylorPolynomial(
             new_coeffs, self.exponents, self.domain_center,
             _static_order=target_order,
-            _arg_structure=self._arg_structure,
-            _per_arg_order=self._per_arg_order,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=self._leaf_shapes,
+            _per_leaf_order=self._per_leaf_order,
         )
 
     # --- Conversion ---
@@ -385,8 +403,9 @@ class TaylorPolynomial:
             self.coeffs, self.exponents, remainder,
             domain, center=self.domain_center,
             _static_order=self._static_order,
-            _arg_structure=self._arg_structure,
-            _per_arg_order=self._per_arg_order,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=self._leaf_shapes,
+            _per_leaf_order=self._per_leaf_order,
         )
 
     # --- Indexing ---
@@ -398,8 +417,9 @@ class TaylorPolynomial:
         return TaylorPolynomial(
             c, self.exponents, self.domain_center,
             _static_order=self._static_order,
-            _arg_structure=self._arg_structure,
-            _per_arg_order=self._per_arg_order,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=self._leaf_shapes,
+            _per_leaf_order=self._per_leaf_order,
         )
 
     def __len__(self) -> int:

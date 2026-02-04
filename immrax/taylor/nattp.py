@@ -30,10 +30,10 @@ from jaxtyping import Array, ArrayLike
 
 from immrax.taylor.taylor_polynomial import TaylorPolynomial
 from immrax.taylor.taylor_model import (
-    ArgumentStructure,
     _get_canonical_exponents,
-    _get_arg_total_degree_exponents,
-    _check_per_arg_bounds,
+    _get_leaf_total_degree_exponents,
+    _check_per_leaf_bounds,
+    _leaf_slice,
     _merge_taylor_terms,
     _max_order,
 )
@@ -377,15 +377,17 @@ def _tp_add_p(x, y):
         new_coeffs, new_exp = _merge_taylor_terms(x_coeffs, x.exponents, y_coeffs, y.exponents)
         new_order = _max_order(x._static_order, y._static_order)
 
-        # Preserve arg_structure if present
-        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
-        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+        # Preserve structured domain info if present
+        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
+        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
 
         result = TaylorPolynomial(
             new_coeffs, new_exp, x.domain_center,
             _static_order=new_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order
         )
         return result.to_canonical(new_order)
 
@@ -400,8 +402,9 @@ def _tp_add_p(x, y):
         result = TaylorPolynomial(
             new_coeffs, new_exp, x.domain_center,
             _static_order=x._static_order,
-            _arg_structure=x._arg_structure,
-            _per_arg_order=x._per_arg_order
+            _domain_treedef=x._domain_treedef,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order
         )
         return result.to_canonical(x._static_order)
 
@@ -422,8 +425,9 @@ def _tp_neg_p(x):
     return TaylorPolynomial(
         -x.coeffs, x.exponents, x.domain_center,
         _static_order=x._static_order,
-        _arg_structure=x._arg_structure,
-        _per_arg_order=x._per_arg_order
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order
     )
 
 tp_inclusion_registry[lax.neg_p] = _tp_neg_p
@@ -463,14 +467,15 @@ def _tp_mul_p(x, y, *, max_order: int = None):
 
         effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
 
-        # Check for multi-argument mode
-        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
-        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+        # Check for structured domain mode
+        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
+        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
 
         # Discard HOT (no remainder) using appropriate mode
-        if arg_structure is not None and per_arg_order is not None:
-            # Per-argument total degree mode
-            keep_mask = _check_per_arg_bounds(all_exp, arg_structure, per_arg_order)
+        if leaf_shapes is not None and per_leaf_order is not None:
+            # Per-leaf total degree mode
+            keep_mask = _check_per_leaf_bounds(all_exp, leaf_shapes, per_leaf_order)
         else:
             # Per-variable mode
             if isinstance(effective_order, int):
@@ -485,8 +490,9 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         result = TaylorPolynomial(
             kept_coeffs, all_exp, x.domain_center,
             _static_order=effective_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order
         )
         return result.to_canonical(effective_order)
 
@@ -499,8 +505,9 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         return TaylorPolynomial(
             new_coeffs, x.exponents, x.domain_center,
             _static_order=x._static_order,
-            _arg_structure=x._arg_structure,
-            _per_arg_order=x._per_arg_order
+            _domain_treedef=x._domain_treedef,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order
         )
 
     elif istaylorpolynomial(y):
@@ -548,8 +555,9 @@ def _tp_dot_general_array(arr, tp, dim_nums):
     return TaylorPolynomial(
         new_coeffs, tp.exponents, tp.domain_center,
         _static_order=tp._static_order,
-        _arg_structure=tp._arg_structure,
-        _per_arg_order=tp._per_arg_order
+        _domain_treedef=tp._domain_treedef,
+        _leaf_shapes=tp._leaf_shapes,
+        _per_leaf_order=tp._per_leaf_order
     )
 
 
@@ -580,8 +588,9 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
             return TaylorPolynomial(
                 new_coeffs, result.exponents, result.domain_center,
                 _static_order=result._static_order,
-                _arg_structure=result._arg_structure,
-                _per_arg_order=result._per_arg_order
+                _domain_treedef=result._domain_treedef,
+                _leaf_shapes=result._leaf_shapes,
+                _per_leaf_order=result._per_leaf_order
             )
         return result
 
@@ -604,13 +613,14 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Check for multi-argument mode
-        arg_structure = A._arg_structure if A._arg_structure is not None else B._arg_structure
-        per_arg_order = A._per_arg_order if A._per_arg_order is not None else B._per_arg_order
+        # Check for structured domain mode
+        domain_treedef = A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
+        leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
+        per_leaf_order = A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
 
         # Discard HOT using appropriate mode
-        if arg_structure is not None and per_arg_order is not None:
-            keep_mask = _check_per_arg_bounds(product_exp, arg_structure, per_arg_order)
+        if leaf_shapes is not None and per_leaf_order is not None:
+            keep_mask = _check_per_leaf_bounds(product_exp, leaf_shapes, per_leaf_order)
         else:
             if isinstance(effective_order, int):
                 eff_tuple = tuple([effective_order] * d)
@@ -624,8 +634,9 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result = TaylorPolynomial(
             kept_coeffs, product_exp, A.domain_center,
             _static_order=effective_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order
         )
         return result.to_canonical(effective_order)
 

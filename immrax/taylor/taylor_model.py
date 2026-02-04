@@ -16,9 +16,141 @@ from jax.experimental import jet
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike
 
-from immrax.inclusion import Interval, interval, icentpert
+import jax.tree_util
+
+from immrax.inclusion import Interval, interval, icentpert, iconcatenate
 from immrax.utils import fact, inv_fact
 
+
+# ---------------------------------------------------------------------------
+# PyTree Domain Helpers
+# ---------------------------------------------------------------------------
+
+def _is_interval_leaf(x):
+    """Check if x is an Interval (leaf node in domain pytree)."""
+    return isinstance(x, Interval)
+
+
+def _get_domain_metadata(domain):
+    """Extract pytree structure and leaf info from domain.
+
+    Parameters
+    ----------
+    domain : Interval or PyTree[Interval]
+        Domain intervals. Can be single Interval or any pytree structure
+        (list, dict, nested) with Interval leaves.
+
+    Returns
+    -------
+    treedef : jax.tree_util.PyTreeDef
+        PyTree structure definition for the domain.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval in tree traversal order.
+    flat_domain : Interval
+        Single flattened Interval containing all domain variables concatenated.
+    """
+    treedef = jax.tree_util.tree_structure(domain, is_leaf=_is_interval_leaf)
+    leaves = jax.tree_util.tree_leaves(domain, is_leaf=_is_interval_leaf)
+
+    if len(leaves) == 0:
+        raise ValueError("Domain must contain at least one Interval")
+
+    leaf_shapes = tuple(iv.lower.shape for iv in leaves)
+
+    # Flatten all leaves into single domain interval
+    flat = []
+    for iv in leaves:
+        if iv.shape == ():
+            flat.append(iv[None])
+        else:
+            flat.append(iv.reshape(-1))
+
+    flat_domain = iconcatenate(flat)
+
+    return treedef, leaf_shapes, flat_domain
+
+
+def _get_domain_from_metadata(treedef, leaf_shapes, flat_domain) -> "Interval | PyTree[Interval]":
+    """Reconstruct domain from metadata."""
+    if len(leaf_shapes) == 1:
+        return flat_domain
+    else:
+        # First unpack flat_domain into the leaves
+        leaves = []
+        start = 0
+        for shape in leaf_shapes:
+            size = math.prod(shape) if shape else 1
+            leaves.append(flat_domain[start:start + size].reshape(shape))
+            start += size
+
+        return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
+    """Normalize order specification to per-leaf and per-variable tuples.
+
+    Parameters
+    ----------
+    order : int or PyTree[int]
+        Order specification. If int, broadcast to all leaves.
+        If pytree, must match domain_treedef structure.
+    domain_treedef : jax.tree_util.PyTreeDef
+        PyTree structure from the domain.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval.
+
+    Returns
+    -------
+    per_leaf_order : tuple[int, ...]
+        Total degree bound for each leaf (one per leaf).
+    per_var_order : tuple[int, ...]
+        Per-variable order bounds (one per scalar domain variable).
+    """
+    num_leaves = len(leaf_shapes)
+
+    if isinstance(order, int):
+        per_leaf_order = tuple([order] * num_leaves)
+    else:
+        # order is a pytree - flatten it
+        order_leaves = jax.tree_util.tree_leaves(order)
+        if len(order_leaves) != num_leaves:
+            raise ValueError(
+                f"Order pytree has {len(order_leaves)} leaves but domain has {num_leaves} leaves"
+            )
+        per_leaf_order = tuple(int(o) for o in order_leaves)
+
+    # Compute per-variable order from per-leaf order
+    per_var_order = []
+    for shape, leaf_ord in zip(leaf_shapes, per_leaf_order):
+        size = math.prod(shape) if shape else 1
+        per_var_order.extend([leaf_ord] * size)
+
+    return per_leaf_order, tuple(per_var_order)
+
+
+def _leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> slice:
+    """Get slice for domain variables of a given leaf.
+
+    Parameters
+    ----------
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval.
+    leaf_idx : int
+        Index of the leaf to get slice for.
+
+    Returns
+    -------
+    slice
+        Slice object for indexing into flat domain variables.
+    """
+    sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
+    start = sum(sizes[:leaf_idx])
+    return slice(start, start + sizes[leaf_idx])
+
+
+# ---------------------------------------------------------------------------
+# Legacy ArgumentStructure (deprecated, for backward compatibility)
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ArgumentStructure:
@@ -157,21 +289,21 @@ def _enumerate_total_degree(dim: int, max_deg: int) -> list[tuple[int, ...]]:
 
 
 @lru_cache(maxsize=128)
-def _get_arg_total_degree_exponents(
-    arg_structure: ArgumentStructure,
-    per_arg_order: tuple[int, ...]
+def _get_leaf_total_degree_exponents(
+    leaf_shapes: "tuple[tuple[int, ...], ...]",
+    per_leaf_order: tuple[int, ...]
 ) -> Array:
-    """Generate exponents with per-argument total degree bounds.
+    """Generate exponents with per-leaf total degree bounds.
 
-    For multi-argument functions, this generates all monomials where
-    the total degree of exponents for each argument is bounded separately.
+    For multi-leaf domains (pytree of Intervals), this generates all monomials
+    where the total degree of exponents for each leaf is bounded separately.
 
     Parameters
     ----------
-    arg_structure : ArgumentStructure
-        Metadata about argument shapes and sizes.
-    per_arg_order : tuple[int, ...]
-        Maximum total degree for each argument.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval.
+    per_leaf_order : tuple[int, ...]
+        Maximum total degree for each leaf.
 
     Returns
     -------
@@ -180,56 +312,72 @@ def _get_arg_total_degree_exponents(
 
     Example
     -------
-    For f(t, x) where t: () and x: (2,), with per_arg_order = (2, 3):
+    For domain = [interval_t, interval_x] where t: () and x: (2,),
+    with per_leaf_order = (2, 3):
     - Generates monomials t^a * x1^b1 * x2^b2 where a <= 2 and b1+b2 <= 3
     - Count: (2+1) * C(2+3, 3) = 3 * 10 = 30 monomials
     """
     from itertools import product
     import numpy as np
 
-    # Generate exponents for each argument separately
-    arg_indices = []
-    for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
-        arg_indices.append(_enumerate_total_degree(size, max_ord))
+    # Compute sizes from shapes
+    leaf_sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
 
-    # Take Cartesian product across arguments
+    # Generate exponents for each leaf separately
+    leaf_indices = []
+    for size, max_ord in zip(leaf_sizes, per_leaf_order):
+        leaf_indices.append(_enumerate_total_degree(size, max_ord))
+
+    # Take Cartesian product across leaves
     all_exponents = []
-    for combo in product(*arg_indices):
+    for combo in product(*leaf_indices):
         # Flatten the tuple of tuples into a single exponent vector
-        flat_exp = [e for arg_exp in combo for e in arg_exp]
+        flat_exp = [e for leaf_exp in combo for e in leaf_exp]
         all_exponents.append(flat_exp)
 
     return np.array(all_exponents, dtype=np.int32).T
 
 
-def _check_per_arg_bounds(
+def _check_per_leaf_bounds(
     exponents: Array,
-    arg_structure: ArgumentStructure,
-    per_arg_order: tuple[int, ...]
+    leaf_shapes: "tuple[tuple[int, ...], ...]",
+    per_leaf_order: tuple[int, ...]
 ) -> Array:
-    """Return boolean mask for monomials within per-argument total degree bounds.
+    """Return boolean mask for monomials within per-leaf total degree bounds.
 
     Parameters
     ----------
     exponents : Array, shape (d, m)
         Exponent matrix.
-    arg_structure : ArgumentStructure
-        Metadata about argument structure.
-    per_arg_order : tuple[int, ...]
-        Maximum total degree for each argument.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval.
+    per_leaf_order : tuple[int, ...]
+        Maximum total degree for each leaf.
 
     Returns
     -------
     Array
         Boolean mask of shape (m,), True for monomials within bounds.
     """
+    num_leaves = len(leaf_shapes)
     masks = []
-    for arg_idx in range(arg_structure.num_args):
-        slc = arg_structure.arg_slice(arg_idx)
-        # Sum exponents for this argument's variables (total degree for this arg)
-        arg_total = jnp.sum(exponents[slc, :], axis=0)
-        masks.append(arg_total <= per_arg_order[arg_idx])
+    for leaf_idx in range(num_leaves):
+        slc = _leaf_slice(leaf_shapes, leaf_idx)
+        # Sum exponents for this leaf's variables (total degree for this leaf)
+        leaf_total = jnp.sum(exponents[slc, :], axis=0)
+        masks.append(leaf_total <= per_leaf_order[leaf_idx])
     return jnp.all(jnp.stack(masks), axis=0)
+
+
+# Backward compatibility aliases
+def _get_arg_total_degree_exponents(arg_structure, per_arg_order):
+    """Deprecated: Use _get_leaf_total_degree_exponents instead."""
+    return _get_leaf_total_degree_exponents(arg_structure.arg_shapes, per_arg_order)
+
+
+def _check_per_arg_bounds(exponents, arg_structure, per_arg_order):
+    """Deprecated: Use _check_per_leaf_bounds instead."""
+    return _check_per_leaf_bounds(exponents, arg_structure.arg_shapes, per_arg_order)
 
 
 @register_pytree_node_class
@@ -288,8 +436,9 @@ class TaylorModel:
         domain: Interval,
         center: ArrayLike = None,
         _static_order: "int | tuple[int, ...] | None" = None,
-        _arg_structure: "ArgumentStructure | None" = None,
-        _per_arg_order: "tuple[int, ...] | None" = None,
+        _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
+        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+        _per_leaf_order: "tuple[int, ...] | None" = None,
     ) -> None:
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
@@ -319,9 +468,10 @@ class TaylorModel:
         # Monomials are always the LAST axis of coeffs
         self._output_shape = self.coeffs.shape[:-1]
 
-        # Multi-argument support: store argument structure and per-arg order
-        self._arg_structure = _arg_structure
-        self._per_arg_order = _per_arg_order
+        # Structured domain support: store pytree metadata
+        self._domain_treedef = _domain_treedef
+        self._leaf_shapes = _leaf_shapes
+        self._per_leaf_order = _per_leaf_order
 
         # Validate dimensions
         if self.coeffs.ndim < 1:
@@ -360,24 +510,27 @@ class TaylorModel:
             {
                 "_static_order": self._static_order,
                 "_output_shape": self._output_shape,
-                "_arg_structure": self._arg_structure,
-                "_per_arg_order": self._per_arg_order,
+                "_domain_treedef": self._domain_treedef,
+                "_leaf_shapes": self._leaf_shapes,
+                "_per_leaf_order": self._per_leaf_order,
             },
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
         static_order = aux_data.get("_static_order") if aux_data else None
-        arg_structure = aux_data.get("_arg_structure") if aux_data else None
-        per_arg_order = aux_data.get("_per_arg_order") if aux_data else None
+        domain_treedef = aux_data.get("_domain_treedef") if aux_data else None
+        leaf_shapes = aux_data.get("_leaf_shapes") if aux_data else None
+        per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
         # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
         coeffs, exponents, remainder, domain, center = children
         return cls(
             coeffs, exponents, remainder, domain,
             center=center,
             _static_order=static_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order,
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
     # --- Properties ---
@@ -424,19 +577,33 @@ class TaylorModel:
         return self._output_shape
 
     @property
-    def arg_structure(self) -> "ArgumentStructure | None":
-        """Argument structure for multi-argument Taylor models, or None."""
-        return self._arg_structure
+    def domain_treedef(self) -> "jax.tree_util.PyTreeDef | None":
+        """PyTree structure of the original domain, or None for single Interval."""
+        return self._domain_treedef
 
     @property
-    def per_arg_order(self) -> "tuple[int, ...] | None":
-        """Per-argument total degree bounds, or None for per-variable mode."""
-        return self._per_arg_order
+    def leaf_shapes(self) -> "tuple[tuple[int, ...], ...] | None":
+        """Shapes of each leaf Interval in the domain pytree, or None."""
+        return self._leaf_shapes
 
     @property
-    def is_multiarg(self) -> bool:
-        """True if this TM uses per-argument total degree bounds."""
-        return self._arg_structure is not None and self._per_arg_order is not None
+    def per_leaf_order(self) -> "tuple[int, ...] | None":
+        """Per-leaf total degree bounds, or None for per-variable mode."""
+        return self._per_leaf_order
+
+    @property
+    def is_structured(self) -> bool:
+        """True if this TM uses per-leaf total degree bounds (structured domain)."""
+        return self._domain_treedef is not None
+    
+    @property
+    def structured_center(self) -> Array :
+        """Get the center of the domain as a structured pytree."""
+        if not self.is_structured :
+            return self.center
+        else :
+            return _get_domain_from_metadata(self.domain_treedef, self.leaf_shapes, self.center)
+            
 
     def __getitem__(self, idx) -> "TaylorModel":
         """Get component(s) of the Taylor Model.
@@ -470,8 +637,9 @@ class TaylorModel:
 
         return TaylorModel(c, self.exponents, rem, self.domain,
                            center=self.center, _static_order=self._static_order,
-                           _arg_structure=self._arg_structure,
-                           _per_arg_order=self._per_arg_order)
+                           _domain_treedef=self._domain_treedef,
+                           _leaf_shapes=self._leaf_shapes,
+                           _per_leaf_order=self._per_leaf_order)
 
     def __len__(self) -> int:
         """Length along first axis of output shape."""
@@ -695,9 +863,9 @@ class TaylorModel:
         TaylorModel
             TM with canonical exponent structure
         """
-        # Handle multi-argument mode
-        if self._arg_structure is not None and self._per_arg_order is not None:
-            return self._to_canonical_per_arg(target_order, method)
+        # Handle structured domain mode (per-leaf total degree bounds)
+        if self._leaf_shapes is not None and self._per_leaf_order is not None:
+            return self._to_canonical_per_leaf(target_order, method)
 
         # Standard per-variable mode
         if target_order is None:
@@ -781,37 +949,38 @@ class TaylorModel:
             _static_order=tuple(target_order),
         )
 
-    def _to_canonical_per_arg(
+    def _to_canonical_per_leaf(
         self,
         target_order: "tuple[int, ...] | None" = None,
         method: str | None = None,
     ) -> "TaylorModel":
-        """Convert to canonical exponent structure for multi-argument mode.
+        """Convert to canonical exponent structure for structured domain mode.
 
-        Uses per-argument total degree bounds instead of per-variable bounds.
+        Uses per-leaf total degree bounds instead of per-variable bounds.
         """
-        arg_structure = self._arg_structure
+        leaf_shapes = self._leaf_shapes
+        num_leaves = len(leaf_shapes)
 
-        # Determine per_arg_order: use target_order only if it has the correct
-        # length (number of arguments), otherwise use stored _per_arg_order.
+        # Determine per_leaf_order: use target_order only if it has the correct
+        # length (number of leaves), otherwise use stored _per_leaf_order.
         # This handles the case where to_canonical is called with per-variable
         # order from arithmetic operations.
         if target_order is not None:
             if isinstance(target_order, int):
-                per_arg_order = tuple([target_order] * arg_structure.num_args)
-            elif len(target_order) == arg_structure.num_args:
-                per_arg_order = tuple(target_order)
+                per_leaf_order = tuple([target_order] * num_leaves)
+            elif len(target_order) == num_leaves:
+                per_leaf_order = tuple(target_order)
             else:
                 # target_order has wrong length (probably per-variable order),
-                # use stored per_arg_order instead
-                per_arg_order = self._per_arg_order
+                # use stored per_leaf_order instead
+                per_leaf_order = self._per_leaf_order
         else:
-            per_arg_order = self._per_arg_order
+            per_leaf_order = self._per_leaf_order
 
-        per_arg_order = tuple(per_arg_order)
+        per_leaf_order = tuple(per_leaf_order)
 
-        # Generate canonical exponents with per-arg total degree bounds
-        canonical_exp = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
+        # Generate canonical exponents with per-leaf total degree bounds
+        canonical_exp = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
         num_canonical = canonical_exp.shape[1]
 
         # Auto-select method
@@ -820,15 +989,15 @@ class TaylorModel:
 
         # Compute hash for current and canonical exponents
         # Need a hash that's unique across all possible exponents
-        max_exp_per_var = max(max(self._static_order), max(per_arg_order)) + 1
+        max_exp_per_var = max(max(self._static_order), max(per_leaf_order)) + 1
         base = max_exp_per_var + 2
         powers = base ** jnp.arange(self.d)
 
         current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        # Check if current terms are within per-arg bounds
-        has_match = _check_per_arg_bounds(self.exponents, arg_structure, per_arg_order)
+        # Check if current terms are within per-leaf bounds
+        has_match = _check_per_leaf_bounds(self.exponents, leaf_shapes, per_leaf_order)
 
         if method == "broadcast":
             match_matrix = current_hash[:, None] == canonical_hash[None, :]
@@ -865,9 +1034,10 @@ class TaylorModel:
 
         new_remainder = self.remainder + interval(absorbed_lower, absorbed_upper)
 
-        # Compute per-variable order from per-arg order
+        # Compute per-variable order from per-leaf order
         per_var_order = []
-        for size, max_ord in zip(arg_structure.arg_sizes, per_arg_order):
+        leaf_sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
+        for size, max_ord in zip(leaf_sizes, per_leaf_order):
             per_var_order.extend([max_ord] * size)
 
         return TaylorModel(
@@ -877,8 +1047,9 @@ class TaylorModel:
             self.domain,
             center=self.center,
             _static_order=tuple(per_var_order),
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
     def reduce_order(self, target_order: "int | tuple[int, ...]") -> "TaylorModel":
@@ -1151,60 +1322,122 @@ def taylor_model_constant(iv: Interval, domain: Interval, order: "int | tuple[in
     return TaylorModel(coeffs, exponents, iv - iv.center, domain, center=center, _static_order=order)
 
 
-def taylor_model_identity(iv: Interval, order: "int | tuple[int, ...]" = 1) -> TaylorModel:
-    """Create a Taylor model representing the identity function over a box interval.
+def taylor_model_identity(domain, order=1) -> TaylorModel:
+    """Create a Taylor model representing the identity function over a domain.
 
-    Represents the interval as the polynomial p(x) = center + 1*(x - center)
-    where x in D = [lower, upper]. Each output component i has a linear term
-    in domain variable i, so the domain dimension equals the flattened output size.
+    Supports domain as a single Interval or any pytree structure of Intervals
+    (list, dict, nested structures). When domain is a pytree, order can also
+    be specified as a matching pytree to give per-leaf total degree bounds.
 
     Parameters
     ----------
-    iv : Interval
-        The domain interval with shape (*output_shape,).
-        For scalar intervals, use interval(scalar_value).
-    order : int or tuple[int, ...]
-        Polynomial degree of the Taylor Model (default: 1)
+    domain : Interval or PyTree[Interval]
+        The domain. Can be:
+        - Single Interval with shape (*output_shape,)
+        - List of Intervals: [interval_t, interval_x]
+        - Dict of Intervals: {'t': interval_t, 'x': interval_x}
+        - Any nested pytree with Interval leaves
+    order : int or PyTree[int]
+        Polynomial degree bounds. Can be:
+        - int: Same order for all leaves (default: 1)
+        - PyTree matching domain structure: Per-leaf total degree bounds
 
     Returns
     -------
     TaylorModel
-        Taylor model for identity function with output shape matching interval shape.
-        Domain dimension d = prod(output_shape).
+        Taylor model for identity function. Output shape is (total_dim,) where
+        total_dim is the sum of flattened sizes of all leaf Intervals.
+
+    Examples
+    --------
+    >>> # Single interval (backward compatible)
+    >>> tm = taylor_model_identity(interval(x), order=2)
+
+    >>> # List of intervals with per-leaf orders
+    >>> tm = taylor_model_identity([interval_t, interval_x], order=[2, 3])
+
+    >>> # Dict of intervals
+    >>> tm = taylor_model_identity({'t': interval_t, 'x': interval_x}, order={'t': 2, 'x': 3})
     """
-    import math
+    # Check if domain is a single Interval (leaf case)
+    if _is_interval_leaf(domain):
+        # Simple case: single Interval domain (backward compatible path)
+        iv = domain
+        output_shape = iv.center.shape
+        scalar_output = len(output_shape) == 0
 
-    output_shape = iv.center.shape
-    scalar_output = len(output_shape) == 0
+        # Flatten to get domain dimension (scalars become 1D)
+        center_flat = iv.center.reshape(-1) if not scalar_output else iv.center[None]
+        radius_flat = iv.pert.reshape(-1) if not scalar_output else iv.pert[None]
+        n = center_flat.shape[0]
 
-    # Flatten to get domain dimension (scalars become 1D)
-    center_flat = iv.center.reshape(-1) if not scalar_output else iv.center[None]
-    radius_flat = iv.pert.reshape(-1) if not scalar_output else iv.pert[None]
-    n = center_flat.shape[0]
+        exponents = _generate_exponents(n, order)
+        num_monomials = exponents.shape[1]
 
-    exponents = _generate_exponents(n, order)
+        # Identify constant (all-zero exponent) and linear (unit vector) columns
+        is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
+        eye_n = jnp.eye(n, dtype=jnp.int32)  # (n, n)
+        is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (n, m)
+
+        # coeffs[i, j] = center[i] if j is constant, 1.0 if j is linear for variable i
+        coeffs_flat = (
+            jnp.where(is_constant[None, :], center_flat[:, None], 0.0)
+            + jnp.where(is_linear, 1.0, 0.0)
+        )  # (n, m)
+
+        if scalar_output:
+            coeffs = coeffs_flat[0]  # (m,)
+            remainder = interval(jnp.zeros((), dtype=center_flat.dtype))
+        else:
+            coeffs = coeffs_flat.reshape(*output_shape, num_monomials)
+            remainder = interval(jnp.zeros(output_shape, dtype=center_flat.dtype))
+
+        flat_domain = icentpert(center_flat, radius_flat)
+        return TaylorModel(coeffs, exponents, remainder, flat_domain,
+                           center=center_flat, _static_order=order)
+
+    # PyTree case: domain is a structure of Intervals
+    treedef, leaf_shapes, flat_domain = _get_domain_metadata(domain)
+    per_leaf_order, per_var_order = _normalize_order_pytree(order, treedef, leaf_shapes)
+
+    center_flat = flat_domain.center
+    total_dim = center_flat.shape[0]
+
+    # Generate exponents with per-leaf total degree bounds
+    exponents = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
     num_monomials = exponents.shape[1]
 
-    # Identify constant (all-zero exponent) and linear (unit vector) columns
-    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
-    eye_n = jnp.eye(n, dtype=jnp.int32)  # (n, n)
-    is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (n, m)
+    # Build identity coefficients:
+    # - Constant term: center_flat[i] for each output i
+    # - Linear term: 1.0 for variable i in output i
 
-    # coeffs[i, j] = center[i] if j is constant, 1.0 if j is linear for variable i
-    coeffs_flat = (
+    # Identify constant monomial (all zeros)
+    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
+
+    # Identify linear monomials (unit vectors)
+    eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (total_dim, total_dim)
+    is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (total_dim, m)
+
+    # Build coefficients: coeffs[i, j] = center[i] if constant, 1.0 if linear for var i
+    coeffs = (
         jnp.where(is_constant[None, :], center_flat[:, None], 0.0)
         + jnp.where(is_linear, 1.0, 0.0)
-    )  # (n, m)
+    )  # (total_dim, m)
 
-    if scalar_output:
-        coeffs = coeffs_flat[0]  # (m,)
-        remainder = interval(jnp.zeros((), dtype=center_flat.dtype))
-    else:
-        coeffs = coeffs_flat.reshape(*output_shape, num_monomials)
-        remainder = interval(jnp.zeros(output_shape, dtype=center_flat.dtype))
+    # Remainder is zero since this is exact
+    remainder = interval(jnp.zeros(total_dim, dtype=center_flat.dtype))
 
-    domain = icentpert(center_flat, radius_flat)
-    return TaylorModel(coeffs, exponents, remainder, domain, center=center_flat, _static_order=order)
+    return TaylorModel(
+        coeffs,
+        exponents,
+        remainder,
+        flat_domain,
+        center=center_flat,
+        _static_order=per_var_order,
+        _domain_treedef=treedef,
+        _leaf_shapes=leaf_shapes,
+        _per_leaf_order=per_leaf_order,
+    )
 
 
 def taylor_model_multiarg_identity(
@@ -1212,6 +1445,9 @@ def taylor_model_multiarg_identity(
     per_arg_order: tuple[int, ...],
 ) -> TaylorModel:
     """Create identity Taylor model for multiple arguments with per-argument total degree bounds.
+
+    .. deprecated::
+        Use ``taylor_model_identity(list(arg_domains), order=list(per_arg_order))`` instead.
 
     For a function f(*args), this creates a Taylor model where each argument
     can have arbitrary shape, and the polynomial order is specified as
@@ -1247,68 +1483,8 @@ def taylor_model_multiarg_identity(
             f"length of per_arg_order ({len(per_arg_order)})"
         )
 
-    # Build argument structure
-    arg_shapes = tuple(d.lower.shape for d in arg_domains)
-    arg_structure = ArgumentStructure(arg_shapes)
-
-    # Flatten domains to get flat domain vector
-    flat_lowers = []
-    flat_uppers = []
-    for d in arg_domains:
-        if d.lower.shape == ():
-            flat_lowers.append(d.lower[None])
-            flat_uppers.append(d.upper[None])
-        else:
-            flat_lowers.append(d.lower.reshape(-1))
-            flat_uppers.append(d.upper.reshape(-1))
-
-    flat_lower = jnp.concatenate(flat_lowers)
-    flat_upper = jnp.concatenate(flat_uppers)
-    flat_domain = interval(flat_lower, flat_upper)
-    center_flat = flat_domain.center
-
-    total_dim = arg_structure.total_dim
-
-    # Generate exponents with per-argument total degree bounds
-    exponents = _get_arg_total_degree_exponents(arg_structure, per_arg_order)
-    num_monomials = exponents.shape[1]
-
-    # Build identity coefficients:
-    # - Constant term: center_flat[i] for each output i
-    # - Linear term: 1.0 for variable i in output i
-
-    # Identify constant monomial (all zeros)
-    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
-
-    # Identify linear monomials (unit vectors)
-    eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (total_dim, total_dim)
-    is_linear = jnp.all(exponents[:, None, :] == eye_n[:, :, None], axis=0)  # (total_dim, m)
-
-    # Build coefficients: coeffs[i, j] = center[i] if constant, 1.0 if linear for var i
-    coeffs = (
-        jnp.where(is_constant[None, :], center_flat[:, None], 0.0)
-        + jnp.where(is_linear, 1.0, 0.0)
-    )  # (total_dim, m)
-
-    # Remainder is zero since this is exact
-    remainder = interval(jnp.zeros(total_dim, dtype=center_flat.dtype))
-
-    # Compute per-variable order from per-arg order (for backward compat)
-    per_var_order = []
-    for arg_idx, (size, max_ord) in enumerate(zip(arg_structure.arg_sizes, per_arg_order)):
-        per_var_order.extend([max_ord] * size)
-    per_var_order = tuple(per_var_order)
-
-    return TaylorModel(
-        coeffs,
-        exponents,
-        remainder,
-        flat_domain,
-        center=center_flat,
-        _static_order=per_var_order,
-        _arg_structure=arg_structure,
-        _per_arg_order=per_arg_order,
-    )
+    # Delegate to unified taylor_model_identity
+    return taylor_model_identity(list(arg_domains), order=list(per_arg_order))
 
 
 def taylor_model_from_function(

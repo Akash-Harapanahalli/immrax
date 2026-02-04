@@ -31,14 +31,14 @@ from immrax.inclusion.interval import Interval, interval, icentpert
 from immrax.utils import fact, inv_fact
 from immrax.taylor.taylor_model import (
     TaylorModel,
-    ArgumentStructure,
     taylor_model,
     taylor_model_constant,
     taylor_model_concatenate,
     _generate_exponents,
     _get_canonical_exponents,
-    _get_arg_total_degree_exponents,
-    _check_per_arg_bounds,
+    _get_leaf_total_degree_exponents,
+    _check_per_leaf_bounds,
+    _leaf_slice,
     _merge_taylor_terms,
     _max_order,
     _normalize_order,
@@ -84,6 +84,7 @@ def nattm(
     *,
     fixed_argnums: int | Sequence[int] = None,
     max_order: int | None = None,
+    structured_center: bool = False,
 ) -> Callable[..., TaylorModel]:
     """Creates a Natural Taylor Model Function of f.
 
@@ -106,6 +107,11 @@ def nattm(
         Natural Taylor Model Function of f
     """
 
+    if structured_center :
+        _f = lambda args, **kwargs : f(*args, **kwargs)
+    else :
+        _f = f
+
     # Note: TaylorModel operations are now JIT-compatible (vectorized).
     # However, the jaxpr interpreter itself uses Python control flow,
     # so @jit is not applied here. JIT can be applied to the underlying function f.
@@ -113,12 +119,18 @@ def nattm(
     def wrapped(*args, **kwargs) -> TaylorModel :
         """Natural Taylor Model function."""
         # Get representative values for tracing (use center, a direct pytree leaf)
-        geteval = lambda x: x.center if istaylormodel(x) else jnp.asarray(x)
+        # geteval = lambda x: x.center if istaylormodel(x) else jnp.asarray(x)
+        def geteval(x) :
+            if istaylormodel(x) :
+                return x.structured_center
+            else :
+                return jnp.asarray(x)
+
         buildargs = jax.tree_util.tree_map(geteval, args, is_leaf=istaylormodel)
         buildkwargs = jax.tree_util.tree_map(geteval, kwargs, is_leaf=istaylormodel)
 
         # Build jaxpr via evaluation on representative values
-        closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
+        closed_jaxpr = eqx.filter_make_jaxpr(_f)(*buildargs, **buildkwargs)[0]
 
         # Determine max_order from inputs if not specified
         effective_order = max_order
@@ -393,14 +405,16 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
 
         new_order = _max_order(x._static_order, y._static_order)
 
-        # Preserve arg_structure if present
-        arg_structure = x._arg_structure if x._arg_structure is not None else y._arg_structure
-        per_arg_order = x._per_arg_order if x._per_arg_order is not None else y._per_arg_order
+        # Preserve structured domain info if present
+        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
+        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
 
         result = TaylorModel(
             new_coeffs, new_exponents, new_remainder, x.domain,
             center=x.center, _static_order=new_order,
-            _arg_structure=arg_structure, _per_arg_order=per_arg_order
+            _domain_treedef=domain_treedef, _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order
         )
         # Convert to canonical form for compatibility
         return result.to_canonical(new_order)
@@ -432,7 +446,8 @@ def _tm_add_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order=None) -> 
         result = TaylorModel(
             new_coeffs, new_exponents, new_remainder, x.domain,
             center=x.center, _static_order=x._static_order,
-            _arg_structure=x._arg_structure, _per_arg_order=x._per_arg_order
+            _domain_treedef=x._domain_treedef, _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order
         )
         return result.to_canonical(x._static_order)
 
@@ -471,8 +486,9 @@ def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         x.domain,
         center=x.center,
         _static_order=x._static_order,
-        _arg_structure=x._arg_structure,
-        _per_arg_order=x._per_arg_order,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 tm_inclusion_registry[lax.neg_p] = _tm_neg_p
@@ -481,7 +497,7 @@ TaylorModel.__neg__ = _tm_neg_p
 
 
 def _truncate_product(coeffs, exponents, max_order, shifted_domain,
-                      arg_structure=None, per_arg_order=None):
+                      leaf_shapes=None, per_leaf_order=None):
     """Truncate polynomial product terms above max_order into an interval remainder.
 
     Parameters
@@ -491,13 +507,13 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain,
     exponents : array, shape (d, num_terms)
         Product exponents (sum of parent exponents for each term pair).
     max_order : int or tuple[int, ...]
-        Per-variable maximum polynomial order to retain (used when arg_structure is None).
+        Per-variable maximum polynomial order to retain (used when leaf_shapes is None).
     shifted_domain : Interval, shape (d,)
         The shifted domain (D - center) for bounding monomials.
-    arg_structure : ArgumentStructure, optional
-        If provided, use per-argument total degree bounds instead of per-variable.
-    per_arg_order : tuple[int, ...], optional
-        Per-argument total degree bounds. Required if arg_structure is provided.
+    leaf_shapes : tuple[tuple[int, ...], ...], optional
+        If provided, use per-leaf total degree bounds instead of per-variable.
+    per_leaf_order : tuple[int, ...], optional
+        Per-leaf total degree bounds. Required if leaf_shapes is provided.
 
     Returns
     -------
@@ -507,10 +523,10 @@ def _truncate_product(coeffs, exponents, max_order, shifted_domain,
         Rigorous bound on the contribution of the removed terms.
     """
     # Determine keep mask based on mode
-    if arg_structure is not None and per_arg_order is not None:
-        # Per-argument total degree mode
-        keep_mask = _check_per_arg_bounds(exponents, arg_structure, per_arg_order)
-        static_max = max(per_arg_order) * 2
+    if leaf_shapes is not None and per_leaf_order is not None:
+        # Per-leaf total degree mode
+        keep_mask = _check_per_leaf_bounds(exponents, leaf_shapes, per_leaf_order)
+        static_max = max(per_leaf_order) * 2
     else:
         # Per-variable mode (original behavior)
         if isinstance(max_order, int):
@@ -570,17 +586,15 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
 
         effective_order = max_order if max_order is not None else _max_order(x._static_order, y._static_order)
 
-        # Check for multi-argument mode - both TMs should have same arg_structure
-        arg_structure = x._arg_structure
-        per_arg_order = x._per_arg_order
-        if y._arg_structure is not None:
-            arg_structure = y._arg_structure
-            per_arg_order = y._per_arg_order
+        # Check for structured domain mode - both TMs should have same structure
+        domain_treedef = x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
+        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
+        per_leaf_order = x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
 
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
             all_coeffs, all_exp, effective_order, x.shifted_domain,
-            arg_structure=arg_structure, per_arg_order=per_arg_order
+            leaf_shapes=leaf_shapes, per_leaf_order=per_leaf_order
         )
 
         new_exponents = all_exp
@@ -605,8 +619,9 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             x.domain,
             center=x.center,
             _static_order=effective_order,
-            _arg_structure=arg_structure,
-            _per_arg_order=per_arg_order,
+            _domain_treedef=domain_treedef,
+            _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
 
         return result.to_canonical(effective_order)
@@ -635,8 +650,9 @@ def _tm_mul_p(x: TaylorModel, y: TaylorModel | ArrayLike, *, max_order: int = No
             x.domain,
             center=x.center,
             _static_order=x._static_order,
-            _arg_structure=x._arg_structure,
-            _per_arg_order=x._per_arg_order,
+            _domain_treedef=x._domain_treedef,
+            _leaf_shapes=x._leaf_shapes,
+            _per_leaf_order=x._per_leaf_order,
         )
 
     elif istaylormodel(y):
@@ -778,7 +794,10 @@ def _tm_univariate(
     final_remainder = lagrange_remainder & r_compat
 
     return TaylorModel(result.coeffs, result.exponents, final_remainder,
-                       result.domain, center=result.center, _static_order=per_var_order)
+                       result.domain, center=result.center, _static_order=per_var_order,
+                       _domain_treedef=x._domain_treedef,
+                       _leaf_shapes=x._leaf_shapes,
+                       _per_leaf_order=x._per_leaf_order)
 
 
 # Re-implement TM primitives using _tm_univariate
@@ -936,7 +955,8 @@ def _tm_dot_general_array(arr, tm, dim_nums):
     return TaylorModel(
         new_coeffs, tm.exponents, new_remainder,
         tm.domain, center=tm.center, _static_order=tm._static_order,
-        _arg_structure=tm._arg_structure, _per_arg_order=tm._per_arg_order,
+        _domain_treedef=tm._domain_treedef, _leaf_shapes=tm._leaf_shapes,
+        _per_leaf_order=tm._per_leaf_order,
     )
 
 
@@ -984,8 +1004,9 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
                 new_coeffs, result.exponents, new_remainder,
                 result.domain, center=result.center,
                 _static_order=result._static_order,
-                _arg_structure=result._arg_structure,
-                _per_arg_order=result._per_arg_order,
+                _domain_treedef=result._domain_treedef,
+                _leaf_shapes=result._leaf_shapes,
+                _per_leaf_order=result._per_leaf_order,
             )
         return result
 
@@ -1015,14 +1036,15 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         # Merge monomial pair axes into single axis: (*result_shape, m1*m2)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Check for multi-argument mode
-        arg_structure = A._arg_structure if A._arg_structure is not None else B._arg_structure
-        per_arg_order = A._per_arg_order if A._per_arg_order is not None else B._per_arg_order
+        # Check for structured domain mode
+        domain_treedef = A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
+        leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
+        per_leaf_order = A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
 
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
             result_coeffs, product_exp, effective_order, A.shifted_domain,
-            arg_structure=arg_structure, per_arg_order=per_arg_order
+            leaf_shapes=leaf_shapes, per_leaf_order=per_leaf_order
         )
 
         # Cross terms: p_A · r_B + r_A · p_B + r_A · r_B
@@ -1044,7 +1066,8 @@ def _tm_dot_general_p(A: TaylorModel, B: TaylorModel, *, max_order: int = None, 
         result = TaylorModel(
             new_coeffs, product_exp, new_remainder,
             A.domain, center=A.center, _static_order=effective_order,
-            _arg_structure=arg_structure, _per_arg_order=per_arg_order,
+            _domain_treedef=domain_treedef, _leaf_shapes=leaf_shapes,
+            _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(effective_order)
 
