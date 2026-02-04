@@ -234,10 +234,8 @@ def nattm_jaxpr(
         for shape in leaf_shapes:
             size = math.prod(shape) if shape else 1
             end = start + size
-            if size == 1:
-                sliced_args.append(tm[start])
-            else:
-                sliced_args.append(tm[start:end])
+            # Always use slice to preserve shape (1,) instead of scalar ()
+            sliced_args.append(tm[start:end])
             start = end
         safe_map(write, jaxpr.invars, sliced_args)
     else:

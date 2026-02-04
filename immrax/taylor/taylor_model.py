@@ -63,7 +63,10 @@ def _pytree_to_flattened_array(pytree, is_leaf=_is_interval_or_array_leaf):
         else:
             flat.append(iv.reshape(-1))
 
-    flat_domain = iconcatenate(flat)
+    if isinstance(leaves[0], Interval) :
+        flat_domain = iconcatenate(flat)
+    else :
+        flat_domain = jnp.concatenate(flat)
 
     return treedef, leaf_shapes, flat_domain
 
@@ -551,7 +554,7 @@ class TaylorModel:
         Returns the center reshaped to match the original domain pytree structure.
         """
         return _unflatten_array_to_pytree(
-            self._domain_treedef, self._leaf_shapes, self.center
+            self._domain_treedef, self._leaf_shapes, self.flat_center
         )
 
     def __getitem__(self, idx) -> "TaylorModel":

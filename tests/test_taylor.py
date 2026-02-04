@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from immrax.inclusion import icentpert
+from immrax.inclusion import icentpert, interval
 from immrax.taylor import (
     taylor_model_from_function,
     taylor_model_identity,
@@ -302,3 +302,27 @@ def test_integrate_variable_multidimensional():
     # --- start=None should use center (here 0.0), same as start=0.0 ---
     itm_none = integrate_variable(tm, var_idx=0, start=None, keep_order=False)
     assert jnp.allclose(itm_none.coeffs, itm_full.coeffs, atol=1e-6)
+
+
+# --- Multi-arg ---
+
+def test_multiarg():
+    def f(t,x,w) :
+        # A time decaying oscillator with unknown forcing w
+        return jnp.array([
+            jnp.exp(-t) * x[1],
+            jnp.exp(-t) * (-x[0]) + w[0]
+        ])
+
+    it0 = interval([0.], [1.])
+    itx = icentpert([1., 0.], 0.1)
+    itw = icentpert([0.], 0.05)
+
+    # center for expansion
+    center = [it0.lower, itx.center, itw.center]
+    order = [4, 2, 1]
+
+    tm_joint = taylor_model_identity([it0, itx, itw], center, order)
+
+    tm_f = nattm(f, structured_center=True)(tm_joint)
+    print(tm_f)
