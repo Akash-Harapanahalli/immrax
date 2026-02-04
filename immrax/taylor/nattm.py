@@ -100,6 +100,12 @@ def nattm(
     max_order : int, optional
         Maximum polynomial order to maintain. If None, uses the order of
         the input TaylorModels.
+    structured_center : bool, optional
+        If True, expects a single TaylorModel with structured domain, and
+        the function f receives unpacked arguments matching the domain structure.
+        E.g., if tm was created with domain=[t_iv, x_iv], then f(t, x) receives
+        t and x as separate arguments, but they share the same underlying
+        TaylorModel structure (preserving cross-terms).
 
     Returns
     -------
@@ -107,23 +113,23 @@ def nattm(
         Natural Taylor Model Function of f
     """
 
-    if structured_center :
-        _f = lambda args, **kwargs : f(*args, **kwargs)
-    else :
+    if structured_center:
+        # Wrapper that unpacks the structured args
+        _f = lambda args, **kwargs: f(*args, **kwargs)
+    else:
         _f = f
 
     # Note: TaylorModel operations are now JIT-compatible (vectorized).
     # However, the jaxpr interpreter itself uses Python control flow,
     # so @jit is not applied here. JIT can be applied to the underlying function f.
     @wraps(f)
-    def wrapped(*args, **kwargs) -> TaylorModel :
+    def wrapped(*args, **kwargs) -> TaylorModel:
         """Natural Taylor Model function."""
-        # Get representative values for tracing (use center, a direct pytree leaf)
-        # geteval = lambda x: x.center if istaylormodel(x) else jnp.asarray(x)
-        def geteval(x) :
-            if istaylormodel(x) :
+        # Get representative values for tracing
+        def geteval(x):
+            if istaylormodel(x):
                 return x.structured_center
-            else :
+            else:
                 return jnp.asarray(x)
 
         buildargs = jax.tree_util.tree_map(geteval, args, is_leaf=istaylormodel)
@@ -142,7 +148,18 @@ def nattm(
                 effective_order = 2  # Default order (will be broadcast in constructors)
 
         # Evaluate the jaxpr on the Taylor model arguments
-        out = nattm_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *args, max_order=effective_order)
+        if structured_center:
+            # Pass the single TM and its structure info for invar slicing
+            tm = args[0]
+            out = nattm_jaxpr(
+                closed_jaxpr.jaxpr, closed_jaxpr.literals, tm,
+                max_order=effective_order,
+                structured_invar=True,
+                leaf_shapes=tm._leaf_shapes,
+            )
+        else:
+            out = nattm_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *args, max_order=effective_order)
+
         if len(out) == 1:
             return out[0]
         return out
@@ -150,8 +167,36 @@ def nattm(
     return wrapped
 
 
-def nattm_jaxpr(jaxpr: Jaxpr, consts, *args, max_order: int = 2, propagate_source_info=True) -> list[Any]:
-    """Interpreter for Jaxpr with TaylorModel arguments."""
+def nattm_jaxpr(
+    jaxpr: Jaxpr,
+    consts,
+    *args,
+    max_order: int = 2,
+    propagate_source_info=True,
+    structured_invar: bool = False,
+    leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+) -> list[Any]:
+    """Interpreter for Jaxpr with TaylorModel arguments.
+
+    Parameters
+    ----------
+    jaxpr : Jaxpr
+        The jaxpr to interpret.
+    consts : list
+        Constants for the jaxpr.
+    *args : TaylorModel or Array
+        Input arguments.
+    max_order : int
+        Maximum polynomial order.
+    propagate_source_info : bool
+        Whether to propagate source info for debugging.
+    structured_invar : bool
+        If True, args is a single TaylorModel with structured domain, and
+        jaxpr invars should be mapped to slices of its output based on leaf_shapes.
+    leaf_shapes : tuple, optional
+        Shapes of each leaf in the domain pytree. Required if structured_invar=True.
+    """
+    import math
 
     def read(v: Atom) -> Any:
         return v.val if isinstance(v, Literal) else env[v]
@@ -163,7 +208,24 @@ def nattm_jaxpr(jaxpr: Jaxpr, consts, *args, max_order: int = 2, propagate_sourc
 
     env: dict[Var, Any] = {}
     safe_map(write, jaxpr.constvars, consts)
-    safe_map(write, jaxpr.invars, args)
+
+    if structured_invar and leaf_shapes is not None:
+        # Single TaylorModel with structured domain - slice for each invar
+        tm = args[0]
+        sliced_args = []
+        start = 0
+        for shape in leaf_shapes:
+            size = math.prod(shape) if shape else 1
+            end = start + size
+            if size == 1:
+                sliced_args.append(tm[start])
+            else:
+                sliced_args.append(tm[start:end])
+            start = end
+        safe_map(write, jaxpr.invars, sliced_args)
+    else:
+        safe_map(write, jaxpr.invars, args)
+
     lu = last_used(jaxpr)
 
     for eqn in jaxpr.eqns:
@@ -709,7 +771,9 @@ def _tm_univariate(
         primals = (val,)
         series = ((1.,) + (0.,) * (order - 1),)
         f_val, f_series = jet(prim_func, primals, series)
-        return jnp.array([f_val] + list(f_series))
+        # jet returns raw derivatives [f', f'', f''', ...], need to divide by k! for Taylor coefficients
+        taylor_coeffs = [f_val] + [f_series[k] * inv_fact(k + 1) for k in range(len(f_series))]
+        return jnp.array(taylor_coeffs)
 
     # Vectorize over flattened output dimensions, shape: (n_flat, order + 1)
     coeffs_raw = jax.vmap(get_coeffs)(c_flat)
@@ -748,7 +812,8 @@ def _tm_univariate(
             primals = (v,)
             series = ((1.,) + (0.,) * order,)
             _, f_series = jet(prim_func, primals, series)
-            return f_series[-1] * fact(order + 1)
+            # jet returns raw derivative f^(order+1)(v), not normalized by factorial
+            return f_series[-1]
 
         iv_i = interval(x_hull_flat_lower[i], x_hull_flat_upper[i])
         return natif(deriv_func)(iv_i)
@@ -770,10 +835,19 @@ def _tm_univariate(
         deriv_bound = interval(deriv_bound_flat.lower[0], deriv_bound_flat.upper[0])
 
     # Compute remainder bound
+    # z^(n+1) ranges from 0 (at center) to ±z_mag^(n+1) (at boundaries)
+    # For even n+1: z^(n+1) ∈ [0, z_mag^(n+1)]
+    # For odd n+1: z^(n+1) ∈ [-z_mag^(n+1), z_mag^(n+1)]
     z_bound = z._bound_polynomial() + z.remainder
     z_mag = jnp.maximum(jnp.abs(z_bound.lower), jnp.abs(z_bound.upper))
-    z_pow_bound = z_mag ** (order + 1)
-    rem_term = deriv_bound * (z_pow_bound * inv_fact(order + 1))
+    z_pow_mag = z_mag ** (order + 1)
+    if (order + 1) % 2 == 0:
+        # Even power: always non-negative, ranges from 0 to z_pow_mag
+        z_pow_interval = interval(jnp.zeros_like(z_pow_mag), z_pow_mag)
+    else:
+        # Odd power: can be negative or positive
+        z_pow_interval = interval(-z_pow_mag, z_pow_mag)
+    rem_term = deriv_bound * z_pow_interval * inv_fact(order + 1)
 
     lagrange_remainder = result.remainder + rem_term
 

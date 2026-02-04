@@ -12,14 +12,13 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import jet
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike
 
 import jax.tree_util
 
 from immrax.inclusion import Interval, interval, icentpert, iconcatenate
-from immrax.utils import fact, inv_fact
+from immrax.utils import inv_fact
 
 
 # ---------------------------------------------------------------------------
@@ -70,20 +69,76 @@ def _get_domain_metadata(domain):
     return treedef, leaf_shapes, flat_domain
 
 
-def _get_domain_from_metadata(treedef, leaf_shapes, flat_domain) -> "Interval | PyTree[Interval]":
-    """Reconstruct domain from metadata."""
-    if len(leaf_shapes) == 1:
-        return flat_domain
-    else:
-        # First unpack flat_domain into the leaves
-        leaves = []
-        start = 0
-        for shape in leaf_shapes:
-            size = math.prod(shape) if shape else 1
-            leaves.append(flat_domain[start:start + size].reshape(shape))
-            start += size
+def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
+    """Unflatten a 1D array into a pytree structure matching leaf_shapes.
 
-        return jax.tree_util.tree_unflatten(treedef, leaves)
+    Parameters
+    ----------
+    treedef : jax.tree_util.PyTreeDef
+        Target pytree structure.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf.
+    flat_array : Array
+        Flattened array to unflatten.
+
+    Returns
+    -------
+    PyTree[Array]
+        Array data reshaped into the pytree structure.
+    """
+    if len(leaf_shapes) == 1:
+        shape = leaf_shapes[0]
+        if shape == ():
+            return flat_array[0] if flat_array.ndim > 0 else flat_array
+        return flat_array.reshape(shape)
+
+    leaves = []
+    start = 0
+    for shape in leaf_shapes:
+        size = math.prod(shape) if shape else 1
+        if shape == ():
+            leaves.append(flat_array[start])
+        else:
+            leaves.append(flat_array[start:start + size].reshape(shape))
+        start += size
+
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+def _get_domain_from_metadata(treedef, leaf_shapes, flat_domain) -> "Interval | list | dict":
+    """Reconstruct domain Interval pytree from metadata.
+
+    Parameters
+    ----------
+    treedef : jax.tree_util.PyTreeDef
+        Target pytree structure.
+    leaf_shapes : tuple[tuple[int, ...], ...]
+        Shape of each leaf Interval.
+    flat_domain : Interval
+        Flattened domain interval.
+
+    Returns
+    -------
+    Interval or PyTree[Interval]
+        Domain Intervals reshaped into the pytree structure.
+    """
+    if len(leaf_shapes) == 1:
+        shape = leaf_shapes[0]
+        if shape == ():
+            return flat_domain[0] if flat_domain.shape != () else flat_domain
+        return flat_domain.reshape(shape)
+
+    leaves = []
+    start = 0
+    for shape in leaf_shapes:
+        size = math.prod(shape) if shape else 1
+        if shape == ():
+            leaves.append(flat_domain[start])
+        else:
+            leaves.append(flat_domain[start:start + size].reshape(shape))
+        start += size
+
+    return jax.tree_util.tree_unflatten(treedef, leaves)
 
 
 def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
@@ -597,12 +652,69 @@ class TaylorModel:
         return self._domain_treedef is not None
     
     @property
-    def structured_center(self) -> Array :
-        """Get the center of the domain as a structured pytree."""
-        if not self.is_structured :
+    def structured_center(self):
+        """Get the center of the domain as a structured pytree.
+
+        Returns the center reshaped to match the original domain pytree structure.
+        For non-structured TaylorModels, returns self.center unchanged.
+        """
+        if not self.is_structured:
             return self.center
-        else :
-            return _get_domain_from_metadata(self.domain_treedef, self.leaf_shapes, self.center)
+        else:
+            return _unflatten_array_to_pytree(
+                self._domain_treedef, self._leaf_shapes, self.center
+            )
+
+    def unpack_to_pytree(self) -> "TaylorModel | list | dict":
+        """Unpack a structured TaylorModel into a pytree of sub-TaylorModels.
+
+        For a TaylorModel created from a pytree domain (e.g., list or dict of Intervals),
+        this returns a matching pytree of TaylorModels, where each sub-TM represents
+        the identity over the corresponding leaf interval.
+
+        For non-structured TaylorModels, returns self unchanged.
+
+        Returns
+        -------
+        TaylorModel or PyTree[TaylorModel]
+            If structured: pytree of sub-TaylorModels matching domain structure.
+            If not structured: self.
+        """
+        if not self.is_structured:
+            return self
+
+        # Extract sub-TMs for each leaf
+        sub_tms = []
+        start = 0
+        for leaf_idx, shape in enumerate(self._leaf_shapes):
+            size = math.prod(shape) if shape else 1
+            end = start + size
+
+            # Slice coefficients and remainder for this leaf's outputs
+            if size == 1:
+                sub_coeffs = self.coeffs[start]  # scalar output
+                sub_remainder = self.remainder[start]
+            else:
+                sub_coeffs = self.coeffs[start:end]
+                sub_remainder = self.remainder[start:end]
+
+            # Create sub-TM (shares the full domain but only represents this leaf's outputs)
+            sub_tm = TaylorModel(
+                sub_coeffs,
+                self.exponents,
+                sub_remainder,
+                self.domain,
+                center=self.center,
+                _static_order=self._static_order,
+                _domain_treedef=self._domain_treedef,
+                _leaf_shapes=self._leaf_shapes,
+                _per_leaf_order=self._per_leaf_order,
+            )
+            sub_tms.append(sub_tm)
+            start = end
+
+        # Reconstruct the pytree structure
+        return jax.tree_util.tree_unflatten(self._domain_treedef, sub_tms)
             
 
     def __getitem__(self, idx) -> "TaylorModel":
@@ -695,9 +807,10 @@ class TaylorModel:
         # Shift to centered coordinates (x - center)
         x_centered = x - self.center
 
-        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i] / fact(exponents[j, i])
+        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
         # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
-        monomials = jnp.prod(x_centered[:, None] ** self.exponents * inv_fact(self.exponents), axis=0)  # (m,)
+        # Note: No factorial division here - coefficients already store D^α f(c) / α!
+        monomials = jnp.prod(x_centered[:, None] ** self.exponents, axis=0)  # (m,)
 
         # Sum coeffs * monomials along the last (monomial) axis
         # coeffs has shape (*output_shape, m), monomials has shape (m,)
@@ -1631,8 +1744,8 @@ def taylor_model_from_function(
     # current_bound is now (n,)
 
     # Divide by (n+1)!
-    fact = jax.scipy.special.gamma(next_order + 1)
-    remainder_bound = current_bound / fact
+    factorial = jax.scipy.special.gamma(next_order + 1)
+    remainder_bound = current_bound / factorial
 
     # Ensure non-zero for safety if needed, though 0 is valid for exact polynomials
     remainder = icentpert(jnp.zeros(n, dtype=f_center.dtype), remainder_bound)
