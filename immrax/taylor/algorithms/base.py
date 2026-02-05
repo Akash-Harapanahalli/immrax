@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax.tree_util import register_pytree_node_class 
+from jax.tree_util import register_pytree_node_class
+from abc import ABC, abstractmethod
 
 from immrax.inclusion import Interval, interval
+from immrax.system import System
 from immrax.utils import inv_fact
+from .. import TaylorModel
+
+from typing import Tuple
+
 
 @register_pytree_node_class
 class TMFlowpipe:
-    """Result of validated ODE integration with TaylorModel flowpipe.
+    """Result of validated ODE integration.
 
-    Stores a list of times and a corresponding list of TaylorModels.
+    Each TaylorModel in the flowpipe has domain variables (t, x),
+    where t\in [t_i, t_{i+1}] is expanded around t_i and
+    x is expanded around the nominal polynomial approximation of the solution.
 
     Attributes
     ----------
@@ -34,68 +42,102 @@ class TMFlowpipe:
         self.success = success
 
     def tree_flatten(self):
-        return (self.tms,), {"times": self.times, "nsteps": self.nsteps,
-                             "success": self.success}
+        return (self.tms,), {
+            "times": self.times,
+            "nsteps": self.nsteps,
+            "success": self.success,
+        }
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         (tms,) = children
         return cls(aux["times"], tms, aux["nsteps"], aux["success"])
 
-    @property
-    def flowpipe(self):
-        """Return the list of TaylorModels."""
-        return self.tms
 
-    @property
-    def flowpipe_intervals(self):
-        """Return list of Interval objects (interval hulls of each TM)."""
-        return [tm.interval_hull() for tm in self.tms]
+class TMFlowpipeGenerator(ABC):
+    """Abstract base class for TaylorModel flowpipe generators.
 
+    These collections of algorithms generically use the following steps to generate a validated flowpipe:
 
-def _step_size(derivs: list, abstol, order: int):
-    """Compute step size from Taylor coefficient norms.
-
-    Uses the last two coefficients (orders ``p-1`` and ``p``) following
-    the standard TaylorIntegration heuristic::
-
-        h = min_k (abstol / ||x_k / k!||_∞)^{1/k}
+    1. Take in an initial TaylorModel (usually identity), a largest dt, and an interval [t_0, t_f]
+    2. The taylor expansion of the solution is computed in (t,x) around (t_i,x_i) using either:
+        a. Lie derivatives of the system vector field
+        b. Iterated Picard iteration
+    3. Verify the contraction of a Picard operator. If not contractive either:
+        a. Increase the remainder portion of the TaylorModel
+        b. Reduce the step size dt
     """
-    h = jnp.inf
-    for k in [order - 1, order]:
-        if 0 < k:
-            coeff_norm = jnp.max(jnp.abs(derivs[k])) * inv_fact(k)
-            hk = jnp.where(coeff_norm > 0,
-                           (abstol / coeff_norm) ** (1.0 / k),
-                           jnp.inf)
-            h = jnp.minimum(h, hk)
-    return h
 
+    sys: System
+    order: Tuple[int, ...]
 
-def _eval_taylor(derivs: list, h, order: int):
-    """Evaluate ``Σ x^(k) h^k / k!`` via Horner's method (array output)."""
-    result = derivs[order] * inv_fact(order)
-    for k in range(order - 1, -1, -1):
-        result = derivs[k] * inv_fact(k) + h * result
-    return result
+    def __init__(self, sys: System, order: Tuple[int, ...]):
+        self.sys = sys
+        self.order = order
 
+    @abstractmethod
+    def _step(self, tmi, dt_max, **kwargs) -> Tuple[TaylorModel, float, bool]:
+        """Take one validated step.
 
-def _eval_taylor_interval(derivs: list, h_iv: Interval, order: int) -> Interval:
-    """Evaluate the Taylor polynomial with an *interval* time step.
+        Parameters
+        ----------
+        tmi : TaylorModel
+            TaylorModel at the start of the step.
+        dt_max : float
+            Maximum allowed step size.
 
-    ``derivs`` are plain arrays (evaluated at the centre); ``h_iv`` is an
-    interval (typically ``[0, h]``).
-    """
-    result = interval(derivs[order] * inv_fact(order))
-    for k in range(order - 1, -1, -1):
-        coeff = interval(derivs[k] * inv_fact(k))
-        result = coeff + h_iv * result
-    return result
+        Returns
+        -------
+        tmf : TaylorModel
+            TaylorModel at the end of the step.
+        dt : float
+            Actual step size taken.
+        success : bool
+            ``True`` if the step was validated.
+        """
 
-def _is_contractive(delta: Interval, delta_x: Interval):
-    """Check ``delta ⊂ int(delta_x)`` component-wise."""
-    strict = (jnp.all(delta.lower > delta_x.lower) &
-              jnp.all(delta.upper < delta_x.upper))
-    both_zero = (jnp.all(delta.lower == 0) & jnp.all(delta.upper == 0) &
-                 jnp.all(delta_x.lower == 0) & jnp.all(delta_x.upper == 0))
-    return strict | both_zero
+    def generate_flowpipe(self, t0, tf, tm0, dt_max, *, max_steps=4096, **kwargs):
+        """Generate a validated flowpipe for the given system.
+
+        Parameters
+        ----------
+        t0 : float
+            Initial time.
+        tf : float
+            Final time.
+        tm0 : TaylorModel
+            Initial TaylorModel.
+        dt_max : float
+            Maximum allowed step size.
+        max_steps : int, optional
+            Maximum number of steps, by default 4096.
+        **kwargs
+            Keyword arguments to pass to the step function.
+
+        Returns
+        -------
+        TMFlowpipe
+            Validated flowpipe.
+        """
+
+        # Use jax.lax.scan to iterate through steps, noop when t_f is reached or success is False
+
+        def scan_fn(carry, _):
+            tmi, ti, success, steps_taken = carry
+
+            noop_cond = jnp.logical_and(success, ti < tf)
+
+            def noop():
+                return (tmi, ti, success, steps_taken), (tmi, jnp.nan)
+
+            def take_step():
+                tmf, dt, success = self._step(tmi, dt_max, **kwargs)
+                return (tmf, ti + dt, success, steps_taken + 1), (tmf, ti + dt)
+
+            return jax.lax.cond(noop_cond, take_step, noop)
+
+        (final_tm, final_t, final_success, final_steps), (tms, times) = jax.lax.scan(
+            scan_fn, (tm0, t0, True, 0), jnp.arange(max_steps)
+        )
+
+        return TMFlowpipe(times, tms, final_steps, final_success)

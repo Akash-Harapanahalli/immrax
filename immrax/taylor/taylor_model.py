@@ -63,9 +63,9 @@ def _pytree_to_flattened_array(pytree, is_leaf=_is_interval_or_array_leaf):
         else:
             flat.append(iv.reshape(-1))
 
-    if isinstance(leaves[0], Interval) :
+    if isinstance(leaves[0], Interval):
         flat_domain = iconcatenate(flat)
-    else :
+    else:
         flat_domain = jnp.concatenate(flat)
 
     return treedef, leaf_shapes, flat_domain
@@ -1580,7 +1580,45 @@ def taylor_model_from_function(
     )
 
 
-def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorModel:
+def _resolve_var_idx(
+    var_idx: int | None,
+    leaf_idx: int | None,
+    leaf_var_idx: tuple[int, ...] | int | None,
+    leaf_shapes: list[tuple[int, ...]],
+) -> int:
+    """Resolve a flat variable index from leaf indices."""
+    if var_idx is not None:
+        return var_idx
+
+    if leaf_idx is None or leaf_var_idx is None:
+        raise ValueError(
+            "Either var_idx or both leaf_idx and leaf_var_idx must be provided"
+        )
+
+    if leaf_idx >= len(leaf_shapes):
+        raise ValueError(
+            f"leaf_idx={leaf_idx} out of range for {len(leaf_shapes)} leaves"
+        )
+
+    var_idx = 0
+    for i, shape in enumerate(leaf_shapes[: leaf_idx - 1]):
+        var_idx += math.prod(shape)
+
+    if isinstance(leaf_var_idx, int):
+        return var_idx + leaf_var_idx
+    else:
+        # Convert tuple to flat index wrt the leaf shape - does validation
+        return var_idx + jnp.ravel_multi_index(leaf_var_idx, leaf_shapes[leaf_idx])
+
+
+def tm_evaluate_at_variable(
+    tm: TaylorModel,
+    var_idx: int | None = None,
+    value: float | None = None,
+    *,
+    leaf_idx: int | None = None,
+    leaf_var_idx: int | None = None,
+) -> TaylorModel:
     """Partially evaluate a TaylorModel at a fixed value for one domain variable.
 
     Given a TM with domain (z_0, ..., z_{d-1}), substitutes z_{var_idx} = value
@@ -1715,7 +1753,7 @@ def evaluate_at_variable(tm: TaylorModel, var_idx: int, value: float) -> TaylorM
     )
 
 
-def integrate_variable(
+def tm_integrate_variable(
     tm: TaylorModel,
     var_idx: int | None = None,
     start: float | None = None,
@@ -1791,42 +1829,9 @@ def integrate_variable(
     >>> tm_result = integrate_variable(tm, leaf_idx=0, leaf_var_idx=0)  # integrate over t
     >>> tm_result = integrate_variable(tm, leaf_idx=1, leaf_var_idx=1)  # integrate over x[1]
     """
-    d = tm.d
-
-    # --- Resolve var_idx from leaf_idx/leaf_var_idx if provided ---
-    if leaf_idx is not None or leaf_var_idx is not None:
-        if leaf_idx is None or leaf_var_idx is None:
-            raise ValueError("Both leaf_idx and leaf_var_idx must be provided together")
-        if var_idx is not None:
-            raise ValueError("Cannot specify both var_idx and leaf_idx/leaf_var_idx")
-        if not tm.is_structured:  # TODO: remove this check
-            raise ValueError(
-                "leaf_idx/leaf_var_idx can only be used with structured domains"
-            )
-
-        leaf_shapes = tm._leaf_shapes
-        num_leaves = len(leaf_shapes)
-        if leaf_idx < 0 or leaf_idx >= num_leaves:
-            raise ValueError(
-                f"leaf_idx={leaf_idx} out of range for {num_leaves} leaves"
-            )
-
-        leaf_size = math.prod(leaf_shapes[leaf_idx]) if leaf_shapes[leaf_idx] else 1
-        if leaf_var_idx < 0 or leaf_var_idx >= leaf_size:
-            raise ValueError(
-                f"leaf_var_idx={leaf_var_idx} out of range for leaf with size {leaf_size}"
-            )
-
-        # Compute flat var_idx from leaf_idx and leaf_var_idx
-        slc = _leaf_slice(leaf_shapes, leaf_idx)
-        var_idx = slc.start + leaf_var_idx
-    elif var_idx is None:
-        raise ValueError(
-            "Either var_idx or both leaf_idx and leaf_var_idx must be provided"
-        )
-
-    if var_idx < 0 or var_idx >= d:
-        raise ValueError(f"var_idx={var_idx} out of range for d={d}")
+    var_idx = _resolve_var_idx(
+        var_idx, leaf_idx, leaf_var_idx, tm.domain_treedef, tm.leaf_shapes
+    )
 
     if start is None:
         start = tm.center[var_idx]
