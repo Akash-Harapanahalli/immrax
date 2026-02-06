@@ -58,10 +58,23 @@ def istaylorpolynomial(x) -> bool:
 
 
 def _tp_constant(
-    value: jax.Array, d: int, order: int, domain_center: jax.Array
+    value: jax.Array,
+    d: int,
+    order: "int | tuple[int, ...]",
+    flat_center: jax.Array,
+    _domain_treedef: jax.tree_util.PyTreeDef,
+    _leaf_shapes: tuple[tuple[int, ...], ...],
+    _per_leaf_order: tuple[int, ...],
 ) -> TaylorPolynomial:
+
     output_shape = value.shape
-    exponents = _get_canonical_exponents(d, order)
+    # If order is a tuple (per-leaf), normalize for canonical exponents call
+    # Note: _get_canonical_exponents takes D and order.
+    # If using structured domains, order here is likely _per_leaf_order,
+    # so we should use _get_leaf_total_degree_exponents instead.
+
+    exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order)
+
     num_monomials = exponents.shape[1]
 
     if len(output_shape) == 0:
@@ -73,14 +86,29 @@ def _tp_constant(
         const_idx = jnp.argmin(jnp.sum(exponents, axis=0))
         coeffs = coeffs.at[..., const_idx].set(value)
 
-    return TaylorPolynomial(coeffs, exponents, domain_center, _static_order=order)
+    return TaylorPolynomial(
+        coeffs,
+        exponents,
+        flat_center,
+        _domain_treedef=_domain_treedef,
+        _leaf_shapes=_leaf_shapes,
+        _per_leaf_order=_per_leaf_order,
+    )
 
 
 def _tp_from_array(
-    arr: jax.Array, d: int, order: int, domain_center: jax.Array
+    arr: jax.Array,
+    d: int,
+    order: "int | tuple[int, ...]",
+    flat_center: jax.Array,
+    _domain_treedef: jax.tree_util.PyTreeDef,
+    _leaf_shapes: tuple[tuple[int, ...], ...],
+    _per_leaf_order: tuple[int, ...],
 ) -> TaylorPolynomial:
     """Wrap a plain array as a constant TaylorPolynomial."""
-    return _tp_constant(arr, d, order, domain_center)
+    return _tp_constant(
+        arr, d, order, flat_center, _domain_treedef, _leaf_shapes, _per_leaf_order
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +120,7 @@ def nattp(
     f: Callable[..., jax.Array],
     *,
     max_order: int | None = None,
+    structured_center: bool = False,
 ) -> Callable[..., TaylorPolynomial]:
     """Creates a Natural Taylor Polynomial Function of *f*.
 
@@ -110,33 +139,59 @@ def nattp(
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorPolynomial:
         geteval = lambda x: (
-            x.evaluate(x.domain_center) if istaylorpolynomial(x) else jnp.asarray(x)
+            x.evaluate(x.flat_center) if istaylorpolynomial(x) else jnp.asarray(x)
         )
         buildargs = jax.tree_util.tree_map(geteval, args, is_leaf=istaylorpolynomial)
         buildkwargs = jax.tree_util.tree_map(
             geteval, kwargs, is_leaf=istaylorpolynomial
         )
 
-        closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
+        # closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
+        # Moved inside logic below to handle structured unpacking
 
         effective_order = max_order
         if effective_order is None:
             for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial):
                 if istaylorpolynomial(arg):
                     effective_order = (
-                        arg._static_order
+                        arg.max_order
                         if effective_order is None
-                        else _max_order(effective_order, arg._static_order)
+                        else max(effective_order, arg.max_order)
                     )
+
             if effective_order is None:
                 effective_order = 2
 
-        out = nattp_jaxpr(
-            closed_jaxpr.jaxpr,
-            closed_jaxpr.literals,
-            *args,
-            max_order=effective_order,
-        )
+        if structured_center:
+            # Pass the single TP and its structure info for invar slicing
+            tp = args[0]
+
+            # Trace with the Unpacked center structure to match f's signature
+            # If center is a tuple/list, we assume it corresponds to *args
+            center_struct = tp.center
+            if isinstance(center_struct, (tuple, list)):
+                trace_args = center_struct
+            else:
+                trace_args = (center_struct,)
+
+            closed_jaxpr = eqx.filter_make_jaxpr(f)(*trace_args, **buildkwargs)[0]
+
+            out = nattp_jaxpr(
+                closed_jaxpr.jaxpr,
+                closed_jaxpr.literals,
+                tp,
+                max_order=effective_order,
+                structured_invar=True,
+                leaf_shapes=tp.leaf_shapes,
+            )
+        else:
+            closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
+            out = nattp_jaxpr(
+                closed_jaxpr.jaxpr,
+                closed_jaxpr.literals,
+                *args,
+                max_order=effective_order,
+            )
         if len(out) == 1:
             return out[0]
         return out
@@ -150,6 +205,8 @@ def nattp_jaxpr(
     *args,
     max_order: int = 2,
     propagate_source_info: bool = True,
+    structured_invar: bool = False,
+    leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
 ) -> list[Any]:
     """Interpreter for Jaxpr with TaylorPolynomial arguments."""
 
@@ -163,7 +220,23 @@ def nattp_jaxpr(
 
     env: dict[Var, Any] = {}
     safe_map(write, jaxpr.constvars, consts)
-    safe_map(write, jaxpr.invars, args)
+
+    if structured_invar and leaf_shapes is not None:
+        import math
+
+        # Single TaylorPolynomial with structured domain - slice for each invar
+        tp = args[0]
+        sliced_args = []
+        start = 0
+        for shape in leaf_shapes:
+            size = math.prod(shape) if shape else 1
+            end = start + size
+            # Always use slice to preserve shape (1,) instead of scalar ()
+            sliced_args.append(tp[start:end])
+            start = end
+        safe_map(write, jaxpr.invars, sliced_args)
+    else:
+        safe_map(write, jaxpr.invars, args)
     lu = last_used(jaxpr)
 
     for eqn in jaxpr.eqns:
@@ -227,7 +300,15 @@ def _make_tp_passthrough(primitive: Primitive):
 
         args_const = [a.constant_term if istaylorpolynomial(a) else a for a in args]
         result_const = primitive.bind(*args_const, **kwargs)
-        return _tp_from_array(result_const, ref.d, ref._static_order, ref.domain_center)
+        return _tp_from_array(
+            result_const,
+            ref.d,
+            ref.max_order,
+            ref.flat_center,
+            ref._domain_treedef,
+            ref._leaf_shapes,
+            ref._per_leaf_order,
+        )
 
     tp_inclusion_registry[primitive] = _handler
 
@@ -254,7 +335,12 @@ def _tp_reshape_p(x, *, new_sizes, dimensions=None):
     else:
         new_coeffs = x.coeffs.reshape(*coeff_new_sizes)
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -271,7 +357,12 @@ def _tp_transpose_p(x, *, permutation):
     coeff_permutation = (*permutation, ndim_out)
     new_coeffs = lax.transpose(x.coeffs, permutation=coeff_permutation)
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -286,7 +377,12 @@ def _tp_squeeze_p(x, *, dimensions):
         return lax.squeeze_p.bind(x, dimensions=dimensions)
     new_coeffs = lax.squeeze(x.coeffs, dimensions=dimensions)
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -308,7 +404,12 @@ def _tp_broadcast_in_dim_p(x, *, shape, broadcast_dimensions, sharding=None):
         x.coeffs, shape=coeff_shape, broadcast_dimensions=coeff_broadcast_dims
     )
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -334,7 +435,12 @@ def _tp_slice_p(x, *, start_indices, limit_indices, strides=None):
         strides=coeff_strides,
     )
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -347,14 +453,25 @@ tp_inclusion_registry[lax.slice_p] = _tp_slice_p
 def _tp_dynamic_slice_p(x, *start_indices, slice_sizes):
     if not istaylorpolynomial(x):
         return lax.dynamic_slice_p.bind(x, *start_indices, slice_sizes=slice_sizes)
+    # The original code had a bug here, assuming start_indices[0] and slice_sizes[0]
+    # for all dimensions. This is incorrect for multi-dimensional slices.
+    # The correct way is to extend start_indices and slice_sizes with the monomial dimension.
+    m = x.num_monomials
+    extended_start_indices = (*start_indices, 0)
+    extended_slice_sizes = (*slice_sizes, m)
+
     new_coeffs = lax.dynamic_slice_p.bind(
         x.coeffs,
-        start_indices[0],
-        0,
-        slice_sizes=(slice_sizes[0], x.coeffs.shape[1]),
+        *extended_start_indices,
+        slice_sizes=extended_slice_sizes,
     )
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -373,17 +490,28 @@ def _tp_concatenate_p(*args, dimension):
     tp_args = []
     for a in args:
         if istaylorpolynomial(a):
-            tp_args.append(a.to_canonical(ref._static_order))
+            tp_args.append(a.to_canonical(ref._per_leaf_order))
         else:
             tp_args.append(
                 _tp_from_array(
-                    jnp.asarray(a), ref.d, ref._static_order, ref.domain_center
+                    jnp.asarray(a),
+                    ref.d,
+                    ref.max_order,
+                    ref.flat_center,
+                    ref._domain_treedef,
+                    ref._leaf_shapes,
+                    ref._per_leaf_order,
                 )
             )
 
     coeffs = jnp.concatenate([t.coeffs for t in tp_args], axis=dimension)
     return TaylorPolynomial(
-        coeffs, tp_args[0].exponents, ref.domain_center, _static_order=ref._static_order
+        coeffs,
+        tp_args[0].exponents,
+        ref.flat_center,
+        _domain_treedef=ref._domain_treedef,
+        _leaf_shapes=ref._leaf_shapes,
+        _per_leaf_order=ref._per_leaf_order,
     )
 
 
@@ -401,10 +529,9 @@ def _tp_pjit_p(*args, **bind_params):
     for a in args:
         if istaylorpolynomial(a):
             eff_order = (
-                a._static_order
-                if eff_order is None
-                else _max_order(eff_order, a._static_order)
+                a.max_order if eff_order is None else max(eff_order, a.max_order)
             )
+
     if eff_order is None:
         eff_order = 2
     return nattp_jaxpr(bind_jaxpr, [], *args, max_order=eff_order)
@@ -428,7 +555,9 @@ def _tp_add_p(x, y):
         new_coeffs, new_exp = _merge_taylor_terms(
             x_coeffs, x.exponents, y_coeffs, y.exponents
         )
-        new_order = _max_order(x._static_order, y._static_order)
+
+        # For addition, we can just use the per-leaf order from one of the operands
+        # (assuming they are compatible/same structure)
 
         # Preserve structured domain info if present
         domain_treedef = (
@@ -439,16 +568,19 @@ def _tp_add_p(x, y):
             x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
         )
 
+        # Normalize order to match (should be same, but just in case take element-wise max)
+        if x._per_leaf_order is not None and y._per_leaf_order is not None:
+            per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
+
         result = TaylorPolynomial(
             new_coeffs,
             new_exp,
-            x.domain_center,
-            _static_order=new_order,
+            x.flat_center,
             _domain_treedef=domain_treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
         )
-        return result.to_canonical(new_order)
+        return result.to_canonical(per_leaf_order)
 
     elif istaylorpolynomial(x):
         val = jnp.asarray(y)
@@ -463,13 +595,12 @@ def _tp_add_p(x, y):
         result = TaylorPolynomial(
             new_coeffs,
             new_exp,
-            x.domain_center,
-            _static_order=x._static_order,
+            x.flat_center,
             _domain_treedef=x._domain_treedef,
             _leaf_shapes=x._leaf_shapes,
             _per_leaf_order=x._per_leaf_order,
         )
-        return result.to_canonical(x._static_order)
+        return result.to_canonical(x._per_leaf_order)
 
     elif istaylorpolynomial(y):
         return _tp_add_p(y, x)
@@ -489,8 +620,7 @@ def _tp_neg_p(x):
     return TaylorPolynomial(
         -x.coeffs,
         x.exponents,
-        x.domain_center,
-        _static_order=x._static_order,
+        x.flat_center,
         _domain_treedef=x._domain_treedef,
         _leaf_shapes=x._leaf_shapes,
         _per_leaf_order=x._per_leaf_order,
@@ -533,13 +663,7 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         coeff2 = y_coeffs[..., None, :]
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
-        effective_order = (
-            max_order
-            if max_order is not None
-            else _max_order(x._static_order, y._static_order)
-        )
-
-        # Check for structured domain mode
+        # Structured domain support
         domain_treedef = (
             x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
         )
@@ -548,31 +672,30 @@ def _tp_mul_p(x, y, *, max_order: int = None):
             x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
         )
 
-        # Discard HOT (no remainder) using appropriate mode
+        # Per-leaf total degree mode
         if leaf_shapes is not None and per_leaf_order is not None:
-            # Per-leaf total degree mode
+            # If orders differ, take max
+            if x._per_leaf_order is not None and y._per_leaf_order is not None:
+                per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
+
             keep_mask = _check_per_leaf_bounds(all_exp, leaf_shapes, per_leaf_order)
         else:
-            # Per-variable mode
-            if isinstance(effective_order, int):
-                eff_tuple = tuple([effective_order] * d)
-            else:
-                eff_tuple = tuple(effective_order)
-            target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
-            keep_mask = jnp.all(all_exp <= target_arr, axis=0)
+            # Fallback if no structured info (shouldn't happen with mandatory constraint)
+            raise ValueError(
+                "Structured metadata missing in TaylorPolynomial multiplication"
+            )
 
         kept_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
 
         result = TaylorPolynomial(
             kept_coeffs,
             all_exp,
-            x.domain_center,
-            _static_order=effective_order,
+            x.flat_center,
             _domain_treedef=domain_treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
         )
-        return result.to_canonical(effective_order)
+        return result.to_canonical(per_leaf_order)
 
     elif istaylorpolynomial(x):
         alpha = jnp.asarray(y)
@@ -583,8 +706,7 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         return TaylorPolynomial(
             new_coeffs,
             x.exponents,
-            x.domain_center,
-            _static_order=x._static_order,
+            x.flat_center,
             _domain_treedef=x._domain_treedef,
             _leaf_shapes=x._leaf_shapes,
             _per_leaf_order=x._per_leaf_order,
@@ -605,10 +727,21 @@ TaylorPolynomial.__rmul__ = _tp_mul_p
 def _tp_integer_pow_p(x, y: int, *, max_order: int = None):
     if not istaylorpolynomial(x):
         return lax.integer_pow(x, y)
-    order = max_order if max_order is not None else x._static_order
+
+    order = max_order if max_order is not None else x.max_order
+
+    # NOTE: If y=0, we need to return a constant TP.
+    # We must use x's structure.
+
     if y == 0:
         return _tp_constant(
-            jnp.ones(x._output_shape, dtype=x.dtype), x.d, order, x.domain_center
+            jnp.ones(x._output_shape, dtype=x.dtype),
+            x.d,
+            x._per_leaf_order,  # Pass tuple order
+            x.flat_center,
+            x._domain_treedef,
+            x._leaf_shapes,
+            x._per_leaf_order,
         )
     if y < 0:
         raise ValueError(
@@ -644,8 +777,7 @@ def _tp_dot_general_array(arr, tp, dim_nums):
     return TaylorPolynomial(
         new_coeffs,
         tp.exponents,
-        tp.domain_center,
-        _static_order=tp._static_order,
+        tp.flat_center,
         _domain_treedef=tp._domain_treedef,
         _leaf_shapes=tp._leaf_shapes,
         _per_leaf_order=tp._per_leaf_order,
@@ -679,8 +811,7 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
             return TaylorPolynomial(
                 new_coeffs,
                 result.exponents,
-                result.domain_center,
-                _static_order=result._static_order,
+                result.flat_center,
                 _domain_treedef=result._domain_treedef,
                 _leaf_shapes=result._leaf_shapes,
                 _per_leaf_order=result._per_leaf_order,
@@ -691,11 +822,18 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         if A.d != B.d:
             raise ValueError(f"Domain dimensions must match: {A.d} vs {B.d}")
 
-        effective_order = (
-            max_order
-            if max_order is not None
-            else _max_order(A._static_order, B._static_order)
+        # Check for structured domain mode
+        domain_treedef = (
+            A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
         )
+        leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
+        per_leaf_order = (
+            A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
+        )
+
+        if A._per_leaf_order is not None and B._per_leaf_order is not None:
+            per_leaf_order = _max_order(A._per_leaf_order, B._per_leaf_order)
+
         d = A.d
         m1 = A.num_monomials
         m2 = B.num_monomials
@@ -713,38 +851,25 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Check for structured domain mode
-        domain_treedef = (
-            A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
-        )
-        leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
-        per_leaf_order = (
-            A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
-        )
-
         # Discard HOT using appropriate mode
         if leaf_shapes is not None and per_leaf_order is not None:
             keep_mask = _check_per_leaf_bounds(product_exp, leaf_shapes, per_leaf_order)
         else:
-            if isinstance(effective_order, int):
-                eff_tuple = tuple([effective_order] * d)
-            else:
-                eff_tuple = tuple(effective_order)
-            target_arr = jnp.array(eff_tuple, dtype=jnp.int32)[:, None]
-            keep_mask = jnp.all(product_exp <= target_arr, axis=0)
+            raise ValueError(
+                "Structured metadata missing in TaylorPolynomial dot_general"
+            )
 
         kept_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
         result = TaylorPolynomial(
             kept_coeffs,
             product_exp,
-            A.domain_center,
-            _static_order=effective_order,
+            A.flat_center,
             _domain_treedef=domain_treedef,
             _leaf_shapes=leaf_shapes,
             _per_leaf_order=per_leaf_order,
         )
-        return result.to_canonical(effective_order)
+        return result.to_canonical(per_leaf_order)
 
     return lax.dot_general_p.bind(A, B, **kwargs)
 
@@ -766,7 +891,12 @@ def _tp_reduce_sum_p(x, *, axes):
         return lax.reduce_sum_p.bind(x, axes=axes)
     new_coeffs = jnp.sum(x.coeffs, axis=axes)
     return TaylorPolynomial(
-        new_coeffs, x.exponents, x.domain_center, _static_order=x._static_order
+        new_coeffs,
+        x.exponents,
+        x.flat_center,
+        _domain_treedef=x._domain_treedef,
+        _leaf_shapes=x._leaf_shapes,
+        _per_leaf_order=x._per_leaf_order,
     )
 
 
@@ -777,9 +907,17 @@ def _tp_reduce_max_p(x, *, axes):
     if not istaylorpolynomial(x):
         return lax.reduce_max_p.bind(x, axes=axes)
     # Max is not polynomial-preserving; fall back to constant from evaluation at center
-    val = x.evaluate(x.domain_center)
+    val = x.evaluate(x.flat_center)
     result = jnp.max(val, axis=axes)
-    return _tp_constant(result, x.d, x._static_order, x.domain_center)
+    return _tp_constant(
+        result,
+        x.d,
+        x._per_leaf_order,
+        x.flat_center,
+        x._domain_treedef,
+        x._leaf_shapes,
+        x._per_leaf_order,
+    )
 
 
 tp_inclusion_registry[lax.reduce_max_p] = _tp_reduce_max_p
@@ -788,9 +926,17 @@ tp_inclusion_registry[lax.reduce_max_p] = _tp_reduce_max_p
 def _tp_reduce_min_p(x, *, axes):
     if not istaylorpolynomial(x):
         return lax.reduce_min_p.bind(x, axes=axes)
-    val = x.evaluate(x.domain_center)
+    val = x.evaluate(x.flat_center)
     result = jnp.min(val, axis=axes)
-    return _tp_constant(result, x.d, x._static_order, x.domain_center)
+    return _tp_constant(
+        result,
+        x.d,
+        x._per_leaf_order,
+        x.flat_center,
+        x._domain_treedef,
+        x._leaf_shapes,
+        x._per_leaf_order,
+    )
 
 
 tp_inclusion_registry[lax.reduce_min_p] = _tp_reduce_min_p
@@ -828,7 +974,7 @@ def _tp_univariate(
     if not istaylorpolynomial(x):
         return primitive_p.bind(x)
 
-    per_var_order = max_order if max_order is not None else x._static_order
+    per_var_order = max_order if max_order is not None else x.max_order
     # For univariate composition, use max of per-variable orders as expansion depth
     if isinstance(per_var_order, tuple):
         order = max(per_var_order)
@@ -862,7 +1008,15 @@ def _tp_univariate(
     z = x - c
 
     def horner_step(carry, coeff):
-        term = _tp_constant(coeff, x.d, per_var_order, x.domain_center)
+        term = _tp_constant(
+            coeff,
+            x.d,
+            per_var_order,
+            x.flat_center,
+            x._domain_treedef,
+            x._leaf_shapes,
+            x._per_leaf_order,
+        )
         return _tp_mul_p(carry, z, max_order=per_var_order) + term, None
 
     if output_shape:
@@ -872,7 +1026,15 @@ def _tp_univariate(
         init_coeff = coeffs_raw_shaped[order]
         scan_coeffs = coeffs_raw_shaped[:order][::-1]
 
-    init = _tp_constant(init_coeff, x.d, per_var_order, x.domain_center)
+    init = _tp_constant(
+        init_coeff,
+        x.d,
+        per_var_order,
+        x.flat_center,
+        x._domain_treedef,
+        x._leaf_shapes,
+        x._per_leaf_order,
+    )
     result, _ = lax.scan(horner_step, init, scan_coeffs)
 
     return result
@@ -898,8 +1060,16 @@ def _tp_abs_p(x):
     if not istaylorpolynomial(x):
         return jnp.abs(x)
     # abs is not smooth at 0; just evaluate at center as a constant
-    val = jnp.abs(x.evaluate(x.domain_center))
-    return _tp_constant(val, x.d, x._static_order, x.domain_center)
+    val = jnp.abs(x.evaluate(x.flat_center))
+    return _tp_constant(
+        val,
+        x.d,
+        x._per_leaf_order,
+        x.flat_center,
+        x._domain_treedef,
+        x._leaf_shapes,
+        x._per_leaf_order,
+    )
 
 
 tp_inclusion_registry[lax.abs_p] = _tp_abs_p
@@ -932,11 +1102,9 @@ def _tp_pow_p(x, y, *, max_order=None):
     if order is None:
         order = None
         if istaylorpolynomial(x):
-            order = x._static_order
+            order = x.max_order
         if istaylorpolynomial(y):
-            order = (
-                y._static_order if order is None else _max_order(order, y._static_order)
-            )
+            order = y.max_order if order is None else max(order, y.max_order)
         if order is None:
             order = 2
 
@@ -954,10 +1122,16 @@ _tp_needs_max_order.add(lax.pow_p)
 
 def _tp_max_p(x, y):
     ref = x if istaylorpolynomial(x) else y
-    x_val = x.evaluate(x.domain_center) if istaylorpolynomial(x) else jnp.asarray(x)
-    y_val = y.evaluate(y.domain_center) if istaylorpolynomial(y) else jnp.asarray(y)
+    x_val = x.evaluate(x.flat_center) if istaylorpolynomial(x) else jnp.asarray(x)
+    y_val = y.evaluate(y.flat_center) if istaylorpolynomial(y) else jnp.asarray(y)
     return _tp_constant(
-        jnp.maximum(x_val, y_val), ref.d, ref._static_order, ref.domain_center
+        jnp.maximum(x_val, y_val),
+        ref.d,
+        ref._per_leaf_order,
+        ref.flat_center,
+        ref._domain_treedef,
+        ref._leaf_shapes,
+        ref._per_leaf_order,
     )
 
 
@@ -966,10 +1140,16 @@ tp_inclusion_registry[lax.max_p] = _tp_max_p
 
 def _tp_min_p(x, y):
     ref = x if istaylorpolynomial(x) else y
-    x_val = x.evaluate(x.domain_center) if istaylorpolynomial(x) else jnp.asarray(x)
-    y_val = y.evaluate(y.domain_center) if istaylorpolynomial(y) else jnp.asarray(y)
+    x_val = x.evaluate(x.flat_center) if istaylorpolynomial(x) else jnp.asarray(x)
+    y_val = y.evaluate(y.flat_center) if istaylorpolynomial(y) else jnp.asarray(y)
     return _tp_constant(
-        jnp.minimum(x_val, y_val), ref.d, ref._static_order, ref.domain_center
+        jnp.minimum(x_val, y_val),
+        ref.d,
+        ref._per_leaf_order,
+        ref.flat_center,
+        ref._domain_treedef,
+        ref._leaf_shapes,
+        ref._per_leaf_order,
     )
 
 
@@ -985,7 +1165,10 @@ def _tp_reciprocal_p(x, *, max_order: int = None):
     one = _tp_constant(
         jnp.ones(x._output_shape, dtype=x.dtype),
         x.d,
-        max_order if max_order else x._static_order,
-        x.domain_center,
+        max_order if max_order is not None else x._per_leaf_order,
+        x.flat_center,
+        x._domain_treedef,
+        x._leaf_shapes,
+        x._per_leaf_order,
     )
     return _tp_div_p(one, x, max_order=max_order)

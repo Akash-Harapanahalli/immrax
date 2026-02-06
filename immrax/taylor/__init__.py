@@ -12,7 +12,7 @@ from .taylor_model import (
     taylor_model_constant,
     taylor_model_from_function,
     taylor_model_concatenate,
-    integrate_variable,
+    tm_integrate_variable as integrate_variable,
     _generate_exponents,
     _get_canonical_exponents,
     _get_leaf_total_degree_exponents,
@@ -37,6 +37,12 @@ from .nattp import (
     nattp_jaxpr,
     tp_inclusion_registry,
     istaylorpolynomial,
+)
+
+from .algorithms import (
+    TMFlowpipe,
+    TMFlowpipeGenerator,
+    BasicTMFlowpipeGenerator,
 )
 
 __all__ = [

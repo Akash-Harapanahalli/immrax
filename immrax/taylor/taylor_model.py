@@ -1829,10 +1829,8 @@ def tm_integrate_variable(
     >>> tm_result = integrate_variable(tm, leaf_idx=0, leaf_var_idx=0)  # integrate over t
     >>> tm_result = integrate_variable(tm, leaf_idx=1, leaf_var_idx=1)  # integrate over x[1]
     """
-    var_idx = _resolve_var_idx(
-        var_idx, leaf_idx, leaf_var_idx, tm.domain_treedef, tm.leaf_shapes
-    )
-
+    var_idx = _resolve_var_idx(var_idx, leaf_idx, leaf_var_idx, tm.leaf_shapes)
+    d = tm.d
     if start is None:
         start = tm.center[var_idx]
 
@@ -2013,3 +2011,7 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
         _leaf_shapes=ref._leaf_shapes,
         _per_leaf_order=per_leaf_order,
     )
+
+
+# Alias for backward compatibility
+integrate_variable = tm_integrate_variable
