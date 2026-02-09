@@ -9,7 +9,12 @@ Both compute rigorous flowpipe enclosures for ``x' = f(t, x)`` with
 interval initial conditions.
 """
 
-from immrax.taylor.algorithms.base import TMFlowpipe, TMFlowpipeGenerator
+from immrax.taylor.algorithms.base import (
+    TMFlowpipe,
+    TMFlowpipeGenerator,
+    tx_tm_eval,
+    tps_to_tx,
+)
 from .basic import BasicTMFlowpipeGenerator
 
 
@@ -17,4 +22,6 @@ __all__ = [
     "TMFlowpipe",
     "TMFlowpipeGenerator",
     "BasicTMFlowpipeGenerator",
+    "tx_tm_eval",
+    "tps_to_tx",
 ]

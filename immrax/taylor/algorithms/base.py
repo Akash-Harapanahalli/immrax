@@ -10,9 +10,129 @@ from abc import ABC, abstractmethod
 from immrax.inclusion import Interval, interval
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
-from .. import TaylorModel
+from .. import TaylorModel, TaylorPolynomial, taylor_model, _pytree_to_flattened_array
 
 from typing import Tuple
+
+
+def _tube_to_data(tm):
+    """Extract scan-safe raw arrays from a tube TaylorModel."""
+    return (
+        tm.coeffs,
+        tm.remainder.lower,
+        tm.remainder.upper,
+        tm.flat_domain.lower,
+        tm.flat_domain.upper,
+        tm.flat_center,
+    )
+
+
+def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
+    """Evaluate a time-dependent Taylor Model at a given time.
+
+    Parameters
+    ----------
+    tm : TaylorModel
+        The time-dependent Taylor Model to evaluate.
+    t : float
+        The time at which to evaluate the Taylor Model.
+    t_order : int
+        The order of the Taylor expansion.
+
+    Returns
+    -------
+    TaylorModel
+        The spatial Taylor Model extracted from evaluation at time t.
+    """
+
+    # Since t is always the first variable, the exponent matrix is structured
+    # in [0,0,0,...,1,1,1,...,t_order,t_order,t_order]
+    # i.e., tm.exponents[1:, L * i : L * (i + 1)] is the same for every i
+
+    # t_order = tm.exponents[0, -1]
+    L = tm.exponents.shape[1] // (t_order + 1)
+
+    exponents = tm.exponents[1:, 0:L]
+    coeffs_list = jnp.split(tm.coeffs, t_order + 1, axis=1)
+    t_shifted = t - tm.flat_center[0]
+    coeffs = jnp.sum(
+        jnp.asarray(coeffs_list)
+        * (t_shifted ** jnp.arange(t_order + 1))[:, None, None],
+        axis=0,
+    )
+
+    return TaylorModel(
+        coeffs=coeffs,
+        exponents=exponents,
+        remainder=tm.remainder,
+        flat_domain=tm.flat_domain[1:],
+        flat_center=tm.flat_center[1:],
+        _domain_treedef=tm._domain_treedef.children()[1],
+        _leaf_shapes=tm._leaf_shapes[1:],
+        _per_leaf_order=tm._per_leaf_order[1:],
+    )
+
+
+def tps_to_tx(
+    polys: list[TaylorPolynomial],
+    remainder,
+    domain,
+    center,
+    *,
+    per_leaf_order=None,
+) -> TaylorModel:
+    """Convert a list of TaylorPolynomials to a single TaylorModel with canonical
+    coefficient structure, over the domain.
+
+    Parameters
+    ----------
+    polys : list[TaylorPolynomial]
+        List of TaylorPolynomials to convert.
+    remainder : Interval
+        Remainder interval.
+    domain : PyTree[Interval]
+        Domain for the resulting TaylorModel.
+    center : PyTree[ArrayLike]
+        Expansion center for the resulting TaylorModel.
+    per_leaf_order : tuple[int, ...], optional
+        Per-leaf polynomial orders. If provided, avoids inferring orders from
+        exponents (required for JIT compatibility).
+
+    Returns
+    -------
+    TaylorModel
+        The TaylorModel with canonical coefficient structure.
+    """
+    t_order = len(polys) - 1
+    mon_len = polys[0].exponents.shape[-1]
+    coeffs = jnp.concatenate(
+        [polys[i].coeffs * inv_fact(i) for i in range(t_order + 1)], axis=1
+    )
+    exponents_top = jnp.repeat(jnp.arange(t_order + 1), mon_len)
+    exponents_bottom = jnp.concatenate([p.exponents for p in polys], axis=1)
+    exponents = jnp.vstack((exponents_top, exponents_bottom))
+
+    if per_leaf_order is not None:
+        _domain_treedef, _leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
+        _, _, flat_center = _pytree_to_flattened_array(center)
+        return TaylorModel(
+            coeffs,
+            exponents,
+            remainder,
+            flat_domain,
+            flat_center,
+            _domain_treedef=_domain_treedef,
+            _leaf_shapes=_leaf_shapes,
+            _per_leaf_order=per_leaf_order,
+        )
+
+    return taylor_model(
+        coeffs=coeffs,
+        exponents=exponents,
+        remainder=remainder,
+        domain=domain,
+        center=center,
+    )
 
 
 @register_pytree_node_class
@@ -20,38 +140,90 @@ class TMFlowpipe:
     """Result of validated ODE integration.
 
     Each TaylorModel in the flowpipe has domain variables (t, x),
-    where t\in [t_i, t_{i+1}] is expanded around t_i and
-    x is expanded around the nominal polynomial approximation of the solution.
+    where t is in [t_i, t_{i+1}] and x is expanded around the nominal
+    polynomial approximation of the solution.
 
     Attributes
     ----------
-    times : list[float]
-        Time grid ``[t_0, t_1, …, t_N]``.
-    tms : list[TaylorModel]
-        TaylorModel at each step.  Domain variables are ``(dt, x_0)``.
+    times : Array
+        Time grid of shape ``(nsteps,)``.
     nsteps : int
         Number of real integration steps taken.
     success : bool
         ``True`` if every step was validated.
     """
 
-    def __init__(self, times, tms, nsteps, success):
+    def __init__(self, times, tube_data, exponents, nsteps, success,
+                 *, _domain_treedef, _leaf_shapes, _per_leaf_order):
         self.times = times
-        self.tms = tms
+        self._tube_data = tube_data
+        self.exponents = exponents
         self.nsteps = nsteps
         self.success = success
+        self._domain_treedef = _domain_treedef
+        self._leaf_shapes = _leaf_shapes
+        self._per_leaf_order = _per_leaf_order
+
+    def __len__(self):
+        return self.nsteps
+
+    def __getitem__(self, idx):
+        """Reconstruct the tube TaylorModel at step ``idx``."""
+        coeffs, rem_lo, rem_hi, dom_lo, dom_hi, center = jax.tree.map(
+            lambda x: x[idx], self._tube_data
+        )
+        return TaylorModel(
+            coeffs,
+            self.exponents,
+            interval(rem_lo, rem_hi),
+            interval(dom_lo, dom_hi),
+            center,
+            _domain_treedef=self._domain_treedef,
+            _leaf_shapes=self._leaf_shapes,
+            _per_leaf_order=self._per_leaf_order,
+        )
+
+    def __call__(self, t):
+        """Evaluate the flowpipe at time ``t``, returning a spatial TaylorModel.
+
+        Uses ``searchsorted`` to find the tube segment containing ``t``,
+        reconstructs the tube TaylorModel, and evaluates it at ``t`` via
+        ``tx_tm_eval``.
+
+        Parameters
+        ----------
+        t : float
+            Time at which to evaluate.
+
+        Returns
+        -------
+        TaylorModel
+            Spatial TaylorModel at time ``t``.
+        """
+        idx = jnp.searchsorted(self.times, t, side="left")
+        idx = jnp.clip(idx, 0, self.nsteps - 1)
+        tube_tm = self[idx]
+        t_order = self._per_leaf_order[0]
+        return tx_tm_eval(tube_tm, t, t_order)
 
     def tree_flatten(self):
-        return (self.tms,), {
-            "times": self.times,
-            "nsteps": self.nsteps,
-            "success": self.success,
+        children = (self.times, self._tube_data, self.exponents, self.nsteps, self.success)
+        aux = {
+            "_domain_treedef": self._domain_treedef,
+            "_leaf_shapes": self._leaf_shapes,
+            "_per_leaf_order": self._per_leaf_order,
         }
+        return children, aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        (tms,) = children
-        return cls(aux["times"], tms, aux["nsteps"], aux["success"])
+        times, tube_data, exponents, nsteps, success = children
+        return cls(
+            times, tube_data, exponents, nsteps, success,
+            _domain_treedef=aux["_domain_treedef"],
+            _leaf_shapes=aux["_leaf_shapes"],
+            _per_leaf_order=aux["_per_leaf_order"],
+        )
 
 
 class TMFlowpipeGenerator(ABC):
@@ -127,29 +299,56 @@ class TMFlowpipeGenerator(ABC):
         TMFlowpipe
             Validated flowpipe.
         """
+        t0 = jnp.asarray(t0)
+        tf = jnp.asarray(tf)
+        dt_max = jnp.asarray(dt_max)
 
         self._initialize(
             t0, tf, tm0, dt_max, t_order=t_order, max_steps=max_steps, **kwargs
         )
 
-        # Use jax.lax.scan to iterate through steps, noop when t_f is reached or success is False
+        # Take the first step outside the scan to establish the tube
+        # array structure (needed for the noop branch of lax.cond).
+        dt0, tmf0, tube0, success0 = self._step(t0, tm0, dt_max, **kwargs)
+        tube0_data = _tube_to_data(tube0)
+        dummy_data = jax.tree.map(jnp.zeros_like, tube0_data)
 
         def scan_fn(carry, _):
-            tmi, ti, success, steps_taken = carry
-
-            noop_cond = jnp.logical_and(success, ti < tf)
-
-            def noop():
-                return (tmi, ti, success, steps_taken), (tmi, jnp.nan)
+            ti, tmi, success, steps_taken = carry
+            should_step = jnp.logical_and(success, ti < tf)
 
             def take_step():
-                dt, tmf, tm_tube, success = self._step(ti, tmi, dt_max, **kwargs)
-                return (ti + dt, tmf, success, steps_taken + 1), (ti + dt, tm_tube)
+                dt, tmf, tm_tube, step_success = self._step(ti, tmi, dt_max, **kwargs)
+                return (ti + dt, tmf, step_success, steps_taken + 1), (
+                    ti + dt,
+                    _tube_to_data(tm_tube),
+                )
 
-            return jax.lax.cond(noop_cond, take_step, noop)
+            def noop():
+                return (ti, tmi, success, steps_taken), (jnp.nan, dummy_data)
 
-        (final_t, final_tm, final_success, final_steps), (times, tms) = jax.lax.scan(
-            scan_fn, (t0, tm0, True, 0), jnp.arange(max_steps)
+            return jax.lax.cond(should_step, take_step, noop)
+
+        init_carry = (t0 + dt0, tmf0, success0, jnp.int32(1))
+        (
+            (final_t, final_tm, final_success, final_steps),
+            (
+                scan_times,
+                scan_tube_data,
+            ),
+        ) = jax.lax.scan(scan_fn, init_carry, jnp.arange(max_steps - 1))
+
+        # Prepend first step result
+        times = jnp.concatenate([jnp.array([t0 + dt0]), scan_times])
+        tube_data = jax.tree.map(
+            lambda first, rest: jnp.concatenate([first[None], rest]),
+            tube0_data,
+            scan_tube_data,
         )
 
-        return TMFlowpipe(times, tms, final_steps, final_success)
+        return TMFlowpipe(
+            times, tube_data, tube0.exponents, final_steps, final_success,
+            _domain_treedef=tube0._domain_treedef,
+            _leaf_shapes=tube0._leaf_shapes,
+            _per_leaf_order=tube0._per_leaf_order,
+        )
