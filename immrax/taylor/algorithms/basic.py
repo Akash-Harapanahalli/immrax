@@ -1,16 +1,25 @@
 import jax
 import jax.numpy as jnp
 
-from immrax.inclusion import Interval, interval, natif
+from immrax.inclusion import Interval, interval, natif, icentpert
 from immrax.system import System
-from immrax.utils import inv_fact, prolongation
-from .. import taylor_model, TaylorModel, TaylorPolynomial, nattm, nattp, tm_integrate_variable, taylor_model_concatenate
+from immrax.utils import inv_fact, prolongation, check_containment
+from .. import (
+    taylor_model,
+    TaylorModel,
+    TaylorPolynomial,
+    nattm,
+    nattp,
+    tm_integrate_variable,
+    taylor_model_concatenate,
+    taylor_model_identity,
+)
 from .base import TMFlowpipeGenerator
 
 from typing import Tuple
 
 
-def tx_tm_eval(tm: TaylorModel, t: float) -> TaylorModel:
+def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
     """Evaluate a time-dependent Taylor Model at a given time.
 
     Parameters
@@ -32,14 +41,15 @@ def tx_tm_eval(tm: TaylorModel, t: float) -> TaylorModel:
     # in [0,0,0,...,1,1,1,...,t_order,t_order,t_order]
     # i.e., tm.exponents[1:, L * i : L * (i + 1)] is the same for every i
 
-    t_order = tm.exponents[0, -1]
+    # t_order = tm.exponents[0, -1]
     L = tm.exponents.shape[1] // (t_order + 1)
 
     exponents = tm.exponents[1:, 0:L]
     coeffs_list = jnp.split(tm.coeffs, t_order + 1, axis=1)
     t_shifted = t - tm.flat_center[0]
     coeffs = jnp.sum(
-        jnp.asarray(coeffs_list) * (t_shifted ** jnp.arange(t_order + 1))[:, None, None],
+        jnp.asarray(coeffs_list)
+        * (t_shifted ** jnp.arange(t_order + 1))[:, None, None],
         axis=0,
     )
 
@@ -100,8 +110,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         self.eps = kwargs.get("eps", 1e-2)
         self.delta = kwargs.get("delta", 1e-2)
 
-
-    def _picard(self, tm_tx:TaylorModel) -> TaylorModel :
+    def _picard(self, tm_tx: TaylorModel) -> TaylorModel:
         """Apply the Picard operator to the TaylorModel tm_tx over the domain of the TaylorModel.
 
         The Picard operator is defined as:
@@ -117,31 +126,14 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         where E' contains all the remainders.
         """
         # Initial condition
-        tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower)
+        tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower, self.t_order)
 
         # Construct augmented TM: (t, x0) -> (t, phi_1, ..., phi_n)
         # This is needed because structured_center=True slices the TM's *output*
         # according to leaf_shapes. The flow map tm_tx has output shape (n,) but
         # the domain has total dim 1+n, so we prepend a time-identity TM.
-        is_constant = jnp.all(tm_tx.exponents == 0, axis=0)
-        t_unit = jnp.zeros(tm_tx.d, dtype=jnp.int32).at[0].set(1)
-        is_t_linear = jnp.all(tm_tx.exponents == t_unit[:, None], axis=0)
-        t_coeffs = (
-            jnp.where(is_constant, tm_tx.flat_center[0], 0.0)
-            + jnp.where(is_t_linear, 1.0, 0.0)
-        )[None, :]  # shape (1, num_monomials)
-
-        tm_t = TaylorModel(
-            t_coeffs,
-            tm_tx.exponents,
-            interval(jnp.zeros(1)),
-            tm_tx.flat_domain,
-            tm_tx.flat_center,
-            _domain_treedef=tm_tx._domain_treedef,
-            _leaf_shapes=tm_tx._leaf_shapes,
-            _per_leaf_order=tm_tx._per_leaf_order,
-        )
-        tm_aug = taylor_model_concatenate([tm_t, tm_tx])
+        tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
+        tm_aug = taylor_model_concatenate([tm_id[0:1], tm_tx])
 
         # Integration
         f_tm_tx = nattm(self.sys.f, structured_center=True)(tm_aug)
@@ -149,7 +141,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         con_sh = tm_ic.coeffs.shape
 
-        coeffs = tm_int.coeffs.at[:con_sh[0], :con_sh[1]].add(tm_ic.coeffs)
+        coeffs = tm_int.coeffs.at[: con_sh[0], : con_sh[1]].add(tm_ic.coeffs)
 
         return TaylorModel(
             coeffs=coeffs,
@@ -162,13 +154,6 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
             _per_leaf_order=tm_int._per_leaf_order,
         )
 
-    def _fixed_picard (self, tm_tx:TaylorModel) -> TaylorModel :
-        """A more efficient version of _picard when the polynomial part of the TaylorModel is the Taylor series expansion
-        of the flow map, the polynomial part is a fixed point (to the corresponding order), meaning
-        K(p + E) = p + E'
-        where E' contains all the remainders.
-        """
-
     def _step(self, t: float, tmi: TaylorModel, dt_max: float, **kwargs):
         # Step 1: Compute the Taylor expansion of the flow map to t_order, x_order
 
@@ -180,10 +165,25 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
             (t, tmi.center),
         )
 
-        # Step 2: Check the contraction of the Picard operator
+        # Step 2: eps-inflation to check the contraction of the Picard operator
+        # rem will start at tmi.remainder
 
-        picard_poly = self._picard(poly)
-        
-        return poly, picard_poly
+        def _remainder_inflation(rem):
+            return rem * icentpert(0.0, self.eps) + icentpert(0.0, self.delta)
 
+        def _check_picard(carry):
+            poly, contractive = carry
+            poly.remainder = _remainder_inflation(poly.remainder)
+            contractive = (
+                check_containment(self._picard(poly).remainder, tmi.remainder) == 1
+            )
 
+            return (poly, contractive)
+
+        poly, contractive = jax.lax.while_loop(
+            lambda carry: jnp.logical_not(carry[1]),
+            _check_picard,
+            (poly, False),
+        )
+
+        return poly, contractive
