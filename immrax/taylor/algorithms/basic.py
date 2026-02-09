@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from immrax.inclusion import Interval, interval, natif
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
-from .. import taylor_model, TaylorModel, TaylorPolynomial, nattm, nattp
+from .. import taylor_model, TaylorModel, TaylorPolynomial, nattm, nattp, tm_integrate_variable
 from .base import TMFlowpipeGenerator
 
 from typing import Tuple
@@ -99,6 +99,54 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         self.eps = kwargs.get("eps", 1e-2)
         self.delta = kwargs.get("delta", 1e-2)
 
+
+    def _picard(self, tm_tx:TaylorModel) -> TaylorModel :
+        """Apply the Picard operator to the TaylorModel tm_tx over the domain of the TaylorModel.
+        
+        The Picard operator is defined as:
+        K : C([t0,t1], R^n) -> C([t0,t1], R^n),
+        K(x, t) = x(t0) + \int_{t0}^t f(x(s), s) ds
+
+        Applied to a TaylorModel tm_tx, this operator uses TaylorModel arithmetic to compute:
+        K(p + E) = (q + J) + \int_{t0}^t f(p + E, s) ds
+
+        As a special case, if the polynomial part of the TaylorModel is the Taylor series expansion
+        of the flow map, the polynomial part is a fixed point (to the corresponding order), meaning
+        K(p + E) = p + E'
+        where E' contains all the remainders.
+        """
+        # Initial condition
+        tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower)
+
+        # Integration
+        f_tm_tx = nattm(self.sys.f, structured_center=True)(tm_tx)
+        tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
+
+        print(tm_tx.exponents)
+        print(tm_int.exponents)
+
+        con_sh = tm_ic.coeffs.shape
+
+        coeffs = tm_int.coeffs.at[:con_sh[0], :con_sh[1]].add(tm_ic.coeffs)
+
+        return TaylorModel(
+            coeffs=coeffs,
+            exponents=tm_int.exponents,
+            remainder=tm_int.remainder,
+            flat_domain=tm_int.flat_domain,
+            flat_center=tm_int.flat_center,
+            _domain_treedef=tm_int._domain_treedef,
+            _leaf_shapes=tm_int._leaf_shapes,
+            _per_leaf_order=tm_int._per_leaf_order,
+        )
+
+    def _fixed_picard (self, tm_tx:TaylorModel) -> TaylorModel :
+        """A more efficient version of _picard when the polynomial part of the TaylorModel is the Taylor series expansion
+        of the flow map, the polynomial part is a fixed point (to the corresponding order), meaning
+        K(p + E) = p + E'
+        where E' contains all the remainders.
+        """
+
     def _step(self, t: float, tmi: TaylorModel, dt_max: float, **kwargs):
         # Step 1: Compute the Taylor expansion of the flow map to t_order, x_order
 
@@ -106,7 +154,14 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         poly = tps_to_tx(
             poly_coeffs,
             tmi.remainder,
-            (interval(jnp.asarray(t), jnp.asarray(t + dt_max)), tmi.domain),
+            (interval(t, t + dt_max), tmi.domain),
             (t, tmi.center),
         )
-        return poly
+
+        # Step 2: Check the contraction of the Picard operator
+
+        picard_poly = self._picard(poly)
+        
+        return poly, picard_poly
+
+

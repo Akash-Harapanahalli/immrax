@@ -383,7 +383,7 @@ def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
 
 inclusion_registry[lax.div_p] = _inclusion_div_p
 Interval.__truediv__ = _inclusion_div_p
-Interval.__rtruediv__ = _inclusion_div_p
+Interval.__rtruediv__ = lambda x, y: _inclusion_div_p(y, x)
 
 
 def _inclusion_reciprocal_p(x: Interval) -> Interval:

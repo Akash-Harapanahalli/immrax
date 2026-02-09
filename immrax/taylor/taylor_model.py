@@ -1916,6 +1916,8 @@ def tm_integrate_variable(
             canonical_exp, tm.shifted_domain, max(new_per_leaf_order)
         )
 
+        trunc_exponents = canonical_exp[:, ~high_mask]
+
         high_coeffs = jnp.where(high_mask, new_coeffs, 0.0)
         zeros = jnp.zeros_like(high_coeffs)
         c_pos = jnp.maximum(high_coeffs, zeros)
@@ -1929,12 +1931,12 @@ def tm_integrate_variable(
         )
         trunc_remainder = interval(trunc_lower, trunc_upper)
 
-        kept_coeffs = jnp.where(high_mask, 0.0, new_coeffs)
+        kept_coeffs = new_coeffs[:, ~high_mask]
         total_remainder = trunc_remainder + integ_remainder
 
         return TaylorModel(
             kept_coeffs,
-            canonical_exp,
+            trunc_exponents,
             total_remainder,
             tm.flat_domain,
             flat_center=tm.flat_center,
