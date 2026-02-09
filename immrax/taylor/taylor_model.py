@@ -1905,23 +1905,32 @@ def tm_integrate_variable(
 
     # --- 5. Optionally reduce order back to original ---
     if keep_order:
-        # Find monomials that exceed the original per-leaf order
         orig_per_leaf_order = tm._per_leaf_order
-        high_mask = ~_check_per_leaf_bounds(
-            canonical_exp, leaf_shapes, orig_per_leaf_order
+
+        # Original canonical exponents (static shape, known from per_leaf_order)
+        orig_canonical_exp = _get_leaf_total_degree_exponents(
+            leaf_shapes, orig_per_leaf_order
         )
 
-        # Bound high-order monomials over shifted domain
+        # Scatter from expanded to original canonical basis
+        orig_hash = jnp.sum(orig_canonical_exp * powers_hash[:, None], axis=0)
+        keep_scatter = (canonical_hash[:, None] == orig_hash[None, :]).astype(
+            tm.coeffs.dtype
+        )
+
+        # Project coefficients to original basis (high-order monomials have no
+        # hash match in orig_hash, so their contribution is zero)
+        kept_coeffs = new_coeffs @ keep_scatter
+
+        # Bound high-order terms and absorb into remainder
+        high_mask = jnp.sum(keep_scatter, axis=1) == 0
         mono_bounds = _bound_monomials_over_domain(
             canonical_exp, tm.shifted_domain, max(new_per_leaf_order)
         )
 
-        trunc_exponents = canonical_exp[:, ~high_mask]
-
         high_coeffs = jnp.where(high_mask, new_coeffs, 0.0)
-        zeros = jnp.zeros_like(high_coeffs)
-        c_pos = jnp.maximum(high_coeffs, zeros)
-        c_neg = jnp.minimum(high_coeffs, zeros)
+        c_pos = jnp.maximum(high_coeffs, 0.0)
+        c_neg = jnp.minimum(high_coeffs, 0.0)
 
         trunc_lower = jnp.sum(
             c_pos * mono_bounds.lower + c_neg * mono_bounds.upper, axis=-1
@@ -1931,12 +1940,11 @@ def tm_integrate_variable(
         )
         trunc_remainder = interval(trunc_lower, trunc_upper)
 
-        kept_coeffs = new_coeffs[:, ~high_mask]
         total_remainder = trunc_remainder + integ_remainder
 
         return TaylorModel(
             kept_coeffs,
-            trunc_exponents,
+            orig_canonical_exp,
             total_remainder,
             tm.flat_domain,
             flat_center=tm.flat_center,

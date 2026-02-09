@@ -11,7 +11,15 @@ class TestSystem(irx.System):
         self.evolution = 'continuous'
         self.xlen = 2
     def f (self, t, x) :
-        return jnp.array([x[1], -x[0]])
+        # Harmonic Oscillator
+        # return jnp.array([x[1], -x[0]])
+
+        # # VanderPol Oscillator
+        mu = 0.5
+        return jnp.array([
+            x[1],
+            mu*(1 - x[0]**2)*x[1] - x[0]
+        ])
 
 sys = TestSystem()
 prolonged_f = irx.utils.prolongation(sys.f, 3)
@@ -19,8 +27,8 @@ prolonged_f = irx.utils.prolongation(sys.f, 3)
 
 # %%
 t0 = jnp.asarray(0.)
-tf = jnp.asarray(.1)
-ix0 = irx.icentpert(jnp.ones(2), .5)
+tf = jnp.asarray(1.)
+ix0 = irx.icentpert([-2, 0.], .1)
 tm0 = irx.taylor_model_identity((irx.interval(t0), ix0), order=(2, 2))
 tmt = irx.taylor_model_identity(irx.interval(t0), order=2)
 tmx = irx.taylor_model_identity(ix0, order=2)
@@ -53,42 +61,46 @@ print(conv.remainder)
 print(conv.center)
 
 # %%
-
-
-# fp = irx.utils.prolongation(sys.f, 2)
-tm1 = irx.nattm(sys.f, structured_center=True)(tm0)
-tp1 = irx.nattp(sys.f, structured_center=True)(tm0.polynomial)
-tm1_integ = irx.taylor.integrate_variable(tm1, var_idx=0)
-
-tm2 = irx.nattm(sys.f)(tmt, tmx)
-
+fpg = BasicTMFlowpipeGenerator(sys)
+fpg._initialize(t0, tf, tmx, tf - t0, t_order=3, delta=1.e-4, eps=1.e-2)
 
 # %%
-# print((jnp.arange(10).reshape(-1,1) @ jnp.ones((1,4))).reshape(-1))
-print(jnp.tile(jnp.arange(10).reshape(2,5), (10,)))
-
-# 
-fpg = BasicTMFlowpipeGenerator(sys)
-fpg._initialize(t0, tf, tm0, tf - t0, t_order=4)
-
-res = fpg._picard(tm1)
-print(res.remainder)
-
-tm_test_in = irx.taylor_model_identity(irx.interval([-1.], [1.]), order=4)
-tm_test = irx.nattm(lambda x : jnp.sin(x))(tm_test_in)
-tm_cos_test = irx.nattm(lambda x : jnp.cos(x))(tm_test_in)
+%matplotlib widget
 
 pr_coeffs = prolonged_f(0., ix0.center)
+# pr_poly = lambda t : pr_coeffs[0] + pr_coeffs[1]*t + pr_coeffs[2]*t**2/2 + pr_coeffs[3]*t**3/6
+# pr_poly = lambda t : conv.evaluate_polynomial(t, ix0.center)
 
-step_conv, picard_step_conv = fpg._step(t0, tmx, tf)
-print(jnp.allclose(step_conv.coeffs, picard_step_conv.coeffs))
-print(step_conv.coeffs - picard_step_conv.coeffs)
+dt = 0.01
+
+_, _, step_conv, contractive = fpg._step(t0, tmx, dt)
+print(step_conv.remainder)
+print(fpg._picard(step_conv).remainder)
+# print(step_conv.coeffs)
+# print(picard_step_conv.coeffs)
+# print(picard_step_conv.exponents.shape)
+# print(jnp.allclose(step_conv.coeffs, picard_step_conv.coeffs))
+# print(step_conv.remainder, picard_step_conv.remainder)
+# print(irx.utils.check_containment(picard_step_conv.remainder,step_conv.remainder))
+
+tube = fpg.generate_flowpipe(t0, tf, tmx, dt)
+
+print(contractive)
 
 def pr_poly(t) :
-    return irx.taylor.algorithms.basic.tx_tm_eval(step_conv, t).evaluate_polynomial(ix0.center)
+    return irx.taylor.algorithms.basic.tx_tm_eval(step_conv, t, t_order=3).evaluate_polynomial(ix0.center)
 
 fig, ax = plt.subplots()
 
 tt = jnp.linspace(t0, tf, 100)
+# xx = jax.vmap(lambda t : tm1_integ.polynomial.evaluate_structured(t, ix0.center) + ix0.center)(tt)
+# ax.plot(xx[:,0], xx[:,1])
 pr_xx = jax.vmap(pr_poly)(tt)
 ax.plot(pr_xx[:,0], pr_xx[:,1])
+
+# fpg.generate_flowpipe(t0, tf, tm0, dt_max=1e-2)
+# fpg._initialize(t0, tf, tm0, dt_max=1e-2)
+ax.set_xlim(-2.5, 2.5)
+ax.set_ylim(-2.5, 2.5)
+
+

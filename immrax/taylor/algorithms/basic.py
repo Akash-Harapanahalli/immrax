@@ -169,21 +169,28 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         # rem will start at tmi.remainder
 
         def _remainder_inflation(rem):
-            return rem * icentpert(0.0, self.eps) + icentpert(0.0, self.delta)
+            return rem * icentpert(1.0, self.eps) + icentpert(0.0, self.delta)
 
-        def _check_picard(carry):
+        def _check_picard(i, carry):
             poly, contractive = carry
-            poly.remainder = _remainder_inflation(poly.remainder)
-            contractive = (
-                check_containment(self._picard(poly).remainder, tmi.remainder) == 1
+
+            # Noop if contractive using jax.lax.cond
+            poly.remainder = jax.lax.cond(
+                contractive,
+                lambda rem: rem,
+                lambda rem: _remainder_inflation(rem),
+                poly.remainder,
+            )
+            contractive = jax.lax.cond(
+                contractive,
+                lambda: contractive,
+                lambda: (
+                    check_containment(self._picard(poly).remainder, poly.remainder) == 1
+                ),
             )
 
             return (poly, contractive)
 
-        poly, contractive = jax.lax.while_loop(
-            lambda carry: jnp.logical_not(carry[1]),
-            _check_picard,
-            (poly, False),
-        )
+        poly, contractive = jax.lax.fori_loop(0, 100, _check_picard, (poly, False))
 
-        return poly, contractive
+        return dt_max, tx_tm_eval(poly, t + dt_max, self.t_order), poly, contractive
