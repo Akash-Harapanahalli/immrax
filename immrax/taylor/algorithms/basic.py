@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from immrax.inclusion import Interval, interval, natif
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
-from .. import taylor_model, TaylorModel, TaylorPolynomial, nattm, nattp, tm_integrate_variable
+from .. import taylor_model, TaylorModel, TaylorPolynomial, nattm, nattp, tm_integrate_variable, taylor_model_concatenate
 from .base import TMFlowpipeGenerator
 
 from typing import Tuple
@@ -37,8 +37,9 @@ def tx_tm_eval(tm: TaylorModel, t: float) -> TaylorModel:
 
     exponents = tm.exponents[1:, 0:L]
     coeffs_list = jnp.split(tm.coeffs, t_order + 1, axis=1)
+    t_shifted = t - tm.flat_center[0]
     coeffs = jnp.sum(
-        jnp.asarray(coeffs_list) * (t ** jnp.arange(t_order + 1))[:, None, None],
+        jnp.asarray(coeffs_list) * (t_shifted ** jnp.arange(t_order + 1))[:, None, None],
         axis=0,
     )
 
@@ -102,13 +103,13 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
 
     def _picard(self, tm_tx:TaylorModel) -> TaylorModel :
         """Apply the Picard operator to the TaylorModel tm_tx over the domain of the TaylorModel.
-        
+
         The Picard operator is defined as:
         K : C([t0,t1], R^n) -> C([t0,t1], R^n),
-        K(x, t) = x(t0) + \int_{t0}^t f(x(s), s) ds
+        K(x, t) = x(t0) + \\int_{t0}^t f(x(s), s) ds
 
         Applied to a TaylorModel tm_tx, this operator uses TaylorModel arithmetic to compute:
-        K(p + E) = (q + J) + \int_{t0}^t f(p + E, s) ds
+        K(p + E) = (q + J) + \\int_{t0}^t f(p + E, s) ds
 
         As a special case, if the polynomial part of the TaylorModel is the Taylor series expansion
         of the flow map, the polynomial part is a fixed point (to the corresponding order), meaning
@@ -118,12 +119,33 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         # Initial condition
         tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower)
 
-        # Integration
-        f_tm_tx = nattm(self.sys.f, structured_center=True)(tm_tx)
-        tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
+        # Construct augmented TM: (t, x0) -> (t, phi_1, ..., phi_n)
+        # This is needed because structured_center=True slices the TM's *output*
+        # according to leaf_shapes. The flow map tm_tx has output shape (n,) but
+        # the domain has total dim 1+n, so we prepend a time-identity TM.
+        is_constant = jnp.all(tm_tx.exponents == 0, axis=0)
+        t_unit = jnp.zeros(tm_tx.d, dtype=jnp.int32).at[0].set(1)
+        is_t_linear = jnp.all(tm_tx.exponents == t_unit[:, None], axis=0)
+        t_coeffs = (
+            jnp.where(is_constant, tm_tx.flat_center[0], 0.0)
+            + jnp.where(is_t_linear, 1.0, 0.0)
+        )[None, :]  # shape (1, num_monomials)
 
-        print(tm_tx.exponents)
-        print(tm_int.exponents)
+        tm_t = TaylorModel(
+            t_coeffs,
+            tm_tx.exponents,
+            interval(jnp.zeros(1)),
+            tm_tx.flat_domain,
+            tm_tx.flat_center,
+            _domain_treedef=tm_tx._domain_treedef,
+            _leaf_shapes=tm_tx._leaf_shapes,
+            _per_leaf_order=tm_tx._per_leaf_order,
+        )
+        tm_aug = taylor_model_concatenate([tm_t, tm_tx])
+
+        # Integration
+        f_tm_tx = nattm(self.sys.f, structured_center=True)(tm_aug)
+        tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
         con_sh = tm_ic.coeffs.shape
 
