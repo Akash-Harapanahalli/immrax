@@ -1,6 +1,7 @@
 from .interval import (
     Interval,
     interval,
+    isinterval,
     icopy,
     icentpert,
     i2centpert,
@@ -39,6 +40,7 @@ from .jacobian import (
 __all__ = [
     "Interval",
     "interval",
+    "isinterval",
     "icopy",
     "icentpert",
     "i2centpert",

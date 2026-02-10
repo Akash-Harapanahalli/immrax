@@ -1,5 +1,5 @@
 from functools import wraps
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import equinox as eqx
 import jax
@@ -21,7 +21,7 @@ from jax.extend.core import Primitive
 from jax._src.lax import linalg as LA
 
 # TODO: import only necessary things
-from immrax.inclusion.interval import Interval, interval
+from immrax.inclusion.interval import Interval, interval, isinterval
 from functools import partial
 
 """
@@ -32,23 +32,18 @@ inclusion_registry = {}
 
 
 def natif(
-    f: Callable[..., jax.Array], *, fixed_argnums: int | Sequence[int] = None
+    f: Callable[..., jax.Array],
 ) -> Callable[..., Interval]:
     """Creates a Natural Inclusion Function of f.
 
-    All positional arguments not listed in ``fixed_argnums`` are treated as
-    Interval inputs.  Fixed arguments and all keyword arguments are captured
-    as constants in the traced Jaxpr (they are not intervalized).
+    Non-Interval positional arguments are automatically closed over
+    (treated as constants during tracing).  All keyword arguments are
+    also closed over.
 
     Parameters
     ----------
     f : Callable[..., jax.Array]
         Function to construct Natural Inclusion Function from.
-    fixed_argnums : int | Sequence[int], optional
-        Positional argument indices to treat as concrete arrays rather than
-        Intervals.  These arguments (together with any kwargs) are closed
-        over before tracing, so they become Jaxpr constants.
-        Default ``None`` means every positional argument is an Interval.
 
     Returns
     -------
@@ -57,50 +52,46 @@ def natif(
 
     Examples
     --------
-    All arguments as intervals (default)::
+    All arguments as intervals::
 
         natif(f)(iv_x, iv_y)
 
     First argument fixed (e.g. a matrix), second is an interval::
 
-        natif(f, fixed_argnums=0)(M, iv_x)
+        natif(f)(M, iv_x)
 
-    Multiple fixed arguments::
+    Mixed arguments::
 
-        natif(f, fixed_argnums=(0, 2))(M, iv_x, dims)
+        natif(f)(M, iv_x, dims)
     """
-    # Normalize fixed_argnums to a frozenset
-    if fixed_argnums is None:
-        _fixed: frozenset[int] = frozenset()
-    elif isinstance(fixed_argnums, int):
-        _fixed = frozenset({fixed_argnums})
-    else:
-        _fixed = frozenset(fixed_argnums)
 
     @jit
     @wraps(f)
     def wrapped(*args, **kwargs):
-        # Split positional args into fixed (closed over) and interval (traced)
-        interval_args = [arg for i, arg in enumerate(args) if i not in _fixed]
+        # Separate interval args from non-interval (fixed) args
+        interval_args = [arg for arg in args if isinterval(arg)]
 
-        # Build a partial that closes over fixed args and kwargs
+        if not interval_args:
+            return f(*args, **kwargs)
+
+        # Build a closure that receives only interval args and
+        # reconstructs the full argument list
         def f_interval(*iv_args):
             full_args = []
             iv_idx = 0
-            for i in range(len(args)):
-                if i in _fixed:
-                    full_args.append(args[i])
-                else:
+            for arg in args:
+                if isinterval(arg):
                     full_args.append(iv_args[iv_idx])
                     iv_idx += 1
+                else:
+                    full_args.append(arg)
             return f(*full_args, **kwargs)
 
         # Representative values for tracing (lower bounds of intervals)
-        getlower = lambda x: x.lower if isinstance(x, Interval) else jnp.asarray(x)
-        isinterval = lambda x: isinstance(x, Interval)
+        getlower = lambda x: x.lower if isinterval(x) else jnp.asarray(x)
         build_iv_args = jax.tree_util.tree_map(getlower, interval_args, is_leaf=isinterval)
 
-        # Build jaxpr from the partial — fixed args and kwargs become constants
+        # Build jaxpr from the closure — fixed args and kwargs become constants
         closed_jaxpr = eqx.filter_make_jaxpr(f_interval)(*build_iv_args)[0]
 
         # Evaluate the jaxpr with interval arguments

@@ -158,10 +158,21 @@ class TMFlowpipe:
         ``True`` if every step was validated.
     """
 
-    def __init__(self, times, tube_data, exponents, nsteps, success,
-                 *, _input_pytree, _output_pytree, _per_leaf_order,
-                 # Legacy kwargs
-                 _domain_treedef=None, _leaf_shapes=None):
+    def __init__(
+        self,
+        times,
+        tube_data,
+        exponents,
+        nsteps,
+        success,
+        *,
+        _input_pytree,
+        _output_pytree,
+        _per_leaf_order,
+        # Legacy kwargs
+        _domain_treedef=None,
+        _leaf_shapes=None,
+    ):
         self.times = times
         self._tube_data = tube_data
         self.exponents = exponents
@@ -172,8 +183,12 @@ class TMFlowpipe:
         elif _domain_treedef is not None and _leaf_shapes is not None:
             self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
         else:
-            raise ValueError("Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided")
-        self._output_pytree = _output_pytree if _output_pytree is not None else PyTreeShape.flat(())
+            raise ValueError(
+                "Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided"
+            )
+        self._output_pytree = (
+            _output_pytree if _output_pytree is not None else PyTreeShape.flat(())
+        )
         self._per_leaf_order = _per_leaf_order
 
     def __len__(self):
@@ -218,8 +233,31 @@ class TMFlowpipe:
         t_order = self._per_leaf_order[0]
         return tx_tm_eval(tube_tm, t, t_order)
 
+    def interval_hulls(self) -> Interval:
+        def _data_to_interval(data):
+            coeffs, rem_lo, rem_hi, dom_lo, dom_hi, center = data
+            tm = TaylorModel(
+                coeffs,
+                self.exponents,
+                interval(rem_lo, rem_hi),
+                interval(dom_lo, dom_hi),
+                center,
+                _input_pytree=self._input_pytree,
+                _output_pytree=self._output_pytree,
+                _per_leaf_order=self._per_leaf_order,
+            )
+            return tm.interval_hull()
+
+        return jax.vmap(_data_to_interval)(self._tube_data)
+
     def tree_flatten(self):
-        children = (self.times, self._tube_data, self.exponents, self.nsteps, self.success)
+        children = (
+            self.times,
+            self._tube_data,
+            self.exponents,
+            self.nsteps,
+            self.success,
+        )
         aux = {
             "_input_pytree": self._input_pytree,
             "_output_pytree": self._output_pytree,
@@ -231,7 +269,11 @@ class TMFlowpipe:
     def tree_unflatten(cls, aux, children):
         times, tube_data, exponents, nsteps, success = children
         return cls(
-            times, tube_data, exponents, nsteps, success,
+            times,
+            tube_data,
+            exponents,
+            nsteps,
+            success,
             _input_pytree=aux["_input_pytree"],
             _output_pytree=aux["_output_pytree"],
             _per_leaf_order=aux["_per_leaf_order"],
@@ -359,7 +401,11 @@ class TMFlowpipeGenerator(ABC):
         )
 
         return TMFlowpipe(
-            times, tube_data, tube0.exponents, final_steps, final_success,
+            times,
+            tube_data,
+            tube0.exponents,
+            final_steps,
+            final_success,
             _input_pytree=tube0._input_pytree,
             _output_pytree=tube0._output_pytree,
             _per_leaf_order=tube0._per_leaf_order,

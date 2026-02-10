@@ -37,7 +37,12 @@ def gen_flowpipe(t0, tf, tmx, dt, delta, eps):
     )
 
 
-fp, times = irx.utils.run_times(100, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
+fp, times = irx.utils.run_times(10, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
+
+
+def mc_sim(x0):
+    return sys.compute_trajectory(t0, tf, x0, (), dt)
+
 
 # assert fp.success, "Flowpipe generation failed"
 # assert fp.nsteps > 0, "No steps taken"
@@ -54,10 +59,27 @@ fig, ax = plt.subplots()
 
 # Check __call__ against exact solution x(t) = [-2*cos(t), 2*sin(t)]
 # test_times = [0.05, 0.25, 0.5, 0.75, 0.99]
-test_times = jnp.linspace(t0, tf, 20)
+# test_times = jnp.linspace(t0, tf, 20)
+PLOT_EVERY = 10
+test_times = jnp.arange(t0, tf + dt, dt)[::PLOT_EVERY]
+irx.utils.draw_iarray(ax, tmx.interval_hull(), color="tab:red")
+
 for t in test_times:
     spatial_tm = fp(t)
     irx.utils.draw_iarray(ax, spatial_tm.interval_hull(), color="tab:blue")
+
+
+mc_x0s = irx.utils.gen_ics(ix0, 10)
+mc_trajs = jax.vmap(mc_sim)(mc_x0s)
+
+mc_trajs = mc_trajs.to_convenience()
+print(mc_trajs.ys.shape)
+ax.scatter(
+    mc_trajs.ys[:, ::PLOT_EVERY, 0],
+    mc_trajs.ys[:, ::PLOT_EVERY, 1],
+    color="tab:red",
+    s=1,
+)
 
 plt.show()
 

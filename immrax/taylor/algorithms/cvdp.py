@@ -29,10 +29,10 @@ t0 = 0.0
 tf = 7.0
 ix0 = irx.icentpert([1.4, 2.4, 1.4, 2.4, 2.0], [0.15, 0.05, 0.15, 0.05, 1.0])
 print(ix0)
-tmx = irx.taylor_model_identity(ix0, order=2)
+tmx = irx.taylor_model_identity(ix0, order=1)
 
 fpg = BasicTMFlowpipeGenerator(sys)
-dt = 0.01
+dt = 0.005
 
 delta = 1e-5
 eps = 1e-3
@@ -59,6 +59,9 @@ tube0 = fp[0]
 tubef = fp[fp.nsteps - 1]
 
 fig, ax = plt.subplots()
+
+# Draw a line at y = 2.75
+ax.axhline(y=2.75, color="tab:red", linestyle="--")
 
 # Check __call__ against exact solution x(t) = [-2*cos(t), 2*sin(t)]
 # test_times = [0.05, 0.25, 0.5, 0.75, 0.99]

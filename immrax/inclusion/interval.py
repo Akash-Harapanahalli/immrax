@@ -420,3 +420,8 @@ def scale (i: Interval, factor: Union[float, ArrayLike]) -> Interval:
         The scaled interval.
     """
     return icentpert(i.center, i.pert * factor)
+
+
+def isinterval(x) -> bool:
+    """Check if x is an Interval."""
+    return isinstance(x, Interval)
