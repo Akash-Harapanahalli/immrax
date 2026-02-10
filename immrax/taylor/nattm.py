@@ -6,7 +6,7 @@ propagating polynomial approximations with rigorous remainder bounds.
 """
 
 from functools import wraps, partial
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 from jaxtyping import Array, ArrayLike
 
 import equinox as eqx
@@ -86,23 +86,22 @@ def istaylormodel(x) -> bool:
 def nattm(
     f: Callable[..., jax.Array],
     *,
-    fixed_argnums: int | Sequence[int] = None,
-    max_order: int | None = None,
+    max_order: "int | tuple[int, ...] | None" = None,
 ) -> Callable[..., TaylorModel]:
     """Creates a Natural Taylor Model Function of f.
 
-    All (non-fixed) positional arguments are assumed to be replaced with
-    TaylorModel arguments for the inclusion function.
+    Non-TaylorModel positional arguments are automatically closed over
+    (treated as constants during tracing).
 
     Parameters
     ----------
     f : Callable[..., jax.Array]
         Function to construct Natural Taylor Model Function from
-    fixed_argnums : int|Sequence[int]
-        Positional arguments to be treated as jax.Array instead of TaylorModel
-    max_order : int, optional
-        Maximum polynomial order to maintain. If None, uses the order of
-        the input TaylorModels.
+    max_order : int, tuple[int, ...], or None
+        Maximum polynomial order to maintain.  If an ``int``, it is
+        broadcast to every domain leaf.  If a ``tuple``, it must match
+        the per-leaf structure of the input TaylorModels' domain.
+        If ``None``, inferred from the input TaylorModels.
 
     Returns
     -------
@@ -113,21 +112,6 @@ def nattm(
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorModel:
         """Natural Taylor Model function."""
-
-        # Determine max_order from inputs if not specified
-        effective_order = max_order
-        if effective_order is None:
-            for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylormodel):
-                if istaylormodel(arg):
-                    effective_order = (
-                        arg._per_leaf_order
-                        if effective_order is None
-                        else _max_order(effective_order, arg._per_leaf_order)
-                    )
-            if effective_order is None:
-                effective_order = (
-                    2,
-                )  # Default order as tuple (will be broadcast in constructors)
 
         # Separate TM args from non-TM args
         tm_args = [a for a in jax.tree_util.tree_leaves(args, is_leaf=istaylormodel) if istaylormodel(a)]
@@ -142,6 +126,17 @@ def nattm(
         else:
             tm_concat = taylor_model_concatenate(tm_args)
         output_pytree = tm_concat._output_pytree
+
+        # Determine effective_order as tuple[int, ...], matching domain leaves
+        if max_order is not None:
+            if isinstance(max_order, int):
+                effective_order = tuple(
+                    max_order for _ in tm_concat._per_leaf_order
+                )
+            else:
+                effective_order = tuple(max_order)
+        else:
+            effective_order = tm_concat._per_leaf_order
 
         # Build f_tm that closes over non-TM args and kwargs,
         # receives the TM output leaves as positional args
@@ -191,7 +186,7 @@ def nattm_jaxpr(
     jaxpr: Jaxpr,
     consts,
     *args,
-    max_order: int = 2,
+    max_order: "int | tuple[int, ...] " = 2,
     propagate_source_info=True,
     output_pytree: "PyTreeShape | None" = None,
 ) -> list[Any]:
@@ -205,8 +200,8 @@ def nattm_jaxpr(
         Constants for the jaxpr.
     *args : TaylorModel or Array
         Input arguments.
-    max_order : int
-        Maximum polynomial order.
+    max_order : int or tuple[int, ...]
+        Maximum polynomial order (per-leaf tuple or broadcast int).
     propagate_source_info : bool
         Whether to propagate source info for debugging.
     output_pytree : PyTreeShape, optional

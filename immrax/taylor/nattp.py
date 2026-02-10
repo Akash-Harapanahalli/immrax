@@ -6,7 +6,7 @@ tracking them in an interval remainder.
 """
 
 from functools import wraps
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import equinox as eqx
 import jax
@@ -128,7 +128,7 @@ def _tp_from_array(
 def nattp(
     f: Callable[..., jax.Array],
     *,
-    max_order: int | None = None,
+    max_order: "int | tuple[int, ...] | None" = None,
 ) -> Callable[..., TaylorPolynomial]:
     """Creates a Natural Taylor Polynomial Function of *f*.
 
@@ -140,25 +140,15 @@ def nattp(
     ----------
     f : Callable
         Function to transform.
-    max_order : int, optional
-        Maximum polynomial order.  If ``None``, inferred from inputs.
+    max_order : int, tuple[int, ...], or None
+        Maximum polynomial order.  If an ``int``, it is broadcast to
+        every domain leaf.  If a ``tuple``, it must match the per-leaf
+        structure of the input TaylorPolynomials' domain.
+        If ``None``, inferred from inputs.
     """
 
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorPolynomial:
-        effective_order = max_order
-        if effective_order is None:
-            for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial):
-                if istaylorpolynomial(arg):
-                    effective_order = (
-                        arg.max_order
-                        if effective_order is None
-                        else max(effective_order, arg.max_order)
-                    )
-
-            if effective_order is None:
-                effective_order = 2
-
         # Separate TP args from non-TP args
         tp_args = [a for a in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial) if istaylorpolynomial(a)]
 
@@ -172,6 +162,17 @@ def nattp(
         else:
             tp_concat = taylor_polynomial_concatenate(tp_args)
         output_pytree = tp_concat._output_pytree
+
+        # Determine effective_order as tuple[int, ...], matching domain leaves
+        if max_order is not None:
+            if isinstance(max_order, int):
+                effective_order = tuple(
+                    max_order for _ in tp_concat._per_leaf_order
+                )
+            else:
+                effective_order = tuple(max_order)
+        else:
+            effective_order = tp_concat._per_leaf_order
 
         # Build f_tp that closes over non-TP args and kwargs,
         # receives the TP output leaves as positional args
@@ -219,7 +220,7 @@ def nattp_jaxpr(
     jaxpr: Jaxpr,
     consts,
     *args,
-    max_order: int = 2,
+    max_order: "int | tuple[int, ...]" = 2,
     propagate_source_info: bool = True,
     output_pytree: "PyTreeShape | None" = None,
 ) -> list[Any]:
