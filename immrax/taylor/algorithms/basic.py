@@ -29,7 +29,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         self.eps = kwargs.get("eps", 1e-2)
         self.delta = kwargs.get("delta", 1e-2)
 
-    def _picard(self, tm_tx: TaylorModel) -> TaylorModel:
+    def _picard(self, tm_tx: TaylorModel, u=None) -> TaylorModel:
         """Apply the Picard operator to the TaylorModel tm_tx over the domain of the TaylorModel.
 
         The Picard operator is defined as:
@@ -49,7 +49,10 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         # nattm now handles multi-arg: pass t identity and tm_tx as separate args
         tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
-        f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx)
+        if u is not None:
+            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx, u)
+        else:
+            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx)
         tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
         con_sh = tm_ic.coeffs.shape
@@ -68,9 +71,14 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         )
 
     def _step(self, t: float, tmi: TaylorModel, dt_max: float, **kwargs):
+        u = kwargs.get('u', None)
+
         # Step 1: Compute the Taylor expansion of the flow map to t_order, x_order
 
-        poly_coeffs = nattp(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
+        if u is not None:
+            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x, u))(tmi.polynomial)
+        else:
+            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
         poly = tps_to_tx(
             poly_coeffs,
             tmi.remainder,
@@ -99,7 +107,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
                 contractive,
                 lambda: contractive,
                 lambda: (
-                    check_containment(self._picard(poly).remainder, poly.remainder) == 1
+                    check_containment(self._picard(poly, u=u).remainder, poly.remainder) == 1
                 ),
             )
 

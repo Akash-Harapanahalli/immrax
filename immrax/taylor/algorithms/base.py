@@ -329,7 +329,7 @@ class TMFlowpipeGenerator(ABC):
         """
 
     def generate_flowpipe(
-        self, t0, tf, tm0, dt_max, *, t_order=4, max_steps=4096, **kwargs
+        self, t0, tf, tm0, dt_max, *, t_order=4, max_steps=4096, inputs=None, **kwargs
     ):
         """Generate a validated flowpipe for the given system.
 
@@ -345,6 +345,10 @@ class TMFlowpipeGenerator(ABC):
             Maximum allowed step size.
         max_steps : int, optional
             Maximum number of steps, by default 4096.
+        inputs : Array, optional
+            Piecewise-constant inputs of shape ``(max_steps, ...)``.
+            ``inputs[i]`` is held constant during step ``i``, spaced at
+            exactly ``dt_max``.
         **kwargs
             Keyword arguments to pass to the step function.
 
@@ -361,18 +365,45 @@ class TMFlowpipeGenerator(ABC):
             t0, tf, tm0, dt_max, t_order=t_order, max_steps=max_steps, **kwargs
         )
 
-        # Take the first step outside the scan to establish the tube
-        # array structure (needed for the noop branch of lax.cond).
-        dt0, tmf0, tube0, success0 = self._step(t0, tm0, dt_max, **kwargs)
-        tube0_data = _tube_to_data(tube0)
-        dummy_data = jax.tree.map(jnp.zeros_like, tube0_data)
+        # Compute tube structure metadata from tm0 without running a step
+        mon_len = tm0.polynomial.exponents.shape[1]
+        n_out = tm0.coeffs.shape[0]
 
-        def scan_fn(carry, _):
+        tube_exponents = jnp.vstack((
+            jnp.repeat(jnp.arange(t_order + 1), mon_len),
+            jnp.tile(tm0.polynomial.exponents, (1, t_order + 1)),
+        ))
+
+        tube_domain = (interval(t0, t0 + dt_max), tm0.domain)
+        tube_center = (t0, tm0.center)
+        _domain_treedef, _leaf_shapes, flat_tube_domain = _pytree_to_flattened_array(tube_domain)
+        _, _, flat_tube_center = _pytree_to_flattened_array(tube_center)
+
+        tube_input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+        tube_output_pytree = PyTreeShape.flat((n_out,))
+        tube_per_leaf_order = (t_order,) + tm0._per_leaf_order
+
+        # Dummy tube data for noop branch of lax.cond
+        dummy_data = (
+            jnp.zeros((n_out, mon_len * (t_order + 1))),
+            jnp.zeros_like(tm0.remainder.lower),
+            jnp.zeros_like(tm0.remainder.upper),
+            jnp.zeros_like(flat_tube_domain.lower),
+            jnp.zeros_like(flat_tube_domain.upper),
+            jnp.zeros_like(flat_tube_center),
+        )
+
+        def scan_fn(carry, step_idx):
             ti, tmi, success, steps_taken = carry
             should_step = jnp.logical_and(success, ti < tf)
 
+            u_i = inputs[step_idx] if inputs is not None else None
+
             def take_step():
-                dt, tmf, tm_tube, step_success = self._step(ti, tmi, dt_max, **kwargs)
+                step_kw = dict(kwargs)
+                if u_i is not None:
+                    step_kw['u'] = u_i
+                dt, tmf, tm_tube, step_success = self._step(ti, tmi, dt_max, **step_kw)
                 return (ti + dt, tmf, step_success, steps_taken + 1), (
                     ti + dt,
                     _tube_to_data(tm_tube),
@@ -383,30 +414,19 @@ class TMFlowpipeGenerator(ABC):
 
             return jax.lax.cond(should_step, take_step, noop)
 
-        init_carry = (t0 + dt0, tmf0, success0, jnp.int32(1))
+        init_carry = (t0, tm0, jnp.bool_(True), jnp.int32(0))
         (
             (final_t, final_tm, final_success, final_steps),
-            (
-                scan_times,
-                scan_tube_data,
-            ),
-        ) = jax.lax.scan(scan_fn, init_carry, jnp.arange(max_steps - 1))
-
-        # Prepend first step result
-        times = jnp.concatenate([jnp.array([t0 + dt0]), scan_times])
-        tube_data = jax.tree.map(
-            lambda first, rest: jnp.concatenate([first[None], rest]),
-            tube0_data,
-            scan_tube_data,
-        )
+            (scan_times, scan_tube_data),
+        ) = jax.lax.scan(scan_fn, init_carry, jnp.arange(max_steps))
 
         return TMFlowpipe(
-            times,
-            tube_data,
-            tube0.exponents,
+            scan_times,
+            scan_tube_data,
+            tube_exponents,
             final_steps,
             final_success,
-            _input_pytree=tube0._input_pytree,
-            _output_pytree=tube0._output_pytree,
-            _per_leaf_order=tube0._per_leaf_order,
+            _input_pytree=tube_input_pytree,
+            _output_pytree=tube_output_pytree,
+            _per_leaf_order=tube_per_leaf_order,
         )
