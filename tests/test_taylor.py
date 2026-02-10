@@ -324,5 +324,5 @@ def test_multiarg():
 
     tm_joint = taylor_model_identity([it0, itx, itw], center, order)
 
-    tm_f = nattm(f, structured_center=True)(tm_joint)
+    tm_f = nattm(f)(tm_joint)
     print(tm_f)

@@ -45,7 +45,7 @@ def gen_flowpipe(t0, tf, tmx, dt, delta, eps):
     )
 
 
-fp, times = irx.utils.run_times(1, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
+fp, times = irx.utils.run_times(10, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
 
 # assert fp.success, "Flowpipe generation failed"
 # assert fp.nsteps > 0, "No steps taken"

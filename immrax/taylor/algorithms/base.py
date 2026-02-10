@@ -11,6 +11,7 @@ from immrax.inclusion import Interval, interval
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
 from .. import TaylorModel, TaylorPolynomial, taylor_model, _pytree_to_flattened_array
+from ..taylor_model import PyTreeShape
 
 from typing import Tuple
 
@@ -61,14 +62,18 @@ def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
         axis=0,
     )
 
+    new_input_pytree = PyTreeShape(
+        tm._domain_treedef.children()[1],
+        tm._leaf_shapes[1:],
+    )
     return TaylorModel(
         coeffs=coeffs,
         exponents=exponents,
         remainder=tm.remainder,
         flat_domain=tm.flat_domain[1:],
         flat_center=tm.flat_center[1:],
-        _domain_treedef=tm._domain_treedef.children()[1],
-        _leaf_shapes=tm._leaf_shapes[1:],
+        _input_pytree=new_input_pytree,
+        _output_pytree=tm._output_pytree,
         _per_leaf_order=tm._per_leaf_order[1:],
     )
 
@@ -121,8 +126,8 @@ def tps_to_tx(
             remainder,
             flat_domain,
             flat_center,
-            _domain_treedef=_domain_treedef,
-            _leaf_shapes=_leaf_shapes,
+            _input_pytree=PyTreeShape(_domain_treedef, _leaf_shapes),
+            _output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
             _per_leaf_order=per_leaf_order,
         )
 
@@ -154,14 +159,21 @@ class TMFlowpipe:
     """
 
     def __init__(self, times, tube_data, exponents, nsteps, success,
-                 *, _domain_treedef, _leaf_shapes, _per_leaf_order):
+                 *, _input_pytree, _output_pytree, _per_leaf_order,
+                 # Legacy kwargs
+                 _domain_treedef=None, _leaf_shapes=None):
         self.times = times
         self._tube_data = tube_data
         self.exponents = exponents
         self.nsteps = nsteps
         self.success = success
-        self._domain_treedef = _domain_treedef
-        self._leaf_shapes = _leaf_shapes
+        if _input_pytree is not None:
+            self._input_pytree = _input_pytree
+        elif _domain_treedef is not None and _leaf_shapes is not None:
+            self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+        else:
+            raise ValueError("Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided")
+        self._output_pytree = _output_pytree if _output_pytree is not None else PyTreeShape.flat(())
         self._per_leaf_order = _per_leaf_order
 
     def __len__(self):
@@ -178,8 +190,8 @@ class TMFlowpipe:
             interval(rem_lo, rem_hi),
             interval(dom_lo, dom_hi),
             center,
-            _domain_treedef=self._domain_treedef,
-            _leaf_shapes=self._leaf_shapes,
+            _input_pytree=self._input_pytree,
+            _output_pytree=self._output_pytree,
             _per_leaf_order=self._per_leaf_order,
         )
 
@@ -209,8 +221,8 @@ class TMFlowpipe:
     def tree_flatten(self):
         children = (self.times, self._tube_data, self.exponents, self.nsteps, self.success)
         aux = {
-            "_domain_treedef": self._domain_treedef,
-            "_leaf_shapes": self._leaf_shapes,
+            "_input_pytree": self._input_pytree,
+            "_output_pytree": self._output_pytree,
             "_per_leaf_order": self._per_leaf_order,
         }
         return children, aux
@@ -220,8 +232,8 @@ class TMFlowpipe:
         times, tube_data, exponents, nsteps, success = children
         return cls(
             times, tube_data, exponents, nsteps, success,
-            _domain_treedef=aux["_domain_treedef"],
-            _leaf_shapes=aux["_leaf_shapes"],
+            _input_pytree=aux["_input_pytree"],
+            _output_pytree=aux["_output_pytree"],
             _per_leaf_order=aux["_per_leaf_order"],
         )
 
@@ -348,7 +360,7 @@ class TMFlowpipeGenerator(ABC):
 
         return TMFlowpipe(
             times, tube_data, tube0.exponents, final_steps, final_success,
-            _domain_treedef=tube0._domain_treedef,
-            _leaf_shapes=tube0._leaf_shapes,
+            _input_pytree=tube0._input_pytree,
+            _output_pytree=tube0._output_pytree,
             _per_leaf_order=tube0._per_leaf_order,
         )

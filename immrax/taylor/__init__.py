@@ -7,6 +7,7 @@ them through functions, similar to natif for intervals.
 
 from .taylor_model import (
     TaylorModel,
+    PyTreeShape,
     taylor_model,
     taylor_model_identity,
     taylor_model_constant,
@@ -24,7 +25,7 @@ from .taylor_model import (
     _normalize_order_pytree,
 )
 
-from .taylor_polynomial import TaylorPolynomial
+from .taylor_polynomial import TaylorPolynomial, taylor_polynomial_concatenate
 
 from .nattm import (
     nattm,
@@ -49,6 +50,7 @@ from .algorithms import (
 __all__ = [
     # Taylor Model class and constructors
     "TaylorModel",
+    "PyTreeShape",
     "taylor_model",
     "taylor_model_identity",
     "taylor_model_constant",
@@ -57,6 +59,7 @@ __all__ = [
     "integrate_variable",
     # Taylor Polynomial class
     "TaylorPolynomial",
+    "taylor_polynomial_concatenate",
     # Natural Taylor Model function
     "nattm",
     "nattm_jaxpr",

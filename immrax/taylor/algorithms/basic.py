@@ -47,15 +47,9 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         # Initial condition
         tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower, self.t_order)
 
-        # Construct augmented TM: (t, x0) -> (t, phi_1, ..., phi_n)
-        # This is needed because structured_center=True slices the TM's *output*
-        # according to leaf_shapes. The flow map tm_tx has output shape (n,) but
-        # the domain has total dim 1+n, so we prepend a time-identity TM.
+        # nattm now handles multi-arg: pass t identity and tm_tx as separate args
         tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
-        tm_aug = taylor_model_concatenate([tm_id[0:1], tm_tx])
-
-        # Integration
-        f_tm_tx = nattm(self.sys.f, structured_center=True)(tm_aug)
+        f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx)
         tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
         con_sh = tm_ic.coeffs.shape
@@ -68,8 +62,8 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
             remainder=tm_int.remainder,
             flat_domain=tm_int.flat_domain,
             flat_center=tm_int.flat_center,
-            _domain_treedef=tm_int._domain_treedef,
-            _leaf_shapes=tm_int._leaf_shapes,
+            _input_pytree=tm_int._input_pytree,
+            _output_pytree=tm_int._output_pytree,
             _per_leaf_order=tm_int._per_leaf_order,
         )
 

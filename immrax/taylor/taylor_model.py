@@ -107,6 +107,75 @@ def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
     return jax.tree_util.tree_unflatten(treedef, leaves)
 
 
+class PyTreeShape:
+    """Lightweight, hashable, immutable descriptor for pytree structure.
+
+    Unifies the ``(treedef, leaf_shapes)`` pair used throughout the Taylor
+    model codebase.  Used for both input (domain) and output structure.
+    """
+
+    __slots__ = ("treedef", "leaf_shapes")
+
+    def __init__(self, treedef: PyTreeDef, leaf_shapes: "tuple[tuple[int, ...], ...]"):
+        object.__setattr__(self, "treedef", treedef)
+        object.__setattr__(self, "leaf_shapes", tuple(tuple(s) for s in leaf_shapes))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("PyTreeShape is immutable")
+
+    # --- Properties ---
+
+    @property
+    def flat_size(self) -> int:
+        """Total number of scalar elements across all leaves."""
+        return sum(math.prod(s) if s else 1 for s in self.leaf_shapes)
+
+    @property
+    def num_leaves(self) -> int:
+        """Number of leaves in the pytree."""
+        return len(self.leaf_shapes)
+
+    # --- Methods ---
+
+    def unflatten(self, flat_array):
+        """Reshape a flat array into the pytree structure."""
+        return _unflatten_array_to_pytree(self.treedef, self.leaf_shapes, flat_array)
+
+    def leaf_slice(self, idx: int) -> slice:
+        """Get contiguous slice for leaf ``idx`` in the flat representation."""
+        return _leaf_slice(self.leaf_shapes, idx)
+
+    # --- Constructors ---
+
+    @classmethod
+    def flat(cls, shape: "tuple[int, ...]") -> "PyTreeShape":
+        """Create a PyTreeShape for a single flat leaf with the given shape."""
+        dummy = jnp.zeros(shape)
+        treedef = jax.tree_util.tree_structure(dummy)
+        return cls(treedef, (tuple(shape),))
+
+    @classmethod
+    def from_pytree(cls, pytree) -> "PyTreeShape":
+        """Extract PyTreeShape from a pytree, discarding data."""
+        treedef = jax.tree_util.tree_structure(pytree, is_leaf=_is_interval_or_array_leaf)
+        leaves = jax.tree_util.tree_leaves(pytree, is_leaf=_is_interval_or_array_leaf)
+        leaf_shapes = tuple(leaf.shape for leaf in leaves)
+        return cls(treedef, leaf_shapes)
+
+    # --- Hashability (required for JAX aux_data) ---
+
+    def __eq__(self, other):
+        if not isinstance(other, PyTreeShape):
+            return NotImplemented
+        return self.treedef == other.treedef and self.leaf_shapes == other.leaf_shapes
+
+    def __hash__(self):
+        return hash((self.treedef, self.leaf_shapes))
+
+    def __repr__(self):
+        return f"PyTreeShape(treedef={self.treedef}, leaf_shapes={self.leaf_shapes})"
+
+
 def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
     """Normalize order specification to per-leaf and per-variable tuples.
 
@@ -374,10 +443,8 @@ class TaylorModel:
     coeffs: Array  # Polynomial coefficients, shape (*output_shape, num_monomials)
     exponents: Array  # Exponent matrix, shape (d, num_monomials)
     remainder: Interval  # Interval remainder, shape (*output_shape,)
-    domain: Interval  # Domain box, shape (d,)
-    center: Array  # Expansion point, shape (d,)
-    _domain_treedef: PyTreeDef
-    _leaf_shapes: tuple[tuple[int, ...], ...]
+    _input_pytree: PyTreeShape
+    _output_pytree: PyTreeShape
     _per_leaf_order: tuple[int, ...]
 
     def __init__(
@@ -387,9 +454,13 @@ class TaylorModel:
         remainder: Interval,
         flat_domain: Interval,
         flat_center: ArrayLike,
-        _domain_treedef: PyTreeDef,
-        _leaf_shapes: tuple[tuple[int, ...], ...],
-        _per_leaf_order: tuple[int, ...],
+        *,
+        _input_pytree: "PyTreeShape | None" = None,
+        _output_pytree: "PyTreeShape | None" = None,
+        _per_leaf_order: "tuple[int, ...] | None" = None,
+        # Legacy kwargs for backward compatibility during migration
+        _domain_treedef: "PyTreeDef | None" = None,
+        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
     ) -> None:
         """
         Initialize a TaylorModel. This is a low-level constructor that should
@@ -406,16 +477,32 @@ class TaylorModel:
 
         self._output_shape = self.coeffs.shape[:-1]  # Last axis is monomial axis
 
-        self._domain_treedef = _domain_treedef
-        self._leaf_shapes = _leaf_shapes
+        # Handle _input_pytree: either from new kwarg or legacy kwargs
+        if _input_pytree is not None:
+            self._input_pytree = _input_pytree
+        elif _domain_treedef is not None and _leaf_shapes is not None:
+            self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+        else:
+            raise ValueError("Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided")
+
+        # Handle _output_pytree: new kwarg or default to flat output
+        if _output_pytree is not None:
+            self._output_pytree = _output_pytree
+        else:
+            self._output_pytree = PyTreeShape.flat(self._output_shape)
+
         self._per_leaf_order = _per_leaf_order
 
-        if self._domain_treedef is None:
-            raise ValueError("_domain_treedef cannot be None")
-        if self._leaf_shapes is None:
-            raise ValueError("_leaf_shapes cannot be None")
         if self._per_leaf_order is None:
             raise ValueError("_per_leaf_order cannot be None")
+
+        # Validate _output_pytree.flat_size matches output shape
+        expected_flat = math.prod(self._output_shape) if self._output_shape else 1
+        if self._output_pytree.flat_size != expected_flat:
+            raise ValueError(
+                f"_output_pytree.flat_size ({self._output_pytree.flat_size}) must match "
+                f"prod(coeffs.shape[:-1]) ({expected_flat})"
+            )
 
         # Validate dimensions
         if self.coeffs.ndim < 1:
@@ -441,18 +528,24 @@ class TaylorModel:
             )
 
     @property
+    def _domain_treedef(self):
+        """PyTree structure of the domain (convenience accessor)."""
+        return self._input_pytree.treedef
+
+    @property
+    def _leaf_shapes(self):
+        """Shapes of each leaf Interval in the domain pytree (convenience accessor)."""
+        return self._input_pytree.leaf_shapes
+
+    @property
     def domain(self):
         """Structured domain (PyTree of Intervals)."""
-        return _unflatten_array_to_pytree(
-            self._domain_treedef, self._leaf_shapes, self.flat_domain
-        )
+        return self._input_pytree.unflatten(self.flat_domain)
 
     @property
     def center(self):
         """Structured center (PyTree of Arrays)."""
-        return _unflatten_array_to_pytree(
-            self._domain_treedef, self._leaf_shapes, self.flat_center
-        )
+        return self._input_pytree.unflatten(self.flat_center)
 
     # --- Pytree methods ---
 
@@ -468,17 +561,16 @@ class TaylorModel:
                 self.flat_center,
             ),
             {
-                "_output_shape": self._output_shape,
-                "_domain_treedef": self._domain_treedef,
-                "_leaf_shapes": self._leaf_shapes,
+                "_input_pytree": self._input_pytree,
+                "_output_pytree": self._output_pytree,
                 "_per_leaf_order": self._per_leaf_order,
             },
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
-        domain_treedef = aux_data.get("_domain_treedef") if aux_data else None
-        leaf_shapes = aux_data.get("_leaf_shapes") if aux_data else None
+        input_pytree = aux_data.get("_input_pytree") if aux_data else None
+        output_pytree = aux_data.get("_output_pytree") if aux_data else None
         per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
         # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
         coeffs, exponents, remainder, flat_domain, flat_center = children
@@ -488,8 +580,8 @@ class TaylorModel:
             remainder,
             flat_domain,
             flat_center,
-            _domain_treedef=domain_treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=input_pytree,
+            _output_pytree=output_pytree,
             _per_leaf_order=per_leaf_order,
         )
 
@@ -535,12 +627,12 @@ class TaylorModel:
     @property
     def domain_treedef(self) -> "jax.tree_util.PyTreeDef | None":
         """PyTree structure of the original domain, or None for single Interval."""
-        return self._domain_treedef
+        return self._input_pytree.treedef
 
     @property
     def leaf_shapes(self) -> "tuple[tuple[int, ...], ...] | None":
         """Shapes of each leaf Interval in the domain pytree, or None."""
-        return self._leaf_shapes
+        return self._input_pytree.leaf_shapes
 
     @property
     def per_leaf_order(self) -> "tuple[int, ...]":
@@ -549,13 +641,14 @@ class TaylorModel:
 
     @property
     def structured_center(self):
-        """Get the center of the domain as a structured pytree.
+        """Get the center as a structured pytree matching the output pytree structure.
 
-        Returns the center reshaped to match the original domain pytree structure.
+        If output has multiple leaves, uses _output_pytree to unflatten.
+        Otherwise falls back to _input_pytree (backward-compatible for identity TMs).
         """
-        return _unflatten_array_to_pytree(
-            self._domain_treedef, self._leaf_shapes, self.flat_center
-        )
+        if self._output_pytree.num_leaves > 1:
+            return self._output_pytree.unflatten(self.flat_center)
+        return self._input_pytree.unflatten(self.flat_center)
 
     def __getitem__(self, idx) -> "TaylorModel":
         """Get component(s) of the Taylor Model.
@@ -574,27 +667,14 @@ class TaylorModel:
         # Index remainder the same way
         rem = self.remainder[idx]
 
-        # Ensure remainder shape matches coeffs output shape
-        rem_shape = rem.shape if hasattr(rem, "shape") else ()
-        coeff_out_shape = c.shape[:-1]
-
-        if rem_shape != coeff_out_shape:
-            # Need to reshape remainder to match
-            if rem_shape == ():
-                # Scalar interval - keep as scalar output shape
-                pass
-            else:
-                # Reshape not needed, shapes should match from same indexing
-                pass
-
         return TaylorModel(
             c,
             self.exponents,
             rem,
             self.flat_domain,
             self.flat_center,
-            _domain_treedef=self._domain_treedef,
-            _leaf_shapes=self._leaf_shapes,
+            _input_pytree=self._input_pytree,
+            _output_pytree=PyTreeShape.flat(c.shape[:-1]),
             _per_leaf_order=self._per_leaf_order,
         )
 
@@ -632,8 +712,8 @@ class TaylorModel:
             self.coeffs,
             self.exponents,
             self.flat_center,
-            _domain_treedef=self._domain_treedef,
-            _leaf_shapes=self._leaf_shapes,
+            _input_pytree=self._input_pytree,
+            _output_pytree=self._output_pytree,
             _per_leaf_order=self._per_leaf_order,
         )
 
@@ -903,8 +983,8 @@ class TaylorModel:
             new_remainder,
             self.flat_domain,
             self.flat_center,
-            _domain_treedef=self._domain_treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=PyTreeShape(self._domain_treedef, leaf_shapes),
+            _output_pytree=self._output_pytree,
             _per_leaf_order=per_leaf_order,
         )
 
@@ -971,8 +1051,8 @@ class TaylorModel:
             new_remainder,
             self.flat_domain,
             self.flat_center,
-            _domain_treedef=self._domain_treedef,
-            _leaf_shapes=self._leaf_shapes,
+            _input_pytree=self._input_pytree,
+            _output_pytree=self._output_pytree,
             _per_leaf_order=target_order,
         )
 
@@ -1175,8 +1255,8 @@ def taylor_model(
         remainder,
         flat_domain,
         flat_center,
-        _domain_treedef=_domain_treedef,
-        _leaf_shapes=_leaf_shapes,
+        _input_pytree=PyTreeShape(_domain_treedef, _leaf_shapes),
+        _output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
         _per_leaf_order=_per_leaf_order,
     )
 
@@ -1189,6 +1269,8 @@ def _taylor_model_constant_impl(
     _domain_treedef: "PyTreeDef | None" = None,
     _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
     _per_leaf_order: "tuple[int, ...] | None" = None,
+    _input_pytree: "PyTreeShape | None" = None,
+    _output_pytree: "PyTreeShape | None" = None,
 ) -> TaylorModel:
     """Internal implementation for taylor_model_constant."""
     iv = interval(iv)
@@ -1196,9 +1278,15 @@ def _taylor_model_constant_impl(
     output_shape = iv.lower.shape
     flat_domain = domain
 
-    # Set default leaf_shapes if not provided
-    if _leaf_shapes is None:
-        _leaf_shapes = (flat_domain.shape,)
+    # Resolve _input_pytree
+    if _input_pytree is None:
+        if _leaf_shapes is None:
+            _leaf_shapes = (flat_domain.shape,)
+        if _domain_treedef is None:
+            _domain_treedef = jax.tree_util.tree_structure(jnp.zeros(flat_domain.shape))
+        _input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+    else:
+        _leaf_shapes = _input_pytree.leaf_shapes
 
     num_leaves = len(_leaf_shapes)
 
@@ -1216,14 +1304,17 @@ def _taylor_model_constant_impl(
     coeffs = jnp.zeros((*output_shape, exponents.shape[1]), dtype=iv.lower.dtype)
     coeffs = coeffs.at[..., 0].set(iv.center)
 
+    if _output_pytree is None:
+        _output_pytree = PyTreeShape.flat(output_shape)
+
     return TaylorModel(
         coeffs,
         exponents,
         iv - iv.center,
         flat_domain,
         center,
-        _domain_treedef=_domain_treedef,
-        _leaf_shapes=_leaf_shapes,
+        _input_pytree=_input_pytree,
+        _output_pytree=_output_pytree,
         _per_leaf_order=_per_leaf_order,
     )
 
@@ -1278,8 +1369,7 @@ def taylor_model_constant(
         flat_domain,
         order,
         center=flat_center,
-        _domain_treedef=treedef,
-        _leaf_shapes=leaf_shapes,
+        _input_pytree=PyTreeShape(treedef, leaf_shapes),
         _per_leaf_order=per_leaf_order,
     )
 
@@ -1368,14 +1458,18 @@ def taylor_model_identity(
     # Remainder is zero since this is exact
     remainder = interval(jnp.zeros(total_dim, dtype=center_flat.dtype))
 
+    input_pytree = PyTreeShape(treedef, leaf_shapes)
+    # For identity, output matches domain structure
+    output_pytree = PyTreeShape(treedef, leaf_shapes)
+
     return TaylorModel(
         coeffs,
         exponents,
         remainder,
         flat_domain,
         center_flat,
-        _domain_treedef=treedef,
-        _leaf_shapes=leaf_shapes,
+        _input_pytree=input_pytree,
+        _output_pytree=output_pytree,
         _per_leaf_order=per_leaf_order,
     )
 
@@ -1491,6 +1585,8 @@ def taylor_model_from_function(
     # We need the max order integer for the loop
     max_k = max(per_leaf_order)
 
+    input_pytree = PyTreeShape(treedef, leaf_shapes)
+
     if max_k == 0:
         return TaylorModel(
             f_center.reshape(-1, 1),
@@ -1498,8 +1594,8 @@ def taylor_model_from_function(
             icentpert(jnp.zeros(n), jnp.zeros(n)),
             flat_domain,
             flat_center=expansion_center,
-            _domain_treedef=treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=input_pytree,
+            _output_pytree=PyTreeShape.flat(f_center.shape),
             _per_leaf_order=per_leaf_order,
         )
 
@@ -1574,8 +1670,8 @@ def taylor_model_from_function(
         remainder,
         flat_domain,
         flat_center=expansion_center,
-        _domain_treedef=treedef,
-        _leaf_shapes=leaf_shapes,
+        _input_pytree=input_pytree,
+        _output_pytree=PyTreeShape.flat(f_center.shape),
         _per_leaf_order=per_leaf_order,
     )
 
@@ -1747,8 +1843,8 @@ def tm_evaluate_at_variable(
         tm.remainder,
         new_domain,
         flat_center=new_center,
-        _domain_treedef=new_domain_treedef,
-        _leaf_shapes=new_leaf_shapes,
+        _input_pytree=PyTreeShape(new_domain_treedef, new_leaf_shapes),
+        _output_pytree=tm._output_pytree,
         _per_leaf_order=new_per_leaf_order,
     )
 
@@ -1948,8 +2044,8 @@ def tm_integrate_variable(
             total_remainder,
             tm.flat_domain,
             flat_center=tm.flat_center,
-            _domain_treedef=tm._domain_treedef,
-            _leaf_shapes=tm._leaf_shapes,
+            _input_pytree=tm._input_pytree,
+            _output_pytree=tm._output_pytree,
             _per_leaf_order=tm._per_leaf_order,
         )
     else:
@@ -1959,8 +2055,8 @@ def tm_integrate_variable(
             integ_remainder,
             tm.flat_domain,
             flat_center=tm.flat_center,
-            _domain_treedef=tm._domain_treedef,
-            _leaf_shapes=tm._leaf_shapes,
+            _input_pytree=tm._input_pytree,
+            _output_pytree=tm._output_pytree,
             _per_leaf_order=new_per_leaf_order,
         )
 
@@ -2011,14 +2107,24 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
         jnp.concatenate([tm.remainder.upper for tm in tms], axis=axis),
     )
 
+    # Build merged _output_pytree from all input TMs' output pytrees
+    merged_leaf_shapes = []
+    for tm in tms:
+        merged_leaf_shapes.extend(tm._output_pytree.leaf_shapes)
+    merged_leaf_shapes = tuple(merged_leaf_shapes)
+    # Use a list treedef for the merged output
+    dummy_leaves = [jnp.zeros(s) for s in merged_leaf_shapes]
+    merged_treedef = jax.tree_util.tree_structure(dummy_leaves, is_leaf=_is_interval_or_array_leaf)
+    output_pytree = PyTreeShape(merged_treedef, merged_leaf_shapes)
+
     return TaylorModel(
         coeffs,
         exponents,
         remainder,
         ref.flat_domain,
         flat_center=ref.flat_center,
-        _domain_treedef=ref._domain_treedef,
-        _leaf_shapes=ref._leaf_shapes,
+        _input_pytree=ref._input_pytree,
+        _output_pytree=output_pytree,
         _per_leaf_order=per_leaf_order,
     )
 

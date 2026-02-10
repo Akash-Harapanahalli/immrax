@@ -28,8 +28,9 @@ from jax._src.debugging import debug_callback_p
 from jax.experimental.jet import jet
 from jaxtyping import Array, ArrayLike
 
-from immrax.taylor.taylor_polynomial import TaylorPolynomial
+from immrax.taylor.taylor_polynomial import TaylorPolynomial, taylor_polynomial_concatenate
 from immrax.taylor.taylor_model import (
+    PyTreeShape,
     _get_canonical_exponents,
     _get_leaf_total_degree_exponents,
     _check_per_leaf_bounds,
@@ -62,18 +63,23 @@ def _tp_constant(
     d: int,
     order: "int | tuple[int, ...]",
     flat_center: jax.Array,
-    _domain_treedef: jax.tree_util.PyTreeDef,
-    _leaf_shapes: tuple[tuple[int, ...], ...],
-    _per_leaf_order: tuple[int, ...],
+    _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
+    _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+    _per_leaf_order: "tuple[int, ...] | None" = None,
+    _input_pytree: "PyTreeShape | None" = None,
+    _output_pytree: "PyTreeShape | None" = None,
 ) -> TaylorPolynomial:
 
-    output_shape = value.shape
-    # If order is a tuple (per-leaf), normalize for canonical exponents call
-    # Note: _get_canonical_exponents takes D and order.
-    # If using structured domains, order here is likely _per_leaf_order,
-    # so we should use _get_leaf_total_degree_exponents instead.
+    # Resolve _input_pytree
+    if _input_pytree is None:
+        _input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+    _leaf_shapes = _input_pytree.leaf_shapes
+    _per_leaf_order_resolved = _per_leaf_order if _per_leaf_order is not None else (
+        tuple([order] * len(_leaf_shapes)) if isinstance(order, int) else tuple(order)
+    )
 
-    exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order)
+    output_shape = value.shape
+    exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order_resolved)
 
     num_monomials = exponents.shape[1]
 
@@ -86,13 +92,16 @@ def _tp_constant(
         const_idx = jnp.argmin(jnp.sum(exponents, axis=0))
         coeffs = coeffs.at[..., const_idx].set(value)
 
+    if _output_pytree is None:
+        _output_pytree = PyTreeShape.flat(output_shape)
+
     return TaylorPolynomial(
         coeffs,
         exponents,
         flat_center,
-        _domain_treedef=_domain_treedef,
-        _leaf_shapes=_leaf_shapes,
-        _per_leaf_order=_per_leaf_order,
+        _input_pytree=_input_pytree,
+        _output_pytree=_output_pytree,
+        _per_leaf_order=_per_leaf_order_resolved,
     )
 
 
@@ -120,7 +129,6 @@ def nattp(
     f: Callable[..., jax.Array],
     *,
     max_order: int | None = None,
-    structured_center: bool = False,
 ) -> Callable[..., TaylorPolynomial]:
     """Creates a Natural Taylor Polynomial Function of *f*.
 
@@ -138,17 +146,6 @@ def nattp(
 
     @wraps(f)
     def wrapped(*args, **kwargs) -> TaylorPolynomial:
-        geteval = lambda x: (
-            x.evaluate(x.flat_center) if istaylorpolynomial(x) else jnp.asarray(x)
-        )
-        buildargs = jax.tree_util.tree_map(geteval, args, is_leaf=istaylorpolynomial)
-        buildkwargs = jax.tree_util.tree_map(
-            geteval, kwargs, is_leaf=istaylorpolynomial
-        )
-
-        # closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
-        # Moved inside logic below to handle structured unpacking
-
         effective_order = max_order
         if effective_order is None:
             for arg in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial):
@@ -162,36 +159,55 @@ def nattp(
             if effective_order is None:
                 effective_order = 2
 
-        if structured_center:
-            # Pass the single TP and its structure info for invar slicing
-            tp = args[0]
+        # Separate TP args from non-TP args
+        tp_args = [a for a in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial) if istaylorpolynomial(a)]
 
-            # Trace with the Unpacked center structure to match f's signature
-            # If center is a tuple/list, we assume it corresponds to *args
-            center_struct = tp.center
-            if isinstance(center_struct, (tuple, list)):
-                trace_args = center_struct
-            else:
-                trace_args = (center_struct,)
+        if not tp_args:
+            # No TP args at all — just evaluate f directly
+            return f(*args, **kwargs)
 
-            closed_jaxpr = eqx.filter_make_jaxpr(f)(*trace_args, **buildkwargs)[0]
-
-            out = nattp_jaxpr(
-                closed_jaxpr.jaxpr,
-                closed_jaxpr.literals,
-                tp,
-                max_order=effective_order,
-                structured_invar=True,
-                leaf_shapes=tp.leaf_shapes,
-            )
+        # Concatenate all TP args into one
+        if len(tp_args) == 1:
+            tp_concat = tp_args[0]
         else:
-            closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
-            out = nattp_jaxpr(
-                closed_jaxpr.jaxpr,
-                closed_jaxpr.literals,
-                *args,
-                max_order=effective_order,
-            )
+            tp_concat = taylor_polynomial_concatenate(tp_args)
+        output_pytree = tp_concat._output_pytree
+
+        # Build f_tp that closes over non-TP args and kwargs,
+        # receives the TP output leaves as positional args
+        def f_tp(*tp_leaves):
+            full_args = []
+            leaf_idx = 0
+            for i in range(len(args)):
+                if istaylorpolynomial(args[i]):
+                    n = args[i]._output_pytree.num_leaves
+                    if n == 1:
+                        full_args.append(tp_leaves[leaf_idx])
+                        leaf_idx += 1
+                    else:
+                        leaves = tp_leaves[leaf_idx:leaf_idx + n]
+                        reconstructed = args[i]._output_pytree.treedef.unflatten(leaves)
+                        if len(args) == 1 and isinstance(reconstructed, (list, tuple)):
+                            full_args.extend(reconstructed)
+                        else:
+                            full_args.append(reconstructed)
+                        leaf_idx += n
+                else:
+                    full_args.append(args[i])
+            return f(*full_args, **kwargs)
+
+        # Trace with zero-valued representatives
+        rep_args = tuple(jnp.zeros(shape) for shape in output_pytree.leaf_shapes)
+        closed_jaxpr = eqx.filter_make_jaxpr(f_tp)(*rep_args)[0]
+
+        out = nattp_jaxpr(
+            closed_jaxpr.jaxpr,
+            closed_jaxpr.literals,
+            tp_concat,
+            max_order=effective_order,
+            output_pytree=output_pytree,
+        )
+
         if len(out) == 1:
             return out[0]
         return out
@@ -205,8 +221,7 @@ def nattp_jaxpr(
     *args,
     max_order: int = 2,
     propagate_source_info: bool = True,
-    structured_invar: bool = False,
-    leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
+    output_pytree: "PyTreeShape | None" = None,
 ) -> list[Any]:
     """Interpreter for Jaxpr with TaylorPolynomial arguments."""
 
@@ -221,19 +236,13 @@ def nattp_jaxpr(
     env: dict[Var, Any] = {}
     safe_map(write, jaxpr.constvars, consts)
 
-    if structured_invar and leaf_shapes is not None:
-        import math
-
-        # Single TaylorPolynomial with structured domain - slice for each invar
+    if output_pytree is not None:
+        # Single TaylorPolynomial with structured output - slice for each invar
         tp = args[0]
         sliced_args = []
-        start = 0
-        for shape in leaf_shapes:
-            size = math.prod(shape) if shape else 1
-            end = start + size
-            # Always use slice to preserve shape (1,) instead of scalar ()
-            sliced_args.append(tp[start:end])
-            start = end
+        for i in range(output_pytree.num_leaves):
+            slc = output_pytree.leaf_slice(i)
+            sliced_args.append(tp[slc])
         safe_map(write, jaxpr.invars, sliced_args)
     else:
         safe_map(write, jaxpr.invars, args)
@@ -338,8 +347,8 @@ def _tp_reshape_p(x, *, new_sizes, dimensions=None):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -360,8 +369,8 @@ def _tp_transpose_p(x, *, permutation):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -380,8 +389,8 @@ def _tp_squeeze_p(x, *, dimensions):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -407,8 +416,8 @@ def _tp_broadcast_in_dim_p(x, *, shape, broadcast_dimensions, sharding=None):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -438,8 +447,8 @@ def _tp_slice_p(x, *, start_indices, limit_indices, strides=None):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -469,8 +478,8 @@ def _tp_dynamic_slice_p(x, *start_indices, slice_sizes):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -509,8 +518,8 @@ def _tp_concatenate_p(*args, dimension):
         coeffs,
         tp_args[0].exponents,
         ref.flat_center,
-        _domain_treedef=ref._domain_treedef,
-        _leaf_shapes=ref._leaf_shapes,
+        _input_pytree=ref._input_pytree,
+        _output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
         _per_leaf_order=ref._per_leaf_order,
     )
 
@@ -559,25 +568,14 @@ def _tp_add_p(x, y):
         # For addition, we can just use the per-leaf order from one of the operands
         # (assuming they are compatible/same structure)
 
-        # Preserve structured domain info if present
-        domain_treedef = (
-            x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
-        )
-        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
-        per_leaf_order = (
-            x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
-        )
-
-        # Normalize order to match (should be same, but just in case take element-wise max)
-        if x._per_leaf_order is not None and y._per_leaf_order is not None:
-            per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
+        per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
 
         result = TaylorPolynomial(
             new_coeffs,
             new_exp,
             x.flat_center,
-            _domain_treedef=domain_treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=x._input_pytree,
+            _output_pytree=x._output_pytree,
             _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(per_leaf_order)
@@ -596,8 +594,8 @@ def _tp_add_p(x, y):
             new_coeffs,
             new_exp,
             x.flat_center,
-            _domain_treedef=x._domain_treedef,
-            _leaf_shapes=x._leaf_shapes,
+            _input_pytree=x._input_pytree,
+            _output_pytree=x._output_pytree,
             _per_leaf_order=x._per_leaf_order,
         )
         return result.to_canonical(x._per_leaf_order)
@@ -621,8 +619,8 @@ def _tp_neg_p(x):
         -x.coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=x._output_pytree,
         _per_leaf_order=x._per_leaf_order,
     )
 
@@ -663,27 +661,8 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         coeff2 = y_coeffs[..., None, :]
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
-        # Structured domain support
-        domain_treedef = (
-            x._domain_treedef if x._domain_treedef is not None else y._domain_treedef
-        )
-        leaf_shapes = x._leaf_shapes if x._leaf_shapes is not None else y._leaf_shapes
-        per_leaf_order = (
-            x._per_leaf_order if x._per_leaf_order is not None else y._per_leaf_order
-        )
-
-        # Per-leaf total degree mode
-        if leaf_shapes is not None and per_leaf_order is not None:
-            # If orders differ, take max
-            if x._per_leaf_order is not None and y._per_leaf_order is not None:
-                per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
-
-            keep_mask = _check_per_leaf_bounds(all_exp, leaf_shapes, per_leaf_order)
-        else:
-            # Fallback if no structured info (shouldn't happen with mandatory constraint)
-            raise ValueError(
-                "Structured metadata missing in TaylorPolynomial multiplication"
-            )
+        per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
+        keep_mask = _check_per_leaf_bounds(all_exp, x._leaf_shapes, per_leaf_order)
 
         kept_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
 
@@ -691,8 +670,8 @@ def _tp_mul_p(x, y, *, max_order: int = None):
             kept_coeffs,
             all_exp,
             x.flat_center,
-            _domain_treedef=domain_treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=x._input_pytree,
+            _output_pytree=x._output_pytree,
             _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(per_leaf_order)
@@ -707,8 +686,8 @@ def _tp_mul_p(x, y, *, max_order: int = None):
             new_coeffs,
             x.exponents,
             x.flat_center,
-            _domain_treedef=x._domain_treedef,
-            _leaf_shapes=x._leaf_shapes,
+            _input_pytree=x._input_pytree,
+            _output_pytree=x._output_pytree,
             _per_leaf_order=x._per_leaf_order,
         )
 
@@ -778,8 +757,8 @@ def _tp_dot_general_array(arr, tp, dim_nums):
         new_coeffs,
         tp.exponents,
         tp.flat_center,
-        _domain_treedef=tp._domain_treedef,
-        _leaf_shapes=tp._leaf_shapes,
+        _input_pytree=tp._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=tp._per_leaf_order,
     )
 
@@ -812,8 +791,8 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
                 new_coeffs,
                 result.exponents,
                 result.flat_center,
-                _domain_treedef=result._domain_treedef,
-                _leaf_shapes=result._leaf_shapes,
+                _input_pytree=result._input_pytree,
+                _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
                 _per_leaf_order=result._per_leaf_order,
             )
         return result
@@ -822,17 +801,7 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         if A.d != B.d:
             raise ValueError(f"Domain dimensions must match: {A.d} vs {B.d}")
 
-        # Check for structured domain mode
-        domain_treedef = (
-            A._domain_treedef if A._domain_treedef is not None else B._domain_treedef
-        )
-        leaf_shapes = A._leaf_shapes if A._leaf_shapes is not None else B._leaf_shapes
-        per_leaf_order = (
-            A._per_leaf_order if A._per_leaf_order is not None else B._per_leaf_order
-        )
-
-        if A._per_leaf_order is not None and B._per_leaf_order is not None:
-            per_leaf_order = _max_order(A._per_leaf_order, B._per_leaf_order)
+        per_leaf_order = _max_order(A._per_leaf_order, B._per_leaf_order)
 
         d = A.d
         m1 = A.num_monomials
@@ -851,13 +820,7 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        # Discard HOT using appropriate mode
-        if leaf_shapes is not None and per_leaf_order is not None:
-            keep_mask = _check_per_leaf_bounds(product_exp, leaf_shapes, per_leaf_order)
-        else:
-            raise ValueError(
-                "Structured metadata missing in TaylorPolynomial dot_general"
-            )
+        keep_mask = _check_per_leaf_bounds(product_exp, A._leaf_shapes, per_leaf_order)
 
         kept_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
@@ -865,8 +828,8 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
             kept_coeffs,
             product_exp,
             A.flat_center,
-            _domain_treedef=domain_treedef,
-            _leaf_shapes=leaf_shapes,
+            _input_pytree=A._input_pytree,
+            _output_pytree=PyTreeShape.flat(kept_coeffs.shape[:-1]),
             _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(per_leaf_order)
@@ -894,8 +857,8 @@ def _tp_reduce_sum_p(x, *, axes):
         new_coeffs,
         x.exponents,
         x.flat_center,
-        _domain_treedef=x._domain_treedef,
-        _leaf_shapes=x._leaf_shapes,
+        _input_pytree=x._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
         _per_leaf_order=x._per_leaf_order,
     )
 

@@ -18,9 +18,9 @@ def reproduction():
     # Create an identity TP for this structured domain
     tp = taylor_polynomial_identity(domain, order=2)
 
-    # Use nattp with structured_center=True
+    # Use nattp (auto-detects structured mode from _output_pytree)
     # The function f expects (x, y), but we pass the single structured TP
-    # nattp should unpack it based on the domain structure
+    # nattp should unpack it based on the output pytree structure
 
     # We need to wrap f to match the unpacked signature if we were calling it normally?
     # No, nattp traces f using the flattened args.
@@ -40,7 +40,7 @@ def reproduction():
     def f_flat(x, y):
         return x * y
 
-    f_tp = nattp(f_flat, structured_center=True)
+    f_tp = nattp(f_flat)
 
     # Call with the single structured TP
     res = f_tp(tp)
