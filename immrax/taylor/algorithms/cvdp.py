@@ -32,10 +32,10 @@ print(ix0)
 tmx = irx.taylor_model_identity(ix0, order=2)
 
 fpg = BasicTMFlowpipeGenerator(sys)
-dt = 0.05
+dt = 0.01
 
-delta = 1e-4
-eps = 1e-2
+delta = 1e-5
+eps = 1e-3
 
 
 @jax.jit
@@ -45,7 +45,7 @@ def gen_flowpipe(t0, tf, tmx, dt, delta, eps):
     )
 
 
-fp, times = irx.utils.run_times(100, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
+fp, times = irx.utils.run_times(1, gen_flowpipe, t0, tf, tmx, dt, delta, eps)
 
 # assert fp.success, "Flowpipe generation failed"
 # assert fp.nsteps > 0, "No steps taken"
@@ -62,10 +62,12 @@ fig, ax = plt.subplots()
 
 # Check __call__ against exact solution x(t) = [-2*cos(t), 2*sin(t)]
 # test_times = [0.05, 0.25, 0.5, 0.75, 0.99]
-test_times = jnp.linspace(t0, tf, 20)
+test_times = jnp.linspace(t0, tf, 100)
 for t in test_times:
     spatial_tm = fp(t)
-    irx.utils.draw_iarray(ax, spatial_tm.interval_hull(), color="tab:blue")
+    irx.utils.draw_iarray(
+        ax, spatial_tm.interval_hull(), color="tab:blue", fc="tab:blue"
+    )
 
 plt.show()
 

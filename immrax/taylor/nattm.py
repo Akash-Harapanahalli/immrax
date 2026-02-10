@@ -366,9 +366,21 @@ def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
         if ref_tm is None:
             return primitive.bind(*args, **kwargs)
 
+        # Lift non-TM args to coefficient shape: place scalar value in
+        # the constant-monomial column (index 0), zeros elsewhere.
+        def _lift(arg):
+            if istaylormodel(arg):
+                return arg.coeffs
+            if jnp.ndim(arg) < ref_tm.coeffs.ndim:
+                m = ref_tm.num_monomials
+                return jnp.concatenate(
+                    [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
+                )
+            return arg
+
         # Apply primitive to coeffs with adapted kwargs
         coeff_kwargs = adapt_coeff_kwargs(kwargs, ref_tm)
-        args_coeffs = [arg.coeffs if istaylormodel(arg) else arg for arg in args]
+        args_coeffs = [_lift(arg) for arg in args]
         new_coeffs = primitive.bind(*args_coeffs, **coeff_kwargs)
 
         # Apply primitive to remainder lower/upper with original kwargs
