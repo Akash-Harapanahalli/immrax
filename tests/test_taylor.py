@@ -178,6 +178,34 @@ def test_concatenate():
     tm_hull_contains_samples(f, tm_f)
 
 
+def test_split():
+    """jnp.split then recombine with arithmetic."""
+    def f(x):
+        a, b = jnp.split(x, 2)
+        return a * b
+
+    center = jnp.array([1.0, 2.0, 3.0, 4.0])
+    radius = jnp.array([0.3, 0.3, 0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (2,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_split_uneven():
+    """jnp.split with uneven sizes."""
+    def f(x):
+        a, b = jnp.split(x, [1])
+        return jnp.concatenate([b, a])
+
+    center = jnp.array([1.0, 2.0, 3.0])
+    radius = jnp.array([0.3, 0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
 # --- Passthrough operations ---
 
 def test_passthrough_copy():
@@ -302,6 +330,167 @@ def test_integrate_variable_multidimensional():
     # --- start=None should use center (here 0.0), same as start=0.0 ---
     itm_none = integrate_variable(tm, var_idx=0, start=None, keep_order=False)
     assert jnp.allclose(itm_none.coeffs, itm_full.coeffs, atol=1e-6)
+
+
+# --- Scatter operations ---
+
+def test_scatter_set_into_zeros():
+    """scatter (at[].set) placing TM values into a zeros array."""
+    def f(x):
+        y = jnp.zeros(4)
+        return y.at[1].set(x[0]).at[3].set(x[1])
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.5, 0.5])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (4,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_set_with_array_indices():
+    """scatter (at[].set) using an array of indices."""
+    def f(x):
+        y = jnp.zeros(5)
+        return y.at[jnp.array([0, 2, 4])].set(x)
+
+    center = jnp.array([1.0, 2.0, 3.0])
+    radius = jnp.array([0.3, 0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (5,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_add():
+    """scatter_add (at[].add) adding TM values to a constant array."""
+    def f(x):
+        y = jnp.ones(3)
+        return y.at[0].add(x[0]).at[2].add(x[1])
+
+    center = jnp.array([0.0, 0.0])
+    radius = jnp.array([1.0, 1.0])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_add_duplicate_indices():
+    """scatter_add with duplicate indices accumulates contributions."""
+    def f(x):
+        y = jnp.zeros(2)
+        return y.at[jnp.array([0, 0])].add(x)
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.5, 0.5])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (2,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_set_2d():
+    """scatter (at[].set) on a 2D array — row-level scatter."""
+    def f(x):
+        y = jnp.zeros((3, 2))
+        return y.at[1].set(x)
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3, 2)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_in_composition():
+    """scatter inside a larger computation — scatter then transform."""
+    def f(x):
+        y = jnp.zeros(3)
+        y = y.at[0].set(x[0]).at[1].set(x[1]).at[2].set(x[0] + x[1])
+        return y ** 2
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_max():
+    """scatter_max (at[].max) — element-wise max at scatter indices."""
+    def f(x):
+        y = jnp.zeros(3)
+        return y.at[0].max(x[0]).at[2].max(x[1])
+
+    center = jnp.array([1.0, -1.0])
+    radius = jnp.array([0.5, 0.5])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_scatter_min():
+    """scatter_min (at[].min) — element-wise min at scatter indices."""
+    def f(x):
+        y = jnp.ones(3)
+        return y.at[1].min(x[0]).at[2].min(x[1])
+
+    center = jnp.array([0.5, 2.0])
+    radius = jnp.array([0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+# --- Select operations ---
+
+def test_select_n_where():
+    """jnp.where with constant predicate selecting between TM and array."""
+    def f(x):
+        return jnp.where(jnp.array([True, False]), x, jnp.zeros(2))
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.5, 0.5])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (2,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_select_n_three_way():
+    """lax.select_n with 3 cases mixing TM and constant arrays."""
+    from jax import lax
+
+    def f(x):
+        pred = jnp.array([0, 1, 2])
+        return lax.select_n(pred, jnp.zeros(3), x[0] * jnp.ones(3), x[1] * jnp.ones(3))
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=2)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (3,)
+    tm_hull_contains_samples(f, tm_f)
+
+
+def test_select_n_in_composition():
+    """select_n inside a larger computation — select then square."""
+    def f(x):
+        # Use constant predicate to select, then apply polynomial
+        selected = jnp.where(jnp.array([True, False]), x, jnp.ones(2))
+        return selected ** 2
+
+    center = jnp.array([1.0, 2.0])
+    radius = jnp.array([0.3, 0.3])
+    tm_x = taylor_model_identity(icentpert(center, radius), order=3)
+    tm_f = nattm(f)(tm_x)
+    assert tm_f._output_shape == (2,)
+    tm_hull_contains_samples(f, tm_f)
 
 
 # --- Multi-arg ---

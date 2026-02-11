@@ -449,83 +449,31 @@ class TaylorModel:
 
     def __init__(
         self,
-        coeffs: ArrayLike,
-        exponents: ArrayLike,
+        coeffs,
+        exponents,
         remainder: Interval,
         flat_domain: Interval,
-        flat_center: ArrayLike,
+        flat_center,
         *,
         _input_pytree: "PyTreeShape | None" = None,
         _output_pytree: "PyTreeShape | None" = None,
         _per_leaf_order: "tuple[int, ...] | None" = None,
-        # Legacy kwargs for backward compatibility during migration
-        _domain_treedef: "PyTreeDef | None" = None,
-        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
     ) -> None:
-        """
-        Initialize a TaylorModel. This is a low-level constructor that should
-        not be used directly by users. Instead, use the high-level constructor
-        :func:`taylor_model`, which performs necessary input validation and
-        normalization.
-        """
+        """Low-level constructor — converts arrays and assigns attributes.
 
+        No shape validation is performed; callers are trusted to provide
+        compatible shapes.  Use the high-level constructor
+        :func:`taylor_model` for user-facing construction with full input
+        validation.
+        """
         self.coeffs = jnp.asarray(coeffs)
         self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
         self.remainder = remainder
         self.flat_domain = flat_domain
         self.flat_center = jnp.asarray(flat_center) if flat_center is not None else None
-
-        self._output_shape = self.coeffs.shape[:-1]  # Last axis is monomial axis
-
-        # Handle _input_pytree: either from new kwarg or legacy kwargs
-        if _input_pytree is not None:
-            self._input_pytree = _input_pytree
-        elif _domain_treedef is not None and _leaf_shapes is not None:
-            self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
-        else:
-            raise ValueError("Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided")
-
-        # Handle _output_pytree: new kwarg or default to flat output
-        if _output_pytree is not None:
-            self._output_pytree = _output_pytree
-        else:
-            self._output_pytree = PyTreeShape.flat(self._output_shape)
-
+        self._input_pytree = _input_pytree
+        self._output_pytree = _output_pytree
         self._per_leaf_order = _per_leaf_order
-
-        if self._per_leaf_order is None:
-            raise ValueError("_per_leaf_order cannot be None")
-
-        # Validate _output_pytree.flat_size matches output shape
-        expected_flat = math.prod(self._output_shape) if self._output_shape else 1
-        if self._output_pytree.flat_size != expected_flat:
-            raise ValueError(
-                f"_output_pytree.flat_size ({self._output_pytree.flat_size}) must match "
-                f"prod(coeffs.shape[:-1]) ({expected_flat})"
-            )
-
-        # Validate dimensions
-        if self.coeffs.ndim < 1:
-            raise ValueError(
-                f"coeffs must be at least 1D, got shape {self.coeffs.shape}"
-            )
-        if self.exponents.ndim != 2:
-            raise ValueError(f"exponents must be 2D, got shape {self.exponents.shape}")
-        if self.coeffs.shape[-1] != self.exponents.shape[1]:
-            raise ValueError(
-                f"coeffs and exponents must have same number of monomials: "
-                f"{self.coeffs.shape[-1]} vs {self.exponents.shape[1]}"
-            )
-        if self.remainder.shape != self._output_shape:
-            raise ValueError(
-                f"remainder and coeffs must have same output shape: "
-                f"{self.remainder.shape} vs {self._output_shape}"
-            )
-        if self.flat_domain.lower.shape[0] != self.exponents.shape[0]:
-            raise ValueError(
-                f"domain must match exponents dimension: "
-                f"{self.flat_domain.lower.shape[0]} vs {self.exponents.shape[0]}"
-            )
 
     @property
     def _domain_treedef(self):
@@ -569,23 +517,26 @@ class TaylorModel:
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
-        input_pytree = aux_data.get("_input_pytree") if aux_data else None
-        output_pytree = aux_data.get("_output_pytree") if aux_data else None
-        per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
-        # _output_shape is recomputed in __init__ from coeffs.shape[:-1]
+        # Bypass __init__ to avoid jnp.asarray — JAX/equinox may pass
+        # non-array sentinels (e.g. booleans) through tree operations.
         coeffs, exponents, remainder, flat_domain, flat_center = children
-        return cls(
-            coeffs,
-            exponents,
-            remainder,
-            flat_domain,
-            flat_center,
-            _input_pytree=input_pytree,
-            _output_pytree=output_pytree,
-            _per_leaf_order=per_leaf_order,
-        )
+        obj = object.__new__(cls)
+        obj.coeffs = coeffs
+        obj.exponents = exponents
+        obj.remainder = remainder
+        obj.flat_domain = flat_domain
+        obj.flat_center = flat_center
+        obj._input_pytree = aux_data.get("_input_pytree") if aux_data else None
+        obj._output_pytree = aux_data.get("_output_pytree") if aux_data else None
+        obj._per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
+        return obj
 
     # --- Properties ---
+
+    @property
+    def _output_shape(self) -> Tuple[int, ...]:
+        """Output shape, derived from coeffs. Last axis is monomial axis."""
+        return self.coeffs.shape[:-1]
 
     @property
     def n(self) -> int:
@@ -1248,6 +1199,27 @@ def taylor_model(
             _, _, flat_center = _pytree_to_flattened_array(center)
     else:
         flat_center = None
+
+    # Validate shapes
+    if coeffs.ndim < 1:
+        raise ValueError(f"coeffs must be at least 1D, got shape {coeffs.shape}")
+    if exponents.ndim != 2:
+        raise ValueError(f"exponents must be 2D, got shape {exponents.shape}")
+    if coeffs.shape[-1] != exponents.shape[1]:
+        raise ValueError(
+            f"coeffs and exponents must have same number of monomials: "
+            f"{coeffs.shape[-1]} vs {exponents.shape[1]}"
+        )
+    if remainder.shape != output_shape:
+        raise ValueError(
+            f"remainder and coeffs must have same output shape: "
+            f"{remainder.shape} vs {output_shape}"
+        )
+    if flat_domain.lower.shape[0] != exponents.shape[0]:
+        raise ValueError(
+            f"domain must match exponents dimension: "
+            f"{flat_domain.lower.shape[0]} vs {exponents.shape[0]}"
+        )
 
     return TaylorModel(
         coeffs,

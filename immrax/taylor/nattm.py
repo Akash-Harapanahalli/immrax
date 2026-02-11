@@ -481,6 +481,212 @@ def _tm_dynamic_slice_p(x, *start_indices, slice_sizes, max_order=None) -> Taylo
 tm_inclusion_registry[lax.dynamic_slice_p] = _tm_dynamic_slice_p
 
 
+def _make_tm_scatter_p(primitive):
+    """Factory for scatter TM operations (scatter, scatter_add, scatter_max, scatter_min).
+
+    Scatter has positional args (operand, scatter_indices, updates) where
+    scatter_indices are integer indices that must never be lifted to TM coefficients.
+    The monomial axis is added to update_window_dims so the full [M] monomial
+    slice is scattered as a unit.
+    """
+
+    def _tm_p(operand, scatter_indices, updates, *, dimension_numbers,
+              max_order=None, **kwargs):
+        op_is_tm = istaylormodel(operand)
+        upd_is_tm = istaylormodel(updates)
+        if not op_is_tm and not upd_is_tm:
+            return primitive.bind(operand, scatter_indices, updates,
+                                 dimension_numbers=dimension_numbers, **kwargs)
+
+        ref_tm = operand if op_is_tm else updates
+        m = ref_tm.num_monomials
+
+        def _lift(arg):
+            if istaylormodel(arg):
+                return arg.coeffs
+            return jnp.concatenate(
+                [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
+            )
+
+        op_coeffs = _lift(operand)
+        upd_coeffs = _lift(updates)
+
+        # Add monomial axis (last axis of updates coeffs) to update_window_dims
+        dn = dimension_numbers
+        mono_ax = upd_coeffs.ndim - 1
+        new_dn = lax.ScatterDimensionNumbers(
+            update_window_dims=(*dn.update_window_dims, mono_ax),
+            inserted_window_dims=dn.inserted_window_dims,
+            scatter_dims_to_operand_dims=dn.scatter_dims_to_operand_dims,
+            operand_batching_dims=dn.operand_batching_dims,
+            scatter_indices_batching_dims=dn.scatter_indices_batching_dims,
+        )
+
+        new_coeffs = primitive.bind(op_coeffs, scatter_indices, upd_coeffs,
+                                    dimension_numbers=new_dn, **kwargs)
+
+        # Remainder bounds: non-TM args have zero remainder (their full value
+        # is captured in the polynomial coefficients via _lift).
+        op_lo = operand.remainder.lower if op_is_tm else jnp.zeros_like(operand)
+        op_hi = operand.remainder.upper if op_is_tm else jnp.zeros_like(operand)
+        upd_lo = updates.remainder.lower if upd_is_tm else jnp.zeros_like(updates)
+        upd_hi = updates.remainder.upper if upd_is_tm else jnp.zeros_like(updates)
+
+        new_lower = primitive.bind(op_lo, scatter_indices, upd_lo,
+                                   dimension_numbers=dimension_numbers, **kwargs)
+        new_upper = primitive.bind(op_hi, scatter_indices, upd_hi,
+                                   dimension_numbers=dimension_numbers, **kwargs)
+
+        return TaylorModel(
+            new_coeffs,
+            ref_tm.exponents,
+            interval(new_lower, new_upper),
+            ref_tm.flat_domain,
+            flat_center=ref_tm.flat_center,
+            _input_pytree=ref_tm._input_pytree,
+            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            _per_leaf_order=ref_tm._per_leaf_order,
+        )
+
+    tm_inclusion_registry[primitive] = _tm_p
+
+
+_make_tm_scatter_p(lax.scatter_p)
+_make_tm_scatter_p(lax.scatter_add_p)
+
+
+def _make_tm_scatter_nonlinear_p(primitive):
+    """Factory for non-linear scatter ops (scatter_max, scatter_min).
+
+    Unlike scatter (set) and scatter_add which are structural/linear,
+    scatter_max/scatter_min apply a non-linear combiner. Applying max/min
+    to polynomial coefficients is not meaningful, so we fall back to
+    interval arithmetic: compute interval hulls, apply the primitive to
+    bounds, and return a constant TM.
+    """
+
+    def _tm_p(operand, scatter_indices, updates, *, dimension_numbers,
+              max_order=None, **kwargs):
+        op_is_tm = istaylormodel(operand)
+        upd_is_tm = istaylormodel(updates)
+        if not op_is_tm and not upd_is_tm:
+            return primitive.bind(operand, scatter_indices, updates,
+                                 dimension_numbers=dimension_numbers, **kwargs)
+
+        ref_tm = operand if op_is_tm else updates
+
+        # Get interval bounds for operand and updates
+        if op_is_tm:
+            op_hull = operand.interval_hull()
+            op_lo, op_hi = op_hull.lower, op_hull.upper
+        else:
+            op_lo = op_hi = jnp.asarray(operand)
+
+        if upd_is_tm:
+            upd_hull = updates.interval_hull()
+            upd_lo, upd_hi = upd_hull.lower, upd_hull.upper
+        else:
+            upd_lo = upd_hi = jnp.asarray(updates)
+
+        # scatter_max/scatter_min are monotone in both args, so
+        # applying to (lo, lo) and (hi, hi) gives valid enclosure.
+        new_lower = primitive.bind(op_lo, scatter_indices, upd_lo,
+                                   dimension_numbers=dimension_numbers, **kwargs)
+        new_upper = primitive.bind(op_hi, scatter_indices, upd_hi,
+                                   dimension_numbers=dimension_numbers, **kwargs)
+
+        return _taylor_model_constant_impl(
+            interval(new_lower, new_upper),
+            ref_tm.flat_domain,
+            ref_tm._per_leaf_order,
+            center=ref_tm.flat_center,
+            _input_pytree=ref_tm._input_pytree,
+            _per_leaf_order=ref_tm._per_leaf_order,
+        )
+
+    tm_inclusion_registry[primitive] = _tm_p
+
+
+_make_tm_scatter_nonlinear_p(lax.scatter_max_p)
+_make_tm_scatter_nonlinear_p(lax.scatter_min_p)
+
+
+def _tm_select_n_p(pred, *cases, max_order=None):
+    """Taylor model select_n: pred chooses among cases element-wise.
+
+    pred is integer/boolean (never a TM). Each case may be a TM.
+    The predicate is broadcast along the monomial axis for coefficients.
+    """
+    if not any(istaylormodel(c) for c in cases):
+        return lax.select_n_p.bind(pred, *cases)
+
+    ref_tm = next(c for c in cases if istaylormodel(c))
+    m = ref_tm.num_monomials
+
+    def _lift(arg):
+        if istaylormodel(arg):
+            return arg.coeffs
+        return jnp.concatenate(
+            [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
+        )
+
+    # Broadcast pred along monomial axis so it selects entire polynomial slices
+    pred_coeffs = jnp.broadcast_to(pred[..., None], (*pred.shape, m))
+    cases_coeffs = [_lift(c) for c in cases]
+    new_coeffs = lax.select_n_p.bind(pred_coeffs, *cases_coeffs)
+
+    # Remainder: non-TM cases have zero remainder
+    cases_lo = [c.remainder.lower if istaylormodel(c) else jnp.zeros_like(c) for c in cases]
+    cases_hi = [c.remainder.upper if istaylormodel(c) else jnp.zeros_like(c) for c in cases]
+    new_lower = lax.select_n_p.bind(pred, *cases_lo)
+    new_upper = lax.select_n_p.bind(pred, *cases_hi)
+
+    return TaylorModel(
+        new_coeffs,
+        ref_tm.exponents,
+        interval(new_lower, new_upper),
+        ref_tm.flat_domain,
+        flat_center=ref_tm.flat_center,
+        _input_pytree=ref_tm._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        _per_leaf_order=ref_tm._per_leaf_order,
+    )
+
+
+if hasattr(lax, "select_n_p"):
+    tm_inclusion_registry[lax.select_n_p] = _tm_select_n_p
+
+
+def _tm_split_p(x, *, sizes, axis, max_order=None):
+    """Taylor model split: split along an output axis, preserving polynomials.
+
+    split_p is a multiple_results primitive — returns a list of TaylorModels.
+    The axis and sizes refer to output dimensions; the monomial axis (last)
+    is carried through unchanged.
+    """
+    if not istaylormodel(x):
+        return lax.split_p.bind(x, sizes=sizes, axis=axis)
+
+    coeff_chunks = lax.split_p.bind(x.coeffs, sizes=sizes, axis=axis)
+    lo_chunks = lax.split_p.bind(x.remainder.lower, sizes=sizes, axis=axis)
+    hi_chunks = lax.split_p.bind(x.remainder.upper, sizes=sizes, axis=axis)
+
+    return [
+        TaylorModel(
+            c, x.exponents, interval(lo, hi),
+            x.flat_domain, flat_center=x.flat_center,
+            _input_pytree=x._input_pytree,
+            _output_pytree=PyTreeShape.flat(c.shape[:-1]),
+            _per_leaf_order=x._per_leaf_order,
+        )
+        for c, lo, hi in zip(coeff_chunks, lo_chunks, hi_chunks)
+    ]
+
+
+if hasattr(lax, "split_p"):
+    tm_inclusion_registry[lax.split_p] = _tm_split_p
+
+
 # --- Higher-order primitives ---
 
 

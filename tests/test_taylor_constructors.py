@@ -9,25 +9,25 @@ from immrax.taylor.taylor_model import (
 from immrax.inclusion import interval, icentpert
 
 
-def test_taylor_model_init_validation():
-    """Test that TaylorModel.__init__ enforces non-None metadata."""
-    coeffs = jnp.array([[1.0]])
-    exponents = jnp.array([[0]])
-    remainder = interval(jnp.array([0.0]))
+def test_taylor_model_factory_validation():
+    """Test that taylor_model() validates shapes."""
     domain = icentpert(jnp.array([0.0]), jnp.array([1.0]))
-    center = jnp.array([0.0])
 
-    # TaylorModel constructor requires explicit metadata
-    with pytest.raises(ValueError, match="_domain_treedef cannot be None"):
-        TaylorModel(
-            coeffs,
-            exponents,
-            remainder,
-            domain,
-            center,
-            _domain_treedef=None,
-            _leaf_shapes=None,
-            _per_leaf_order=None,
+    # Scalar coeffs (not at least 1D)
+    with pytest.raises(ValueError, match="coeffs must be at least 1D"):
+        taylor_model(jnp.array(1.0), jnp.array([[0]]), domain=domain)
+
+    # Mismatched coeffs/exponents monomial count
+    with pytest.raises(ValueError, match="same number of monomials"):
+        taylor_model(jnp.array([[1.0, 2.0]]), jnp.array([[0]]), domain=domain)
+
+    # Mismatched remainder shape
+    with pytest.raises(ValueError, match="same output shape"):
+        taylor_model(
+            jnp.array([[1.0]]),
+            jnp.array([[0]]),
+            remainder=interval(jnp.array([0.0, 0.0])),
+            domain=domain,
         )
 
 
