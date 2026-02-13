@@ -29,7 +29,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         self.eps = kwargs.get("eps", 1e-2)
         self.delta = kwargs.get("delta", 1e-2)
 
-    def _picard(self, tm_tx: TaylorModel, u=None) -> TaylorModel:
+    def _picard(self, tm_tx: TaylorModel, ic_remainder=None, u=None) -> TaylorModel:
         """Apply the Picard operator to the TaylorModel tm_tx over the domain of the TaylorModel.
 
         The Picard operator is defined as:
@@ -43,6 +43,19 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         of the flow map, the polynomial part is a fixed point (to the corresponding order), meaning
         K(p + E) = p + E'
         where E' contains all the remainders.
+
+        Parameters
+        ----------
+        tm_tx : TaylorModel
+            The tube TaylorModel to apply the Picard operator to.
+        ic_remainder : Interval, optional
+            The remainder from the initial condition (previous step's spatial
+            TM remainder).  If provided, this is added to the returned
+            remainder to account for IC uncertainty.  If None, the IC
+            remainder from ``tx_tm_eval`` at ``t0`` is used (which equals
+            the tube's own remainder — correct only when E_prev = 0).
+        u : optional
+            Control input.
         """
         # Initial condition
         tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower, self.t_order)
@@ -59,10 +72,13 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         coeffs = tm_int.coeffs.at[: con_sh[0], : con_sh[1]].add(tm_ic.coeffs)
 
+        if ic_remainder is None:
+            ic_remainder = tm_ic.remainder
+
         return TaylorModel(
             coeffs=coeffs,
             exponents=tm_int.exponents,
-            remainder=tm_int.remainder,
+            remainder=tm_int.remainder + ic_remainder,
             flat_domain=tm_int.flat_domain,
             flat_center=tm_int.flat_center,
             _input_pytree=tm_int._input_pytree,
@@ -71,7 +87,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         )
 
     def _step(self, t: float, tmi: TaylorModel, dt_max: float, **kwargs):
-        u = kwargs.get('u', None)
+        u = kwargs.get("u", None)
 
         # Step 1: Compute the Taylor expansion of the flow map to t_order, x_order
 
@@ -81,7 +97,8 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
             poly_coeffs = nattp(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
         poly = tps_to_tx(
             poly_coeffs,
-            tmi.remainder,
+            # tmi.remainder,
+            interval(jnp.zeros_like(tmi.remainder.lower)),
             (interval(t, t + dt_max), tmi.domain),
             (t, tmi.center),
             per_leaf_order=(self.t_order,) + tmi._per_leaf_order,
@@ -107,12 +124,16 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
                 contractive,
                 lambda: contractive,
                 lambda: (
-                    check_containment(self._picard(poly, u=u).remainder, poly.remainder) == 1
+                    check_containment(
+                        self._picard(poly, ic_remainder=tmi.remainder, u=u).remainder,
+                        poly.remainder,
+                    )
+                    == 1
                 ),
             )
 
             return (poly, contractive)
 
-        poly, contractive = jax.lax.fori_loop(0, 100, _check_picard, (poly, False))
+        poly, contractive = jax.lax.fori_loop(0, 1000, _check_picard, (poly, False))
 
         return dt_max, tx_tm_eval(poly, t + dt_max, self.t_order), poly, contractive

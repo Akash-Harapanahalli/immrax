@@ -105,21 +105,6 @@ def _tp_constant(
     )
 
 
-def _tp_from_array(
-    arr: jax.Array,
-    d: int,
-    order: "int | tuple[int, ...]",
-    flat_center: jax.Array,
-    _domain_treedef: jax.tree_util.PyTreeDef,
-    _leaf_shapes: tuple[tuple[int, ...], ...],
-    _per_leaf_order: tuple[int, ...],
-) -> TaylorPolynomial:
-    """Wrap a plain array as a constant TaylorPolynomial."""
-    return _tp_constant(
-        arr, d, order, flat_center, _domain_treedef, _leaf_shapes, _per_leaf_order
-    )
-
-
 # ---------------------------------------------------------------------------
 # Interpreter
 # ---------------------------------------------------------------------------
@@ -299,6 +284,12 @@ def _resolve_handler(primitive: Primitive):
 
 
 def _make_tp_passthrough(primitive: Primitive):
+    """Creates a TP handler that applies the primitive to coefficients directly.
+
+    For operations like copy, convert_element_type, etc., we just apply
+    the primitive independently to coeffs using tree_map.
+    """
+
     def _handler(*args, **kwargs):
         ref = None
         for a in jax.tree_util.tree_leaves(args, is_leaf=istaylorpolynomial):
@@ -308,16 +299,17 @@ def _make_tp_passthrough(primitive: Primitive):
         if ref is None:
             return primitive.bind(*args, **kwargs)
 
-        args_const = [a.constant_term if istaylorpolynomial(a) else a for a in args]
-        result_const = primitive.bind(*args_const, **kwargs)
-        return _tp_from_array(
-            result_const,
-            ref.d,
-            ref.max_order,
+        getcoeffs = lambda x: x.coeffs if istaylorpolynomial(x) else x
+        args_coeffs = jax.tree_util.tree_map(getcoeffs, args, is_leaf=istaylorpolynomial)
+        new_coeffs = primitive.bind(*args_coeffs, **kwargs)
+
+        return TaylorPolynomial(
+            new_coeffs,
+            ref.exponents,
             ref.flat_center,
-            ref._domain_treedef,
-            ref._leaf_shapes,
-            ref._per_leaf_order,
+            _input_pytree=ref._input_pytree,
+            _output_pytree=ref._output_pytree,
+            _per_leaf_order=ref._per_leaf_order,
         )
 
     tp_inclusion_registry[primitive] = _handler
@@ -329,151 +321,115 @@ _make_tp_passthrough(lax.convert_element_type_p)
 _make_tp_passthrough(debug_callback_p)
 
 
-# --- Reshape ---
+# --- Structural operations (factory pattern, matching nattm) ---
 
 
-def _tp_reshape_p(x, *, new_sizes, dimensions=None):
-    if not istaylorpolynomial(x):
-        return lax.reshape_p.bind(x, new_sizes=new_sizes, dimensions=dimensions)
-    m = x.num_monomials
-    coeff_new_sizes = (*new_sizes, m)
-    if dimensions is not None:
-        coeff_dimensions = (*dimensions, len(x._output_shape))
-        new_coeffs = lax.reshape(
-            x.coeffs, new_sizes=coeff_new_sizes, dimensions=coeff_dimensions
+def _make_tp_structural_p(primitive, adapt_coeff_kwargs):
+    """Factory for structural TP operations that preserve polynomial structure.
+
+    These operations act on the output shape of a TaylorPolynomial. The monomial
+    axis (last axis of coeffs) is left unchanged. ``adapt_coeff_kwargs``
+    takes ``(kwargs, tp)`` and returns modified kwargs for the coeffs array
+    (which has the extra trailing monomial axis).
+    """
+
+    def _tp_p(*args, **kwargs):
+        # Find first TP arg
+        ref_tp = None
+        for arg in args:
+            if istaylorpolynomial(arg):
+                ref_tp = arg
+                break
+        if ref_tp is None:
+            return primitive.bind(*args, **kwargs)
+
+        # Lift non-TP args to coefficient shape: place scalar value in
+        # the constant-monomial column (index 0), zeros elsewhere.
+        def _lift(arg):
+            if istaylorpolynomial(arg):
+                return arg.coeffs
+            if jnp.ndim(arg) < ref_tp.coeffs.ndim:
+                m = ref_tp.num_monomials
+                return jnp.concatenate(
+                    [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
+                )
+            return arg
+
+        # Apply primitive to coeffs with adapted kwargs
+        coeff_kwargs = adapt_coeff_kwargs(kwargs, ref_tp)
+        args_coeffs = [_lift(arg) for arg in args]
+        new_coeffs = primitive.bind(*args_coeffs, **coeff_kwargs)
+
+        return TaylorPolynomial(
+            new_coeffs,
+            ref_tp.exponents,
+            ref_tp.flat_center,
+            _input_pytree=ref_tp._input_pytree,
+            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            _per_leaf_order=ref_tp._per_leaf_order,
         )
-    else:
-        new_coeffs = x.coeffs.reshape(*coeff_new_sizes)
-    return TaylorPolynomial(
-        new_coeffs,
-        x.exponents,
-        x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
-    )
+
+    tp_inclusion_registry[primitive] = _tp_p
 
 
-tp_inclusion_registry[lax.reshape_p] = _tp_reshape_p
+def _adapt_reshape(kwargs, tp):
+    m = tp.num_monomials
+    kw = {**kwargs, "new_sizes": (*kwargs["new_sizes"], m)}
+    if kwargs.get("dimensions") is not None:
+        kw["dimensions"] = (*kwargs["dimensions"], len(tp._output_shape))
+    return kw
 
 
-# --- Transpose ---
+def _adapt_transpose(kwargs, tp):
+    return {**kwargs, "permutation": (*kwargs["permutation"], len(tp._output_shape))}
 
 
-def _tp_transpose_p(x, *, permutation):
-    if not istaylorpolynomial(x):
-        return lax.transpose_p.bind(x, permutation=permutation)
-    ndim_out = len(x._output_shape)
-    coeff_permutation = (*permutation, ndim_out)
-    new_coeffs = lax.transpose(x.coeffs, permutation=coeff_permutation)
-    return TaylorPolynomial(
-        new_coeffs,
-        x.exponents,
-        x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
-    )
+def _adapt_squeeze(kwargs, tp):
+    return kwargs  # monomial axis is never size-1
 
 
-tp_inclusion_registry[lax.transpose_p] = _tp_transpose_p
+def _adapt_broadcast_in_dim(kwargs, tp):
+    shape = kwargs["shape"]
+    return {
+        **kwargs,
+        "shape": (*shape, tp.num_monomials),
+        "broadcast_dimensions": (*kwargs["broadcast_dimensions"], len(shape)),
+    }
 
 
-# --- Squeeze ---
+def _adapt_slice(kwargs, tp):
+    m = tp.num_monomials
+    kw = {
+        **kwargs,
+        "start_indices": (*kwargs["start_indices"], 0),
+        "limit_indices": (*kwargs["limit_indices"], m),
+    }
+    if kwargs.get("strides") is not None:
+        kw["strides"] = (*kwargs["strides"], 1)
+    return kw
 
 
-def _tp_squeeze_p(x, *, dimensions):
-    if not istaylorpolynomial(x):
-        return lax.squeeze_p.bind(x, dimensions=dimensions)
-    new_coeffs = lax.squeeze(x.coeffs, dimensions=dimensions)
-    return TaylorPolynomial(
-        new_coeffs,
-        x.exponents,
-        x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
-    )
+def _adapt_concatenate(kwargs, tp):
+    return kwargs  # dimension refers to output axes; monomial axis is last and shared
 
 
-tp_inclusion_registry[lax.squeeze_p] = _tp_squeeze_p
+_make_tp_structural_p(lax.reshape_p, _adapt_reshape)
+_make_tp_structural_p(lax.transpose_p, _adapt_transpose)
+_make_tp_structural_p(lax.squeeze_p, _adapt_squeeze)
+_make_tp_structural_p(lax.broadcast_in_dim_p, _adapt_broadcast_in_dim)
+_make_tp_structural_p(lax.slice_p, _adapt_slice)
+_make_tp_structural_p(lax.concatenate_p, _adapt_concatenate)
 
 
-# --- Broadcast_in_dim ---
-
-
-def _tp_broadcast_in_dim_p(x, *, shape, broadcast_dimensions, sharding=None):
-    if not istaylorpolynomial(x):
-        return lax.broadcast_in_dim_p.bind(
-            x, shape=shape, broadcast_dimensions=broadcast_dimensions, sharding=sharding
-        )
-    m = x.num_monomials
-    coeff_shape = (*shape, m)
-    coeff_broadcast_dims = (*broadcast_dimensions, len(shape))
-    new_coeffs = lax.broadcast_in_dim(
-        x.coeffs, shape=coeff_shape, broadcast_dimensions=coeff_broadcast_dims
-    )
-    return TaylorPolynomial(
-        new_coeffs,
-        x.exponents,
-        x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
-    )
-
-
-tp_inclusion_registry[lax.broadcast_in_dim_p] = _tp_broadcast_in_dim_p
-
-
-# --- Slice ---
-
-
-def _tp_slice_p(x, *, start_indices, limit_indices, strides=None):
-    if not istaylorpolynomial(x):
-        return lax.slice_p.bind(
-            x, start_indices=start_indices, limit_indices=limit_indices, strides=strides
-        )
-    m = x.num_monomials
-    coeff_start = (*start_indices, 0)
-    coeff_limit = (*limit_indices, m)
-    coeff_strides = (*strides, 1) if strides else None
-    new_coeffs = lax.slice_p.bind(
-        x.coeffs,
-        start_indices=coeff_start,
-        limit_indices=coeff_limit,
-        strides=coeff_strides,
-    )
-    return TaylorPolynomial(
-        new_coeffs,
-        x.exponents,
-        x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
-    )
-
-
-tp_inclusion_registry[lax.slice_p] = _tp_slice_p
-
-
-# --- Dynamic slice ---
+# --- Dynamic slice (positional args, can't use structural factory) ---
 
 
 def _tp_dynamic_slice_p(x, *start_indices, slice_sizes):
     if not istaylorpolynomial(x):
         return lax.dynamic_slice_p.bind(x, *start_indices, slice_sizes=slice_sizes)
-    # The original code had a bug here, assuming start_indices[0] and slice_sizes[0]
-    # for all dimensions. This is incorrect for multi-dimensional slices.
-    # The correct way is to extend start_indices and slice_sizes with the monomial dimension.
     m = x.num_monomials
-    extended_start_indices = (*start_indices, 0)
-    extended_slice_sizes = (*slice_sizes, m)
-
     new_coeffs = lax.dynamic_slice_p.bind(
-        x.coeffs,
-        *extended_start_indices,
-        slice_sizes=extended_slice_sizes,
+        x.coeffs, *start_indices, 0, slice_sizes=(*slice_sizes, m)
     )
     return TaylorPolynomial(
         new_coeffs,
@@ -488,44 +444,168 @@ def _tp_dynamic_slice_p(x, *start_indices, slice_sizes):
 tp_inclusion_registry[lax.dynamic_slice_p] = _tp_dynamic_slice_p
 
 
-# --- Concatenation ---
+# --- Scatter operations ---
 
 
-def _tp_concatenate_p(*args, dimension):
-    tps = [a for a in args if istaylorpolynomial(a)]
-    if len(tps) == 0:
-        return lax.concatenate_p.bind(*args, dimension=dimension)
+def _make_tp_scatter_p(primitive):
+    """Factory for linear scatter TP operations (scatter, scatter_add).
 
-    ref = tps[0]
-    tp_args = []
-    for a in args:
-        if istaylorpolynomial(a):
-            tp_args.append(a.to_canonical(ref._per_leaf_order))
-        else:
-            tp_args.append(
-                _tp_from_array(
-                    jnp.asarray(a),
-                    ref.d,
-                    ref.max_order,
-                    ref.flat_center,
-                    ref._domain_treedef,
-                    ref._leaf_shapes,
-                    ref._per_leaf_order,
-                )
+    Scatter has positional args (operand, scatter_indices, updates) where
+    scatter_indices are integer indices. The monomial axis is added to
+    update_window_dims so the full monomial slice is scattered as a unit.
+    """
+
+    def _tp_p(operand, scatter_indices, updates, *, dimension_numbers, **kwargs):
+        op_is_tp = istaylorpolynomial(operand)
+        upd_is_tp = istaylorpolynomial(updates)
+        if not op_is_tp and not upd_is_tp:
+            return primitive.bind(operand, scatter_indices, updates,
+                                 dimension_numbers=dimension_numbers, **kwargs)
+
+        ref_tp = operand if op_is_tp else updates
+        m = ref_tp.num_monomials
+
+        def _lift(arg):
+            if istaylorpolynomial(arg):
+                return arg.coeffs
+            return jnp.concatenate(
+                [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
             )
 
-    coeffs = jnp.concatenate([t.coeffs for t in tp_args], axis=dimension)
+        op_coeffs = _lift(operand)
+        upd_coeffs = _lift(updates)
+
+        dn = dimension_numbers
+        mono_ax = upd_coeffs.ndim - 1
+        new_dn = lax.ScatterDimensionNumbers(
+            update_window_dims=(*dn.update_window_dims, mono_ax),
+            inserted_window_dims=dn.inserted_window_dims,
+            scatter_dims_to_operand_dims=dn.scatter_dims_to_operand_dims,
+            operand_batching_dims=dn.operand_batching_dims,
+            scatter_indices_batching_dims=dn.scatter_indices_batching_dims,
+        )
+
+        new_coeffs = primitive.bind(op_coeffs, scatter_indices, upd_coeffs,
+                                    dimension_numbers=new_dn, **kwargs)
+
+        return TaylorPolynomial(
+            new_coeffs,
+            ref_tp.exponents,
+            ref_tp.flat_center,
+            _input_pytree=ref_tp._input_pytree,
+            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            _per_leaf_order=ref_tp._per_leaf_order,
+        )
+
+    tp_inclusion_registry[primitive] = _tp_p
+
+
+_make_tp_scatter_p(lax.scatter_p)
+_make_tp_scatter_p(lax.scatter_add_p)
+
+
+def _make_tp_scatter_nonlinear_p(primitive):
+    """Factory for non-linear scatter ops (scatter_max, scatter_min).
+
+    Falls back to center evaluation since max/min on coefficients is not meaningful.
+    """
+
+    def _tp_p(operand, scatter_indices, updates, *, dimension_numbers, **kwargs):
+        op_is_tp = istaylorpolynomial(operand)
+        upd_is_tp = istaylorpolynomial(updates)
+        if not op_is_tp and not upd_is_tp:
+            return primitive.bind(operand, scatter_indices, updates,
+                                 dimension_numbers=dimension_numbers, **kwargs)
+
+        ref_tp = operand if op_is_tp else updates
+        op_val = operand.evaluate(operand.flat_center) if op_is_tp else jnp.asarray(operand)
+        upd_val = updates.evaluate(updates.flat_center) if upd_is_tp else jnp.asarray(updates)
+
+        result = primitive.bind(op_val, scatter_indices, upd_val,
+                                dimension_numbers=dimension_numbers, **kwargs)
+
+        return _tp_constant(
+            result,
+            ref_tp.d,
+            ref_tp._per_leaf_order,
+            ref_tp.flat_center,
+            _input_pytree=ref_tp._input_pytree,
+            _per_leaf_order=ref_tp._per_leaf_order,
+        )
+
+    tp_inclusion_registry[primitive] = _tp_p
+
+
+_make_tp_scatter_nonlinear_p(lax.scatter_max_p)
+_make_tp_scatter_nonlinear_p(lax.scatter_min_p)
+
+
+# --- select_n ---
+
+
+def _tp_select_n_p(pred, *cases):
+    """Taylor polynomial select_n: pred chooses among cases element-wise.
+
+    pred is integer/boolean (never a TP). Each case may be a TP.
+    The predicate is broadcast along the monomial axis for coefficients.
+    """
+    if not any(istaylorpolynomial(c) for c in cases):
+        return lax.select_n_p.bind(pred, *cases)
+
+    ref_tp = next(c for c in cases if istaylorpolynomial(c))
+    m = ref_tp.num_monomials
+
+    def _lift(arg):
+        if istaylorpolynomial(arg):
+            return arg.coeffs
+        return jnp.concatenate(
+            [arg[..., None], jnp.zeros((*jnp.shape(arg), m - 1))], axis=-1
+        )
+
+    pred_coeffs = jnp.broadcast_to(pred[..., None], (*pred.shape, m))
+    cases_coeffs = [_lift(c) for c in cases]
+    new_coeffs = lax.select_n_p.bind(pred_coeffs, *cases_coeffs)
+
     return TaylorPolynomial(
-        coeffs,
-        tp_args[0].exponents,
-        ref.flat_center,
-        _input_pytree=ref._input_pytree,
-        _output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
-        _per_leaf_order=ref._per_leaf_order,
+        new_coeffs,
+        ref_tp.exponents,
+        ref_tp.flat_center,
+        _input_pytree=ref_tp._input_pytree,
+        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        _per_leaf_order=ref_tp._per_leaf_order,
     )
 
 
-tp_inclusion_registry[lax.concatenate_p] = _tp_concatenate_p
+if hasattr(lax, "select_n_p"):
+    tp_inclusion_registry[lax.select_n_p] = _tp_select_n_p
+
+
+# --- split ---
+
+
+def _tp_split_p(x, *, sizes, axis):
+    """Taylor polynomial split: split along an output axis, preserving polynomials.
+
+    split_p is a multiple_results primitive — returns a list of TaylorPolynomials.
+    """
+    if not istaylorpolynomial(x):
+        return lax.split_p.bind(x, sizes=sizes, axis=axis)
+
+    coeff_chunks = lax.split_p.bind(x.coeffs, sizes=sizes, axis=axis)
+
+    return [
+        TaylorPolynomial(
+            c, x.exponents, x.flat_center,
+            _input_pytree=x._input_pytree,
+            _output_pytree=PyTreeShape.flat(c.shape[:-1]),
+            _per_leaf_order=x._per_leaf_order,
+        )
+        for c in coeff_chunks
+    ]
+
+
+if hasattr(lax, "split_p"):
+    tp_inclusion_registry[lax.split_p] = _tp_split_p
 
 
 # --- pjit ---
@@ -576,7 +656,7 @@ def _tp_add_p(x, y):
             new_exp,
             x.flat_center,
             _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
+            _output_pytree=PyTreeShape.flat(broadcast_shape),
             _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(per_leaf_order)
@@ -596,7 +676,7 @@ def _tp_add_p(x, y):
             new_exp,
             x.flat_center,
             _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
+            _output_pytree=PyTreeShape.flat(broadcast_shape),
             _per_leaf_order=x._per_leaf_order,
         )
         return result.to_canonical(x._per_leaf_order)
@@ -672,7 +752,7 @@ def _tp_mul_p(x, y, *, max_order: int = None):
             all_exp,
             x.flat_center,
             _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
+            _output_pytree=PyTreeShape.flat(broadcast_shape),
             _per_leaf_order=per_leaf_order,
         )
         return result.to_canonical(per_leaf_order)
@@ -688,7 +768,7 @@ def _tp_mul_p(x, y, *, max_order: int = None):
             x.exponents,
             x.flat_center,
             _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
+            _output_pytree=PyTreeShape.flat(broadcast_shape),
             _per_leaf_order=x._per_leaf_order,
         )
 
