@@ -45,6 +45,7 @@ from .algorithms import (
     TMFlowpipe,
     TMFlowpipeGenerator,
     BasicTMFlowpipeGenerator,
+    BungerTMFlowpipeGenerator,
 )
 
 __all__ = [

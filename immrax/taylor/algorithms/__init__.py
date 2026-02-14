@@ -16,12 +16,14 @@ from immrax.taylor.algorithms.base import (
     tps_to_tx,
 )
 from .basic import BasicTMFlowpipeGenerator
+from .bunger import BungerTMFlowpipeGenerator
 
 
 __all__ = [
     "TMFlowpipe",
     "TMFlowpipeGenerator",
     "BasicTMFlowpipeGenerator",
+    "BungerTMFlowpipeGenerator",
     "tx_tm_eval",
     "tps_to_tx",
 ]
