@@ -9,13 +9,13 @@ from jaxtyping import ArrayLike
 from ...embedding import embed
 from ...inclusion import (
     Interval,
+    Permutation,
     icopy,
     i2ut,
     interval,
     jacM,
     mjacM,
     natif,
-    standard_permutation,
 )
 from ...neural import fastlin
 from ..parametope import Parametope
@@ -205,15 +205,15 @@ class AdjointEmbedding(ParametricEmbedding):
         if MJACM:
             if self.permutation is None:
                 lenperm = sum([len(arg) for arg in centers])
-                self.permutation = standard_permutation(lenperm)
+                self.permutation = Permutation(range(lenperm))
 
             MM = self.Mf(
                 t,
                 interval(alpha_p) @ big_iz + ox,
                 *args,
-                centers=(centers,),
-                permutations=self.permutation,
-            )[0]
+                center=centers,
+                permutation=self.permutation,
+            )
             ls = []
             us = []
 
@@ -435,16 +435,16 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
 
         if self.permutation is None:
             lenperm = sum([len(arg) for arg in centers])
-            self.permutation = standard_permutation(lenperm)
+            self.permutation = Permutation(range(lenperm))
 
         MM = self.Mf(
             t,
             interval(alpha_p) @ big_iz + ox,
             big_iu,
             *args,
-            centers=(centers,),
-            permutations=self.permutation,
-        )[0]
+            center=centers,
+            permutation=self.permutation,
+        )
 
         ls = []
         us = []

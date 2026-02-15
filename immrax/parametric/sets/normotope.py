@@ -144,7 +144,7 @@ class NormotopeEmbedding(ParametricEmbedding):
             self.gsc = partial(get_rohn_corners, sign='+')
         elif not no_gsc:
             ix0 = nt0.iover()
-            M = self.Mf(0.0, ix0, centers=((jnp.zeros(1), nt0.ox),))[0][1]
+            M = self.Mf(0.0, ix0, center=(jnp.zeros(1), nt0.ox))[1]
             self.gsc = get_sparse_corners(interval(M))
         else:
             self.gsc = get_corners
@@ -170,8 +170,8 @@ class NormotopeEmbedding(ParametricEmbedding):
             H_dot = Ut
 
         MM = self.Mf(
-            t, nt.iover(), centers=((jnp.zeros(1), nt.ox),), permutations=perm
-        )[0]
+            t, nt.iover(), center=(jnp.zeros(1), nt.ox), permutation=perm
+        )
         Mx = MM[1]
 
         mus = [nt.mu(H_dot @ Hp + H @ M @ Hp) for M in self.gsc(interval(Mx))]

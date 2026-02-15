@@ -744,14 +744,13 @@ class NNCEmbeddingSystem(EmbeddingSystem):
             for permutation in permutations:
                 # Compute Hybrid M centerings once
                 if self.M_locality == "hybrid":
-                    Mpre = self.sys_mjacM(
-                        t,
-                        ix,
-                        uglobal,
-                        w,
-                        permutations=permutation,
-                        centers=txuw_corners,
-                    )
+                    Mpre = [
+                        self.sys_mjacM(
+                            t, ix, uglobal, w,
+                            permutation=permutation, center=c,
+                        )
+                        for c in txuw_corners
+                    ]
 
                 for c in corners:
                     # for j, (tc, xc, uc, wc) in enumerate(txuw_corners) :
@@ -799,9 +798,9 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                                 _xi,
                                 _ui,
                                 w,
-                                permutations=permutation,
-                                centers=((tc, _xc, _uc, wc),),
-                            )[0]
+                                permutation=permutation,
+                                center=(tc, _xc, _uc, wc),
+                            )
                         else:
                             Jt, Jx, Ju, Jw = Mpre[j]
 
@@ -876,9 +875,9 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                                 x_i,
                                 u_i,
                                 w,
-                                permutations=permutation,
-                                centers=((tc, x_c, u_c, wc),),
-                            )[0]
+                                permutation=permutation,
+                                center=(tc, x_c, u_c, wc),
+                            )
                         else:
                             Jt, Jx, Ju, Jw = Mpre[j]
 

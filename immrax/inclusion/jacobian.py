@@ -11,7 +11,7 @@ from .interval import Interval, interval
 from .nif import natif
 
 
-def jacM(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
+def jacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
     """Creates the M matrices for the Jacobian-based inclusion function.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -20,6 +20,9 @@ def jacM(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
     ----------
     f : Callable[..., jax.Array]
         Function to construct Jacobian Inclusion Function from
+    mode : str
+        Differentiation mode: ``'rev'`` for ``jax.jacrev`` (default),
+        ``'fwd'`` for ``jax.jacfwd``.
 
     Returns
     -------
@@ -27,6 +30,7 @@ def jacM(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
         Jacobian-Based Inclusion Function of f
 
     """
+    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
 
     @jit
     @api_boundary
@@ -65,16 +69,14 @@ def jacM(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
                 "Must pass jax.Array (one center), Sequence[jax.Array], or None (auto-centered) for the centers argument"
             )
 
-        # return [natif(jax.jacfwd(partial(f, **kwargs), i))(*args) for i in range(len(args))]
         return [
-            natif(jax.jacrev(partial(f, **kwargs), i))(*args) for i in range(len(args))
+            natif(jac_fn(partial(f, **kwargs), i))(*args) for i in range(len(args))
         ]
-        # return [interval(jax.jacfwd(f, i)(*centers[0])) for i in range(len(args))]
 
     return F
 
 
-def jacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
+def jacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
     """Creates a Jacobian Inclusion Function of f using natif.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -83,6 +85,9 @@ def jacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
     ----------
     f : Callable[..., jax.Array]
         Function to construct Jacobian Inclusion Function from
+    mode : str
+        Differentiation mode: ``'rev'`` for ``jax.jacrev`` (default),
+        ``'fwd'`` for ``jax.jacfwd``.
 
     Returns
     -------
@@ -90,6 +95,7 @@ def jacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
         Jacobian-Based Inclusion Function of f
 
     """
+    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
 
     @jit
     @api_boundary
@@ -129,8 +135,7 @@ def jacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
             )
 
         retl, retu = [], []
-        df = [natif(jax.jacrev(f, i))(*args) for i in range(len(args))]
-        # df = [natif(jax.jacfwd(f, i))(*args) for i in range(len(args))]
+        df = [natif(jac_fn(f, i))(*args) for i in range(len(args))]
         for center in centers:
             if len(center) != len(args):
                 raise Exception(
@@ -255,195 +260,243 @@ def get_corners(M: Interval, cs: Tuple[Corner] | None = None):
     # return [(Mc := get_corner(M, c)) for c in cs if not jnp.allclose(Mc, 0)]
 
 
-def mjacM(f: Callable[..., jax.Array], argnums=None) -> Callable:
+def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
     """Creates the M matrices for the Mixed Jacobian-based inclusion function.
 
-    All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
+    For a function f and an interval [x] with center x', computes the interval
+    Jacobian matrix [M] using the mixed Jacobian approach (partial relaxation
+    with a permutation ordering) such that:
+
+    .. math::
+        f(x) - f(x') \\in [M] (x - x')
+
+    All positional arguments are assumed to be replaced with interval arguments
+    for the inclusion function.
 
     Parameters
     ----------
     f : Callable[..., jax.Array]
-        Function to construct Mixed Jacobian Inclusion Function from
+        Function to construct Mixed Jacobian Inclusion Function from.
+    mode : str
+        Differentiation mode: ``'rev'`` for ``jax.jacrev`` (default),
+        ``'fwd'`` for ``jax.jacfwd``.
 
     Returns
     -------
-    Callable[..., Interval]
-        Mixed Jacobian-Based Inclusion Function of f
-
+    Callable
+        Function that returns a list of interval matrices, one per argument group.
+        For multiple centers/permutations, vmap over the returned function.
     """
+    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
 
-    # if isinstance(argnums, int) :
-    #     single = True
-    #     argnums = (argnums,)
-    # else :
-    #     single = False
-
-    # @partial(jit,static_argnames=['permutations', 'corners'])
     @api_boundary
     def F(
         *args,
-        permutations: Tuple[Permutation] | None = None,
-        centers: jax.Array | Sequence[jax.Array] | None = None,
-        corners: Tuple[Corner] | None = None,
+        permutation: Permutation | None = None,
+        center: Tuple[jax.Array] | None = None,
         **kwargs,
-    ) -> Interval:
-        """_summary_
-
-        Parameters
-        ----------
-        permutations : Tuple[Permutation] | None, optional
-            _description_, by default None
-        centers : jax.Array | Sequence[jax.Array] | None, optional
-            _description_, by default None
-        corners : Tuple[Corner] | None, optional
-            _description_, by default None
-
-        Returns
-        -------
-        Interval
-            _description_
-
-        Raises
-        ------
-        Exception
-            _description_
-        Exception
-            _description_
-        Exception
-            _description_
-        Exception
-            _description_
-        Exception
-            _description_
-        """
+    ) -> list:
         args = [interval(arg).atleast_1d() for arg in args]
         leninputsfull = tuple([len(x) for x in args])
         leninputs = sum(leninputsfull)
-
-        # if argnums is None :
-        #     _argnums = range(len(args))
-        # else :
-        #     _argnums = argnums
-
-        if permutations is None:
-            permutations = standard_permutation(leninputs)
-        elif isinstance(permutations, Permutation):
-            permutations = [permutations]
-        elif not isinstance(permutations, Tuple):
-            raise Exception(
-                "Must pass jax.Array (one permutation), Sequence[jax.Array], or None (auto standard permutation) for the permutations argument"
-            )
-
         cumsum = tuple(accumulate(leninputsfull))
 
-        # Mixed Centered
-        if centers is None:
-            if corners is None:
-                # Auto-centered
-                centers = [tuple([(x.lower + x.upper) / 2 for x in args])]
-            else:
-                centers = []
-        elif isinstance(centers, jax.Array):
-            centers = [centers]
-        elif not isinstance(centers, Sequence):
+        if permutation is None:
+            permutation = Permutation(range(leninputs))
+
+        if center is None:
+            center = tuple([(x.lower + x.upper) / 2 for x in args])
+
+        if len(center) != len(args):
             raise Exception(
-                "Must pass jax.Array (one center), Sequence[jax.Array], or None (auto-centered) for the centers argument"
+                f"Not enough points {len(center)=} != {len(args)=} to center the Jacobian-based inclusion function around"
             )
-
-        if corners is not None:
-            if not isinstance(corners, Tuple):
-                raise Exception(
-                    "Must pass Tuple[Corner] or None for the corners argument"
-                )
-            centers.extend(
-                [
-                    tuple(
-                        [
-                            (x.lower if c[i] == 0 else x.upper)
-                            for i, x in enumerate(args)
-                        ]
-                    )
-                    for c in corners
-                ]
-            )
-
-        # multiple permutations/centers
-        ret = []
 
         def arg2z(*args):
             return jnp.concatenate(args)
 
-        def z2arg(z, **kwargs):
+        def z2arg(z):
             return jnp.split(z, cumsum[:-1], axis=-1)
 
-        # TODO: Understand why I needed to change this to jacrev to work with LiftedSystem
-
-        df_func = [natif(jax.jacrev(partial(f, **kwargs), i)) for i in range(len(args))]
-        # df_func = [natif(jax.jacfwd(partial(f, **kwargs), i)) for i in range(len(args))]
-        # df_func = [jax.jacfwd(partial(f, **kwargs), i) for i in range(len(args))]
-        # df_func = [natif(jax.jacfwd(partial(f, **kwargs), i)) for i in _argnums]
-        # df_func = [natif(jax.jacrev(partial(f, **kwargs), i)) for i in _argnums]
+        df_func = [natif(jac_fn(partial(f, **kwargs), i)) for i in range(len(args))]
         _z = arg2z(*[arg.lower for arg in args])
         z_ = arg2z(*[arg.upper for arg in args])
 
-        for center in centers:
-            if len(center) != len(args):
-                raise Exception(
-                    f"Not enough points {len(center)=} != {len(args)=} to center the Jacobian-based inclusion function around"
-                )
-            # f0 = f(*center)
-            zc = arg2z(*[jnp.atleast_1d(c) for c in center])
-            for sig in permutations:
-                Z = interval(
-                    jnp.where(
-                        sig.mtx,
-                        jnp.tile(_z, (len(sig), 1)),
-                        jnp.tile(zc, (len(sig), 1)),
-                    ),
-                    jnp.where(
-                        sig.mtx,
-                        jnp.tile(z_, (len(sig), 1)),
-                        jnp.tile(zc, (len(sig), 1)),
-                    ),
-                )
-                _cumsum = (0,) + cumsum
-                retc = []
-                npsig = np.asarray(sig)
+        zc = arg2z(*[jnp.atleast_1d(c) for c in center])
+        Z = interval(
+            jnp.where(
+                permutation.mtx,
+                jnp.tile(_z, (len(permutation), 1)),
+                jnp.tile(zc, (len(permutation), 1)),
+            ),
+            jnp.where(
+                permutation.mtx,
+                jnp.tile(z_, (len(permutation), 1)),
+                jnp.tile(zc, (len(permutation), 1)),
+            ),
+        )
+        _cumsum = (0,) + cumsum
+        retc = []
+        npsig = np.asarray(permutation)
 
-                # # Using jax.lax.scan to build columns
-                # for i in range(len(args)) :
-                #     idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i+1])
-                #     def to_scan (_, arg) :
-                #         sigj, z = arg
-                #         return None, df_func[i](*natif(z2arg)(z))[:,sigj]
-                #     _, Mi = jax.lax.scan(to_scan, None, (npsig[idx], Z[idx])) #
-                #     # print(Mi.shape)
-                #     # print(npsig[idx])
-                #     retc.append(Mi[npsig[idx]-_cumsum[i]].T)
+        for i in range(len(args)):
+            idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i + 1])
+            iargs = (
+                natif(z2arg)(Z[idx]) if len(args) > 1 else (Z[idx],)
+            )
+            Mi = jax.vmap(df_func[i])(*iargs)
+            retc.append(
+                Mi[
+                    np.arange(leninputsfull[i]), :, np.arange(leninputsfull[i])
+                ].T
+            )
 
-                # Using vmap to build columns
-                for i in range(len(args)):
-                    idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i + 1])
-                    iargs = (
-                        natif(z2arg)(Z[idx]) if len(args) > 1 else (Z[idx],)
-                    )  # fix unpacking issue for single argument
-                    Mi = jax.vmap(df_func[i])(*iargs)
-                    # sig.arr[idx]-_cumsum[i] rearranges/extracts the columns of Mi
-                    # retc.append(Mi[np.arange(leninputsfull[i]),:,npsig[idx]-_cumsum[i]].T)
-                    retc.append(
-                        Mi[
-                            np.arange(leninputsfull[i]), :, np.arange(leninputsfull[i])
-                        ].T
-                    )
-                    # print(Mi.shape)
-
-                ret.append(retc)
-        return ret
+        return retc
 
     return F
 
 
-def mjacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
+def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Callable:
+    """Creates higher-order M tensors for the Mixed Jacobian-based inclusion function.
+
+    For a function f and an interval [x] with center x', computes the interval
+    k-th derivative tensor [D^k f] using the mixed Jacobian approach (partial
+    relaxation with a permutation ordering).
+
+    The result satisfies the Taylor inclusion:
+
+    .. math::
+        f(x) - \\sum_{p=0}^{k-1} \\frac{1}{p!} D^p f(x') (x - x')^{\\otimes p}
+        \\in \\frac{1}{k!} [D^k f] \\cdot (x - x')^{\\otimes k}
+
+    The inner (k-1) derivatives are computed via iterated ``jax.jacfwd``, and the
+    outermost derivative uses the mixed Jacobian technique (``natif(jax.jacrev)``
+    or ``natif(jax.jacfwd)`` depending on ``mode``) with permutation-based
+    partial relaxation for tighter bounds.
+
+    For ``order=1``, this is equivalent to :func:`mjacM`.
+
+    Parameters
+    ----------
+    f : Callable[..., jax.Array]
+        Function to construct Higher-Order Mixed Jacobian from.
+    order : int
+        Order of the derivative tensor to compute. Must be >= 1.
+    mode : str
+        Differentiation mode for the outermost (mixed) derivative:
+        ``'rev'`` for ``jax.jacrev`` (default), ``'fwd'`` for ``jax.jacfwd``.
+
+    Returns
+    -------
+    Callable
+        Higher-Order Mixed Jacobian function. Returns a list (per argument group)
+        of interval tensors. Each tensor has shape ``(m, n, ..., n, n_i)`` with
+        ``(order-1)`` copies of ``n`` from ``jacfwd`` and ``n_i`` for arg group
+        ``i``'s dimension. For multiple centers/permutations, vmap over the
+        returned function.
+    """
+    if order < 1:
+        raise ValueError("order must be >= 1")
+
+    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+
+    @api_boundary
+    def F(
+        *args,
+        permutation: Permutation | None = None,
+        center: Tuple[jax.Array] | None = None,
+        **kwargs,
+    ) -> list:
+        args = [interval(arg).atleast_1d() for arg in args]
+        leninputsfull = tuple([len(x) for x in args])
+        leninputs = sum(leninputsfull)
+        cumsum = tuple(accumulate(leninputsfull))
+
+        if permutation is None:
+            permutation = Permutation(range(leninputs))
+
+        if center is None:
+            center = tuple([(x.lower + x.upper) / 2 for x in args])
+
+        if len(center) != len(args):
+            raise Exception(
+                f"Not enough points {len(center)=} != {len(args)=} to center the inclusion function around"
+            )
+
+        def arg2z(*args):
+            return jnp.concatenate(args)
+
+        def z2arg(z):
+            return jnp.split(z, cumsum[:-1], axis=-1)
+
+        # Single-argument wrapper: g(z) = f(*z2arg(z))
+        g = lambda z: partial(f, **kwargs)(*z2arg(z))
+
+        # Build D^{order-1} g via iterated jacfwd
+        curr_g = g
+        for _ in range(order - 1):
+            curr_g = jax.jacfwd(curr_g)
+        # curr_g: R^n -> R^{m, n^{order-1}}
+
+        # Apply natif(jac_fn) for the mixed approach on the outermost derivative
+        dg_func = natif(jac_fn(curr_g))
+        # dg_func: Interval^n -> Interval^{m, n^{order-1}, n}
+
+        _z = arg2z(*[arg.lower for arg in args])
+        z_ = arg2z(*[arg.upper for arg in args])
+
+        zc = arg2z(*[jnp.atleast_1d(c) for c in center])
+        # Build partially-relaxed intervals using permutation matrix
+        Z = interval(
+            jnp.where(
+                permutation.mtx,
+                jnp.tile(_z, (len(permutation), 1)),
+                jnp.tile(zc, (len(permutation), 1)),
+            ),
+            jnp.where(
+                permutation.mtx,
+                jnp.tile(z_, (len(permutation), 1)),
+                jnp.tile(zc, (len(permutation), 1)),
+            ),
+        )
+
+        # Evaluate interval Jacobian on all partially-relaxed intervals
+        Mi = jax.vmap(dg_func)(Z)
+        # Mi shape: (leninputs, m, n^{order-1}, leninputs)
+
+        npsig = np.asarray(permutation)
+
+        # Extract column σ(j) from the last axis for step j
+        idx_first = np.arange(leninputs)
+        idx_last = npsig
+        idx_tuple = (idx_first,) + (slice(None),) * order + (idx_last,)
+        M_cols = Mi[idx_tuple]
+        # M_cols shape: (leninputs, m, n^{order-1})
+
+        # Split by argument groups and reorder columns
+        retc = []
+        _cumsum = (0,) + cumsum
+        for i in range(len(args)):
+            idx = np.logical_and(
+                npsig >= _cumsum[i], npsig < _cumsum[i + 1]
+            )
+            idx_positions = np.where(idx)[0]
+            sub_indices = npsig[idx_positions] - _cumsum[i]
+            sort_order = np.argsort(sub_indices)
+            block = M_cols[idx_positions[sort_order]]
+            # block shape: (n_i, m, n^{order-1})
+
+            # Move the n_i axis (first) to the end: (m, n^{order-1}, n_i)
+            perm = tuple(range(1, order + 1)) + (0,)
+            block = block.transpose(perm)
+            retc.append(block)
+
+        return retc
+
+    return F
+
+
+def mjacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
     """Creates a Mixed Jacobian Inclusion Function of f using natif.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -452,6 +505,9 @@ def mjacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
     ----------
     f : Callable[..., jax.Array]
         Function to construct Mixed Jacobian Inclusion Function from
+    mode : str
+        Differentiation mode: ``'rev'`` for ``jax.jacrev`` (default),
+        ``'fwd'`` for ``jax.jacfwd``.
 
     Returns
     -------
@@ -459,6 +515,7 @@ def mjacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
         Mixed Jacobian-Based Inclusion Function of f
 
     """
+    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
 
     # @wraps(f)
     @partial(jit, static_argnames=["permutations", "corners"])
@@ -568,8 +625,7 @@ def mjacif(f: Callable[..., jax.Array]) -> Callable[..., Interval]:
         retl, retu = [], []
 
         # This is the \sfJ_x for each argument. Natural inclusion on the Jacobian tree.
-        # TODO: we change to jacrev here, jacfwd doesn't work for unclear reasons
-        df_func = [natif(jax.jacrev(f, i)) for i in range(len(args))]
+        df_func = [natif(jac_fn(f, i)) for i in range(len(args))]
 
         # centers is an array of centers to check
         for center in centers:
