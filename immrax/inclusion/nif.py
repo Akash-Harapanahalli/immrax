@@ -222,7 +222,25 @@ _add_passthrough_to_registry(lax.reduce_min_p)
 _add_passthrough_to_registry(lax.max_p)
 _add_passthrough_to_registry(lax.min_p)
 _add_passthrough_to_registry(lax.exp_p, n_ulps=1)
-_add_passthrough_to_registry(lax.reduce_sum_p, n_ulps=1)
+
+
+def _inclusion_reduce_sum_p(x: Interval, **kwargs) -> Interval:
+    """Interval reduce_sum with rigorous widening scaled by reduction size."""
+    axes = kwargs['axes']
+    lo = lax.reduce_sum_p.bind(x.lower, **kwargs)
+    hi = lax.reduce_sum_p.bind(x.upper, **kwargs)
+    result = Interval(lo, hi)
+    if _rigorous:
+        n = 1
+        for ax in axes:
+            n *= x.lower.shape[ax]
+        if n > 1:
+            result = widen(result, n - 1)
+    return result
+
+
+_inclusion_reduce_sum_p.n_ulps = 0
+inclusion_registry[lax.reduce_sum_p] = _inclusion_reduce_sum_p
 
 
 def _inclusion_reduce_prod_p(x: Interval, *, axes) -> Interval:
@@ -506,17 +524,24 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
             _2 = a.lower * b.upper
             _3 = a.upper * b.lower
             _4 = a.upper * b.upper
-            return Interval(
+            result = Interval(
                 jnp.minimum(jnp.minimum(_1, _2), jnp.minimum(_3, _4)),
                 jnp.maximum(jnp.maximum(_1, _2), jnp.maximum(_3, _4)),
             )
+            if _rigorous:
+                result = widen(result, 1)
+            return result
 
-        isum = lambda x: Interval(jnp.sum(x.lower), jnp.sum(x.upper))
+        def isum(x):
+            result = Interval(jnp.sum(x.lower), jnp.sum(x.upper))
+            if _rigorous:
+                k = x.lower.size
+                if k > 1:
+                    result = widen(result, k - 1)
+            return result
 
         # Two vectors -> scalar
         def f(a, b):
-            # _mulres = jax.vmap(_mul)(a, b)
-            # return Interval(jnp.sum(_mulres.lower), jnp.sum(_mulres.upper))
             _r = jax.vmap(_mul)
             return isum(_r(a, b))
 
@@ -541,7 +566,7 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
     return f(A, B)
 
 
-_inclusion_dot_general_p.n_ulps = 1
+_inclusion_dot_general_p.n_ulps = 0
 inclusion_registry[lax.dot_general_p] = _inclusion_dot_general_p
 
 

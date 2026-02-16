@@ -258,3 +258,111 @@ class TestRigorousDifferentiability:
         assert jnp.all(y.lower <= y.upper)
         assert jnp.all(jnp.isfinite(y.lower))
         assert jnp.all(jnp.isfinite(y.upper))
+
+
+# --- Overconservatism measurement ---
+
+class TestRigorousOverconservatism:
+    """Measure how much extra width rigorous mode adds for dot/sum."""
+
+    def test_matmul_overconservatism(self):
+        """Rigorous matmul should be only marginally wider than non-rigorous."""
+        key = jax.random.PRNGKey(42)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        n, m, p = 10, 20, 15
+        A = icentpert(
+            jax.random.normal(k1, (n, m)),
+            0.1 * jnp.abs(jax.random.normal(k2, (n, m))),
+        )
+        B = icentpert(
+            jax.random.normal(k3, (m, p)),
+            0.1 * jnp.abs(jax.random.normal(k4, (m, p))),
+        )
+
+        rigorous = natif(jnp.matmul, rigorous=True)(A, B)
+        normal = natif(jnp.matmul, rigorous=False)(A, B)
+
+        # Rigorous must enclose non-rigorous
+        assert jnp.all(rigorous.lower <= normal.lower)
+        assert jnp.all(rigorous.upper >= normal.upper)
+
+        normal_width = normal.upper - normal.lower
+        rigorous_width = rigorous.upper - rigorous.lower
+        relative_excess = (rigorous_width - normal_width) / normal_width
+
+        print(f"\nMatmul ({n}x{m} @ {m}x{p}):")
+        print(f"  Mean relative width increase: {jnp.mean(relative_excess):.2e}")
+        print(f"  Max  relative width increase: {jnp.max(relative_excess):.2e}")
+
+        # ULP-scale widening should be negligible compared to interval widths
+        assert jnp.max(relative_excess) < 1e-4
+
+    def test_matmul_containment(self):
+        """Rigorous matmul bounds should contain sampled true values."""
+        key = jax.random.PRNGKey(7)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        n, m, p = 5, 8, 6
+        A = icentpert(
+            jax.random.normal(k1, (n, m)),
+            0.1 * jnp.abs(jax.random.normal(k2, (n, m))),
+        )
+        B = icentpert(
+            jax.random.normal(k3, (m, p)),
+            0.1 * jnp.abs(jax.random.normal(k4, (m, p))),
+        )
+
+        result = natif(jnp.matmul, rigorous=True)(A, B)
+
+        for alpha in jnp.linspace(0, 1, 30):
+            for beta in jnp.linspace(0, 1, 30):
+                A_s = A.lower + alpha * (A.upper - A.lower)
+                B_s = B.lower + beta * (B.upper - B.lower)
+                y_true = A_s @ B_s
+                assert jnp.all(y_true >= result.lower - 1e-6)
+                assert jnp.all(y_true <= result.upper + 1e-6)
+
+    def test_sum_overconservatism(self):
+        """Rigorous sum should be only marginally wider than non-rigorous."""
+        key = jax.random.PRNGKey(0)
+        k1, k2 = jax.random.split(key)
+
+        n = 100
+        x = icentpert(
+            jax.random.normal(k1, (n,)),
+            0.1 * jnp.abs(jax.random.normal(k2, (n,))),
+        )
+
+        rigorous = natif(jnp.sum, rigorous=True)(x)
+        normal = natif(jnp.sum, rigorous=False)(x)
+
+        rigorous_width = rigorous.upper - rigorous.lower
+        normal_width = normal.upper - normal.lower
+        relative_excess = (rigorous_width - normal_width) / normal_width
+
+        print(f"\nSum (n={n}):")
+        print(f"  Normal width:   {normal_width:.6f}")
+        print(f"  Rigorous width: {rigorous_width:.6f}")
+        print(f"  Relative width increase: {relative_excess:.2e}")
+
+        assert relative_excess < 1e-4
+
+    def test_sum_containment(self):
+        """Rigorous sum bounds should contain sampled true values."""
+        key = jax.random.PRNGKey(1)
+        k1, k2 = jax.random.split(key)
+
+        n = 100
+        x = icentpert(
+            jax.random.normal(k1, (n,)),
+            0.1 * jnp.abs(jax.random.normal(k2, (n,))),
+        )
+
+        result = natif(jnp.sum, rigorous=True)(x)
+
+        for alpha in jnp.linspace(0, 1, 100):
+            x_s = x.lower + alpha * (x.upper - x.lower)
+            y_true = jnp.sum(x_s)
+            assert y_true >= result.lower - 1e-6
+            assert y_true <= result.upper + 1e-6

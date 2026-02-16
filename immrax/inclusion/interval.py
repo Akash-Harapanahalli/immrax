@@ -477,8 +477,17 @@ def widen(iv: Interval, n: int = 1) -> Interval:
     Interval
         Widened interval.
     """
+    if n == 0:
+        return iv
     lo, hi = iv.lower, iv.upper
-    for _ in range(n):
-        lo = _widen_lower(lo)
-        hi = _widen_upper(hi)
+    if n <= 4:
+        for _ in range(n):
+            lo = _widen_lower(lo)
+            hi = _widen_upper(hi)
+    else:
+        # O(1) widening: compute 1-ULP step, scale by n, add 1 ULP margin
+        lo_step = _widen_lower(lo) - lo   # negative
+        hi_step = _widen_upper(hi) - hi   # positive
+        lo = _widen_lower(lo + n * lo_step)
+        hi = _widen_upper(hi + n * hi_step)
     return Interval(lo, hi)
