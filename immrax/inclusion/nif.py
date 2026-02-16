@@ -65,7 +65,6 @@ def natif(
         natif(f)(M, iv_x, dims)
     """
 
-    @jit
     @wraps(f)
     def wrapped(*args, **kwargs):
         # Separate interval args from non-interval (fixed) args

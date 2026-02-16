@@ -7,11 +7,11 @@ from functools import partial
 from itertools import accumulate, product
 from itertools import permutations as perms
 from jax._src.api import api_boundary
-from .interval import Interval, interval
+from .interval import Interval, interval, iconcatenate
 from .nif import natif
 
 
-def jacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
+def jacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable[..., Interval]:
     """Creates the M matrices for the Jacobian-based inclusion function.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -30,7 +30,7 @@ def jacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interv
         Jacobian-Based Inclusion Function of f
 
     """
-    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
 
     @jit
     @api_boundary
@@ -69,14 +69,12 @@ def jacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interv
                 "Must pass jax.Array (one center), Sequence[jax.Array], or None (auto-centered) for the centers argument"
             )
 
-        return [
-            natif(jac_fn(partial(f, **kwargs), i))(*args) for i in range(len(args))
-        ]
+        return [natif(jac_fn(partial(f, **kwargs), i))(*args) for i in range(len(args))]
 
     return F
 
 
-def jacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
+def jacif(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable[..., Interval]:
     """Creates a Jacobian Inclusion Function of f using natif.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -95,7 +93,7 @@ def jacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Inter
         Jacobian-Based Inclusion Function of f
 
     """
-    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
 
     @jit
     @api_boundary
@@ -260,7 +258,7 @@ def get_corners(M: Interval, cs: Tuple[Corner] | None = None):
     # return [(Mc := get_corner(M, c)) for c in cs if not jnp.allclose(Mc, 0)]
 
 
-def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
+def mjacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable:
     """Creates the M matrices for the Mixed Jacobian-based inclusion function.
 
     For a function f and an interval [x] with center x', computes the interval
@@ -278,8 +276,8 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
     f : Callable[..., jax.Array]
         Function to construct Mixed Jacobian Inclusion Function from.
     mode : str
-        Differentiation mode: ``'rev'`` for ``jax.jacrev`` (default),
-        ``'fwd'`` for ``jax.jacfwd``.
+        Differentiation mode: ``'fwd'`` for ``jax.jacfwd`` (default),
+        ``'rev'`` for ``jax.jacrev``.
 
     Returns
     -------
@@ -287,7 +285,7 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
         Function that returns a list of interval matrices, one per argument group.
         For multiple centers/permutations, vmap over the returned function.
     """
-    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
 
     @api_boundary
     def F(
@@ -300,6 +298,7 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
         leninputsfull = tuple([len(x) for x in args])
         leninputs = sum(leninputsfull)
         cumsum = tuple(accumulate(leninputsfull))
+        nargs = len(args)
 
         if permutation is None:
             permutation = Permutation(range(leninputs))
@@ -307,18 +306,18 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
         if center is None:
             center = tuple([(x.lower + x.upper) / 2 for x in args])
 
-        if len(center) != len(args):
+        if len(center) != nargs:
             raise Exception(
-                f"Not enough points {len(center)=} != {len(args)=} to center the Jacobian-based inclusion function around"
+                f"Not enough points {len(center)=} != {nargs=} to center the Jacobian-based inclusion function around"
             )
 
-        def arg2z(*args):
-            return jnp.concatenate(args)
+        def arg2z(*a):
+            return jnp.concatenate(a)
 
         def z2arg(z):
             return jnp.split(z, cumsum[:-1], axis=-1)
 
-        df_func = [natif(jac_fn(partial(f, **kwargs), i)) for i in range(len(args))]
+        df_func = [natif(jac_fn(partial(f, **kwargs), i)) for i in range(nargs)]
         _z = arg2z(*[arg.lower for arg in args])
         z_ = arg2z(*[arg.upper for arg in args])
 
@@ -339,16 +338,12 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
         retc = []
         npsig = np.asarray(permutation)
 
-        for i in range(len(args)):
+        for i in range(nargs):
             idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i + 1])
-            iargs = (
-                natif(z2arg)(Z[idx]) if len(args) > 1 else (Z[idx],)
-            )
+            iargs = natif(z2arg)(Z[idx]) if nargs > 1 else (Z[idx],)
             Mi = jax.vmap(df_func[i])(*iargs)
             retc.append(
-                Mi[
-                    np.arange(leninputsfull[i]), :, np.arange(leninputsfull[i])
-                ].T
+                Mi[np.arange(leninputsfull[i]), :, np.arange(leninputsfull[i])].T
             )
 
         return retc
@@ -356,7 +351,7 @@ def mjacM(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable:
     return F
 
 
-def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Callable:
+def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = "fwd") -> Callable:
     """Creates higher-order M tensors for the Mixed Jacobian-based inclusion function.
 
     For a function f and an interval [x] with center x', computes the interval
@@ -389,16 +384,22 @@ def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Ca
     Returns
     -------
     Callable
-        Higher-Order Mixed Jacobian function. Returns a list (per argument group)
-        of interval tensors. Each tensor has shape ``(m, n, ..., n, n_i)`` with
-        ``(order-1)`` copies of ``n`` from ``jacfwd`` and ``n_i`` for arg group
-        ``i``'s dimension. For multiple centers/permutations, vmap over the
-        returned function.
+        Higher-Order Mixed Jacobian function. Returns ``(derivs, M)`` where:
+
+        - ``derivs``: list of concrete arrays
+          ``[g(zc), Dg(zc), ..., D^{k-1}g(zc)]`` — the derivatives of the
+          concatenated function ``g(z) = f(*z2arg(z))`` evaluated at the center
+          ``zc``.  Shapes are ``(m,)``, ``(m, n)``, ``(m, n, n)``, etc.
+        - ``M``: list (per argument group) of interval tensors.  Each tensor
+          has shape ``(m, n, ..., n, n_i)`` with ``(order-1)`` copies of ``n``
+          from ``jacfwd`` and ``n_i`` for arg group ``i``'s dimension.
+
+        For multiple centers/permutations, vmap over the returned function.
     """
     if order < 1:
         raise ValueError("order must be >= 1")
 
-    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
 
     @api_boundary
     def F(
@@ -423,8 +424,8 @@ def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Ca
                 f"Not enough points {len(center)=} != {len(args)=} to center the inclusion function around"
             )
 
-        def arg2z(*args):
-            return jnp.concatenate(args)
+        def arg2z(*a):
+            return jnp.concatenate(a)
 
         def z2arg(z):
             return jnp.split(z, cumsum[:-1], axis=-1)
@@ -432,11 +433,16 @@ def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Ca
         # Single-argument wrapper: g(z) = f(*z2arg(z))
         g = lambda z: partial(f, **kwargs)(*z2arg(z))
 
-        # Build D^{order-1} g via iterated jacfwd
+        # Build D^{order-1} g via iterated jacfwd, collecting intermediate
+        # derivatives evaluated at the center along the way.
+        zc = arg2z(*[jnp.atleast_1d(c) for c in center])
+        derivs = [g(zc)]  # D^0 g(zc) = f(x')
         curr_g = g
         for _ in range(order - 1):
             curr_g = jax.jacfwd(curr_g)
+            derivs.append(curr_g(zc))
         # curr_g: R^n -> R^{m, n^{order-1}}
+        # derivs: [g(zc), Dg(zc), ..., D^{k-1}g(zc)]
 
         # Apply natif(jac_fn) for the mixed approach on the outermost derivative
         dg_func = natif(jac_fn(curr_g))
@@ -477,9 +483,7 @@ def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Ca
         retc = []
         _cumsum = (0,) + cumsum
         for i in range(len(args)):
-            idx = np.logical_and(
-                npsig >= _cumsum[i], npsig < _cumsum[i + 1]
-            )
+            idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i + 1])
             idx_positions = np.where(idx)[0]
             sub_indices = npsig[idx_positions] - _cumsum[i]
             sort_order = np.argsort(sub_indices)
@@ -491,12 +495,83 @@ def hmjacM(f: Callable[..., jax.Array], order: int = 1, mode: str = 'fwd') -> Ca
             block = block.transpose(perm)
             retc.append(block)
 
-        return retc
+        return derivs, retc
 
     return F
 
 
-def mjacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Interval]:
+def taylor_bounds(
+    derivs: list,
+    M: list,
+    center: jax.Array | Tuple[jax.Array],
+) -> Callable[..., Interval]:
+    """Construct a Taylor inclusion function from hmjacM output.
+
+    Given the output ``(derivs, M)`` from ``hmjacM(f, order=k)`` and the
+    center point, returns a function that maps ``x`` to an interval
+    containing ``f(x)`` via the Taylor inclusion:
+
+        f(x) in sum_{p=0}^{k-1} (1/p!) D^p f(x')(x-x')^{otimes p}
+                 + (1/k!) [D^k f](x-x')^{otimes k}
+
+    Parameters
+    ----------
+    derivs : list
+        ``[g(x'), Dg(x'), ..., D^{k-1}g(x')]`` from ``hmjacM``.
+    M : list[Interval]
+        Interval M-tensor blocks from ``hmjacM``.
+    center : array or tuple of arrays
+        Center point ``x'``.  If a tuple (multi-arg), each entry
+        corresponds to one positional argument of the original function.
+
+    Returns
+    -------
+    Callable
+        Maps ``*args`` (arrays or Intervals matching the original function
+        signature) to an Interval containing ``f(*args)``.
+    """
+    from immrax.utils import inv_fact
+
+    order = len(derivs)
+
+    if isinstance(center, tuple):
+        zc = jnp.concatenate([jnp.atleast_1d(c) for c in center])
+    else:
+        zc = jnp.atleast_1d(center)
+
+    # Reassemble full M tensor along last axis
+    full_M = interval(
+        jnp.concatenate([m.lower for m in M], axis=-1),
+        jnp.concatenate([m.upper for m in M], axis=-1),
+    )
+
+    # Precompute inverse factorials: [1/0!, 1/1!, ..., 1/order!]
+    inv_facts = inv_fact(jnp.arange(order + 1, dtype=float))
+
+    def bound(*args):
+        parts = [interval(a).atleast_1d() for a in args]
+        dx = iconcatenate(parts) - zc
+
+        # Polynomial: sum_{p=0}^{k-1} (1/p!) D^p g(zc) . dx^{otimes p}
+        result = interval(derivs[0])
+        for p in range(1, order):
+            term = interval(derivs[p])
+            for _ in range(p):
+                term = term @ dx
+            result = result + term * inv_facts[p]
+
+        # Remainder: (1/k!) [D^k g] . dx^{otimes k}
+        rem = full_M
+        for _ in range(order):
+            rem = rem @ dx
+        result = result + rem * inv_facts[order]
+
+        return result
+
+    return bound
+
+
+def mjacif(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable[..., Interval]:
     """Creates a Mixed Jacobian Inclusion Function of f using natif.
 
     All positional arguments are assumed to be replaced with interval arguments for the inclusion function.
@@ -515,7 +590,7 @@ def mjacif(f: Callable[..., jax.Array], mode: str = 'fwd') -> Callable[..., Inte
         Mixed Jacobian-Based Inclusion Function of f
 
     """
-    jac_fn = jax.jacfwd if mode == 'fwd' else jax.jacrev
+    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
 
     # @wraps(f)
     @partial(jit, static_argnames=["permutations", "corners"])

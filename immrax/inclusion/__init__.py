@@ -36,6 +36,7 @@ from .jacobian import (
     mjacif,
     mjacM,
     hmjacM,
+    taylor_bounds,
 )
 
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     "mjacif",
     "mjacM",
     "hmjacM",
+    "taylor_bounds",
 ]

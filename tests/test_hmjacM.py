@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import immrax as irx
-from immrax.inclusion import hmjacM, mjacM, interval, icentpert
+from immrax.inclusion import hmjacM, mjacM, interval, icentpert, taylor_bounds
 
 
 # --- Test functions ---
@@ -45,25 +45,32 @@ class TestOrder1Consistency:
         """Single 1D argument."""
         x = icentpert(jnp.array([1.0]), 0.1)
         M_orig = mjacM(quadratic)(x)
-        M_new = hmjacM(quadratic, order=1)(x)
+        derivs, M_new = hmjacM(quadratic, order=1)(x)
 
         assert len(M_orig) == len(M_new)
         for orig, new in zip(M_orig, M_new):
             assert orig.shape == new.shape
             assert jnp.allclose(orig.lower, new.lower, atol=1e-6)
             assert jnp.allclose(orig.upper, new.upper, atol=1e-6)
+
+        # derivs should contain [g(zc)] = [f(center)]
+        assert len(derivs) == 1
+        assert jnp.allclose(derivs[0], quadratic(x.center), atol=1e-6)
 
     def test_single_arg_vector(self):
         """Single 2D argument."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
         M_orig = mjacM(coupled_fn)(x)
-        M_new = hmjacM(coupled_fn, order=1)(x)
+        derivs, M_new = hmjacM(coupled_fn, order=1)(x)
 
         assert len(M_orig) == len(M_new)
         for orig, new in zip(M_orig, M_new):
             assert orig.shape == new.shape
             assert jnp.allclose(orig.lower, new.lower, atol=1e-6)
             assert jnp.allclose(orig.upper, new.upper, atol=1e-6)
+
+        assert len(derivs) == 1
+        assert jnp.allclose(derivs[0], coupled_fn(x.center), atol=1e-6)
 
     def test_multi_arg(self):
         """Two arguments: f(t, x)."""
@@ -72,13 +79,16 @@ class TestOrder1Consistency:
         center = ((t.lower + t.upper) / 2, (x.lower + x.upper) / 2)
 
         M_orig = mjacM(multi_arg_fn)(t, x, center=center)
-        M_new = hmjacM(multi_arg_fn, order=1)(t, x, center=center)
+        derivs, M_new = hmjacM(multi_arg_fn, order=1)(t, x, center=center)
 
         assert len(M_orig) == len(M_new)
         for orig, new in zip(M_orig, M_new):
             assert orig.shape == new.shape
             assert jnp.allclose(orig.lower, new.lower, atol=1e-6)
             assert jnp.allclose(orig.upper, new.upper, atol=1e-6)
+
+        assert len(derivs) == 1
+        assert jnp.allclose(derivs[0], multi_arg_fn(*center), atol=1e-6)
 
 
 # --- Order 2: shape and correctness ---
@@ -89,7 +99,7 @@ class TestOrder2:
     def test_shape_single_arg(self):
         """Check output tensor shape for order=2, single argument."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M2 = hmjacM(coupled_fn, order=2)(x)
+        derivs, M2 = hmjacM(coupled_fn, order=2)(x)
 
         # One argument group
         assert len(M2) == 1
@@ -101,7 +111,7 @@ class TestOrder2:
         """Check output tensor shape for order=2, multi-argument."""
         t = icentpert(jnp.array([0.5]), 0.05)
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M2 = hmjacM(multi_arg_fn, order=2)(t, x)
+        derivs, M2 = hmjacM(multi_arg_fn, order=2)(t, x)
 
         # Two argument groups
         assert len(M2) == 2
@@ -113,14 +123,14 @@ class TestOrder2:
     def test_bounds_valid(self):
         """Check that interval bounds are valid (lower <= upper)."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M2 = hmjacM(coupled_fn, order=2)(x)
+        derivs, M2 = hmjacM(coupled_fn, order=2)(x)
         block = M2[0]
         assert jnp.all(block.lower <= block.upper)
 
     def test_contains_true_hessian(self):
         """Check that [D^2 f] contains the true Hessian at several sample points."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M2 = hmjacM(coupled_fn, order=2)(x)
+        derivs, M2 = hmjacM(coupled_fn, order=2)(x)
         block = M2[0]  # shape (2, 2, 2) = Interval Hessian
 
         # Compute true Hessian at several points in the interval
@@ -140,13 +150,24 @@ class TestOrder2:
         def f(x):
             return x ** 2
 
-        M2 = hmjacM(f, order=2)(x)
+        derivs, M2 = hmjacM(f, order=2)(x)
         block = M2[0]  # shape (2, 2, 2)
 
         # True Hessian of x^2 is diag(2, 2) (diagonal in the last two axes)
         H_true = jax.jacfwd(jax.jacfwd(f))(x.center)
         assert jnp.allclose(block.lower, H_true, atol=1e-5)
         assert jnp.allclose(block.upper, H_true, atol=1e-5)
+
+    def test_derivs_order2(self):
+        """Check that derivs contains [g(zc), Dg(zc)] for order=2."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M2 = hmjacM(coupled_fn, order=2)(x)
+
+        # derivs[0] = g(zc) = f(center), shape (2,)
+        assert jnp.allclose(derivs[0], coupled_fn(x.center), atol=1e-6)
+        # derivs[1] = Dg(zc) = Jacobian at center, shape (2, 2)
+        J_true = jax.jacfwd(coupled_fn)(x.center)
+        assert jnp.allclose(derivs[1], J_true, atol=1e-6)
 
 
 # --- Order 3: shape and basic validation ---
@@ -157,7 +178,7 @@ class TestOrder3:
     def test_shape(self):
         """Check output tensor shape for order=3."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M3 = hmjacM(cubic, order=3)(x)
+        derivs, M3 = hmjacM(cubic, order=3)(x)
 
         assert len(M3) == 1
         block = M3[0]
@@ -167,7 +188,7 @@ class TestOrder3:
     def test_contains_true_derivative(self):
         """Check that [D^3 f] contains the true 3rd derivative at sample points."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
-        M3 = hmjacM(cubic, order=3)(x)
+        derivs, M3 = hmjacM(cubic, order=3)(x)
         block = M3[0]
 
         d3f = jax.jacfwd(jax.jacfwd(jax.jacfwd(cubic)))
@@ -180,12 +201,26 @@ class TestOrder3:
     def test_cubic_exact(self):
         """For f(x) = x^3, D^3 f = diag(6), constant."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.2)
-        M3 = hmjacM(cubic, order=3)(x)
+        derivs, M3 = hmjacM(cubic, order=3)(x)
         block = M3[0]
 
         D3_true = jax.jacfwd(jax.jacfwd(jax.jacfwd(cubic)))(x.center)
         assert jnp.allclose(block.lower, D3_true, atol=1e-5)
         assert jnp.allclose(block.upper, D3_true, atol=1e-5)
+
+    def test_derivs_order3(self):
+        """Check that derivs contains [g(zc), Dg(zc), D^2g(zc)] for order=3."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M3 = hmjacM(cubic, order=3)(x)
+
+        # derivs[0] = g(zc), shape (2,)
+        assert jnp.allclose(derivs[0], cubic(x.center), atol=1e-6)
+        # derivs[1] = Dg(zc), shape (2, 2)
+        J_true = jax.jacfwd(cubic)(x.center)
+        assert jnp.allclose(derivs[1], J_true, atol=1e-6)
+        # derivs[2] = D^2 g(zc), shape (2, 2, 2)
+        H_true = jax.jacfwd(jax.jacfwd(cubic))(x.center)
+        assert jnp.allclose(derivs[2], H_true, atol=1e-6)
 
 
 # --- Taylor inclusion validation ---
@@ -200,12 +235,15 @@ class TestTaylorInclusion:
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
         center = x.center
 
-        M1 = hmjacM(sin_fn, order=1)(x)
+        derivs, M1 = hmjacM(sin_fn, order=1)(x)
         M_block = M1[0]  # shape (2, 2)
+
+        # derivs[0] should be f(center)
+        assert jnp.allclose(derivs[0], sin_fn(center), atol=1e-6)
 
         for alpha in jnp.linspace(0, 1, 50):
             x_sample = x.lower + alpha * (x.upper - x.lower)
-            residual = sin_fn(x_sample) - sin_fn(center)
+            residual = sin_fn(x_sample) - derivs[0]
             dx = x_sample - center
 
             # residual should be in [M_block] @ dx
@@ -218,22 +256,21 @@ class TestTaylorInclusion:
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
         center = x.center
 
-        M2 = hmjacM(sin_fn, order=2)(x)
+        derivs, M2 = hmjacM(sin_fn, order=2)(x)
         H_block = M2[0]  # shape (2, 2, 2)
 
-        Df_center = jax.jacfwd(sin_fn)(center)  # shape (2, 2)
+        # Use derivs directly instead of recomputing
+        f_center = derivs[0]  # g(zc) = f(center)
+        Df_center = derivs[1]  # Dg(zc) = Jacobian at center, shape (2, 2)
 
         for alpha in jnp.linspace(0, 1, 50):
             x_sample = x.lower + alpha * (x.upper - x.lower)
             dx = x_sample - center
             # Residual after first-order Taylor subtraction
-            residual = sin_fn(x_sample) - sin_fn(center) - Df_center @ dx
+            residual = sin_fn(x_sample) - f_center - Df_center @ dx
 
             # Bound: (1/2) * H_block contracted with dx twice
-            # H_block has shape (2, 2, 2). Contract last axis with dx, then again.
-            # First contraction: sum_k H[i,j,k] * dx[k] -> shape (2, 2)
             Hdx = interval(H_block) @ interval(dx)  # (2, 2)
-            # Second contraction: sum_j Hdx[i,j] * dx[j] -> shape (2,)
             bound = (interval(Hdx) @ interval(dx)) * 0.5
 
             assert jnp.all(residual >= bound.lower - 1e-5), \
@@ -255,8 +292,112 @@ class TestEdgeCases:
     def test_single_dimension(self):
         """1D input, 1D output."""
         x = icentpert(jnp.array([1.0]), 0.1)
-        M1 = hmjacM(sin_fn, order=1)(x)
+        derivs1, M1 = hmjacM(sin_fn, order=1)(x)
         assert M1[0].shape == (1, 1)
 
-        M2 = hmjacM(sin_fn, order=2)(x)
+        derivs2, M2 = hmjacM(sin_fn, order=2)(x)
         assert M2[0].shape == (1, 1, 1)
+
+
+# --- taylor_bounds ---
+
+class TestTaylorBounds:
+    """Test the taylor_bounds function."""
+
+    def test_order1_contains_true_values(self):
+        """Order-1 Taylor bound should contain f(x) for all x in the interval."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M = hmjacM(sin_fn, order=1)(x)
+        bound = taylor_bounds(derivs, M, x.center)
+
+        for alpha in jnp.linspace(0, 1, 50):
+            x_sample = x.lower + alpha * (x.upper - x.lower)
+            y_true = sin_fn(x_sample)
+            y_bound = bound(interval(x_sample))
+            assert jnp.all(y_true >= y_bound.lower - 1e-6)
+            assert jnp.all(y_true <= y_bound.upper + 1e-6)
+
+    def test_order2_contains_true_values(self):
+        """Order-2 Taylor bound should contain f(x) for all x in the interval."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M = hmjacM(sin_fn, order=2)(x)
+        bound = taylor_bounds(derivs, M, x.center)
+
+        for alpha in jnp.linspace(0, 1, 50):
+            x_sample = x.lower + alpha * (x.upper - x.lower)
+            y_true = sin_fn(x_sample)
+            y_bound = bound(interval(x_sample))
+            assert jnp.all(y_true >= y_bound.lower - 1e-6)
+            assert jnp.all(y_true <= y_bound.upper + 1e-6)
+
+    def test_order3_contains_true_values(self):
+        """Order-3 Taylor bound should contain f(x) for all x in the interval."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M = hmjacM(cubic, order=3)(x)
+        bound = taylor_bounds(derivs, M, x.center)
+
+        for alpha in jnp.linspace(0, 1, 50):
+            x_sample = x.lower + alpha * (x.upper - x.lower)
+            y_true = cubic(x_sample)
+            y_bound = bound(interval(x_sample))
+            assert jnp.all(y_true >= y_bound.lower - 1e-6)
+            assert jnp.all(y_true <= y_bound.upper + 1e-6)
+
+    def test_interval_input(self):
+        """taylor_bounds should accept interval inputs and return valid bounds."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M = hmjacM(sin_fn, order=2)(x)
+        bound = taylor_bounds(derivs, M, x.center)
+
+        y_bound = bound(x)
+        assert jnp.all(y_bound.lower <= y_bound.upper)
+
+        # Should contain f at center
+        y_center = sin_fn(x.center)
+        assert jnp.all(y_center >= y_bound.lower - 1e-6)
+        assert jnp.all(y_center <= y_bound.upper + 1e-6)
+
+    def test_higher_order_tighter(self):
+        """Higher order should give tighter bounds (for smooth functions)."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+
+        derivs1, M1 = hmjacM(sin_fn, order=1)(x)
+        bound1 = taylor_bounds(derivs1, M1, x.center)
+        y1 = bound1(x)
+        width1 = jnp.sum(y1.upper - y1.lower)
+
+        derivs2, M2 = hmjacM(sin_fn, order=2)(x)
+        bound2 = taylor_bounds(derivs2, M2, x.center)
+        y2 = bound2(x)
+        width2 = jnp.sum(y2.upper - y2.lower)
+
+        assert width2 < width1, f"Order 2 ({width2}) not tighter than order 1 ({width1})"
+
+    def test_multi_arg(self):
+        """taylor_bounds should work with multi-argument functions."""
+        t = icentpert(jnp.array([0.5]), 0.05)
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        center = (t.center, x.center)
+
+        derivs, M = hmjacM(multi_arg_fn, order=2)(t, x, center=center)
+        bound = taylor_bounds(derivs, M, center)
+
+        # Test with separate arguments (no concatenation needed)
+        for alpha in jnp.linspace(0, 1, 50):
+            t_s = t.lower + alpha * (t.upper - t.lower)
+            x_s = x.lower + alpha * (x.upper - x.lower)
+            y_true = multi_arg_fn(t_s, x_s)
+            y_bound = bound(interval(t_s), interval(x_s))
+            assert jnp.all(y_true >= y_bound.lower - 1e-5)
+            assert jnp.all(y_true <= y_bound.upper + 1e-5)
+
+    def test_quadratic_exact_at_center(self):
+        """At the center point, the bound should be tight (equal to f(center))."""
+        x = icentpert(jnp.array([1.0, 2.0]), 0.1)
+        derivs, M = hmjacM(quadratic, order=2)(x)
+        bound = taylor_bounds(derivs, M, x.center)
+
+        y_bound = bound(interval(x.center))
+        y_true = quadratic(x.center)
+        assert jnp.allclose(y_bound.lower, y_true, atol=1e-6)
+        assert jnp.allclose(y_bound.upper, y_true, atol=1e-6)
