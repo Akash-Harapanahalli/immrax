@@ -21,7 +21,10 @@ from jax.extend.core import Primitive
 from jax._src.lax import linalg as LA
 
 # TODO: import only necessary things
-from immrax.inclusion.interval import Interval, interval, isinterval, widen
+from immrax.inclusion.interval import (
+    Interval, interval, isinterval, widen,
+    _get_rigorous, _set_rigorous,
+)
 from functools import partial
 
 """
@@ -29,12 +32,6 @@ This file implements the Natural Inclusion Function as an interpreter of Jaxprs.
 """
 
 inclusion_registry = {}
-
-# ---------------------------------------------------------------------------
-# Rigorous mode – internal state used by natif / natif_jaxpr
-# ---------------------------------------------------------------------------
-
-_rigorous: bool = True
 
 
 def natif(
@@ -123,9 +120,7 @@ def natif_jaxpr(
     rigorous: bool = True,
     propagate_source_info: bool = True,
 ) -> list[Any]:
-    global _rigorous
-    old_rigorous = _rigorous
-    _rigorous = rigorous
+    old_rigorous = _set_rigorous(rigorous)
 
     def read(v: Atom) -> Any:
         return v.val if isinstance(v, Literal) else env[v]
@@ -155,7 +150,7 @@ def natif_jaxpr(
                             f"{eqn.primitive} not in inclusion_registry"
                         )
                     # Rigorous widening
-                    if _rigorous and isinstance(ans, Interval):
+                    if _get_rigorous() and isinstance(ans, Interval):
                         n = getattr(handler, "n_ulps", 0)
                         if n > 0:
                             ans = widen(ans, n)
@@ -168,7 +163,7 @@ def natif_jaxpr(
             clean_up_dead_vars(eqn, env, lu)
         return safe_map(read, jaxpr.outvars)
     finally:
-        _rigorous = old_rigorous
+        _set_rigorous(old_rigorous)
 
 
 def _make_inclusion_passthrough_p(primitive: Primitive, n_ulps: int = 0) -> Callable[..., Interval]:
@@ -230,7 +225,7 @@ def _inclusion_reduce_sum_p(x: Interval, **kwargs) -> Interval:
     lo = lax.reduce_sum_p.bind(x.lower, **kwargs)
     hi = lax.reduce_sum_p.bind(x.upper, **kwargs)
     result = Interval(lo, hi)
-    if _rigorous:
+    if _get_rigorous():
         n = 1
         for ax in axes:
             n *= x.lower.shape[ax]
@@ -306,7 +301,7 @@ def _inclusion_pjit_p(*args, **bind_params) -> Interval:
     bind_jaxpr = bind_params.pop("jaxpr")
     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
         bind_jaxpr = bind_jaxpr.jaxpr
-    return natif_jaxpr(bind_jaxpr, [], *args, rigorous=_rigorous)
+    return natif_jaxpr(bind_jaxpr, [], *args, rigorous=_get_rigorous())
 
 
 inclusion_registry[jax._src.pjit.pjit_p] = _inclusion_pjit_p
@@ -528,13 +523,13 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
                 jnp.minimum(jnp.minimum(_1, _2), jnp.minimum(_3, _4)),
                 jnp.maximum(jnp.maximum(_1, _2), jnp.maximum(_3, _4)),
             )
-            if _rigorous:
+            if _get_rigorous():
                 result = widen(result, 1)
             return result
 
         def isum(x):
             result = Interval(jnp.sum(x.lower), jnp.sum(x.upper))
-            if _rigorous:
+            if _get_rigorous():
                 k = x.lower.size
                 if k > 1:
                     result = widen(result, k - 1)

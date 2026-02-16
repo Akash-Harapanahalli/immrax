@@ -2,6 +2,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from immrax.inclusion import (
@@ -10,6 +11,13 @@ from immrax.inclusion import (
     icentpert,
     natif,
     widen,
+    rigorous,
+    non_rigorous,
+)
+from immrax.inclusion.interval import (
+    _resolve_rigorous,
+    _widen_lower,
+    _widen_upper,
 )
 
 
@@ -366,3 +374,158 @@ class TestRigorousOverconservatism:
             y_true = jnp.sum(x_s)
             assert y_true >= result.lower - 1e-6
             assert y_true <= result.upper + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Constructor widening tests
+# ---------------------------------------------------------------------------
+
+def _is_widened(iv, lo, hi):
+    """True when iv is wider than [lo, hi] by exactly 1 ULP each side."""
+    expected_lo = np.asarray(_widen_lower(jnp.asarray(lo)))
+    expected_hi = np.asarray(_widen_upper(jnp.asarray(hi)))
+    return (
+        np.array_equal(np.asarray(iv.lower), expected_lo)
+        and np.array_equal(np.asarray(iv.upper), expected_hi)
+    )
+
+
+def _is_exact(iv, lo, hi):
+    """True when iv bounds are exactly lo, hi (no widening)."""
+    return (
+        np.array_equal(np.asarray(iv.lower), np.asarray(lo))
+        and np.array_equal(np.asarray(iv.upper), np.asarray(hi))
+    )
+
+
+class TestIntervalConstructorRigorous:
+    """interval() should widen by default."""
+
+    def test_default_widens(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        iv = interval(lo, hi)
+        assert _is_widened(iv, lo, hi)
+
+    def test_rigorous_false_no_widen(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        iv = interval(lo, hi, rigorous=False)
+        assert _is_exact(iv, lo, hi)
+
+    def test_degenerate_widens(self):
+        """interval(x) (point interval) should widen by 1 ULP."""
+        x = jnp.float32(3.14)
+        iv = interval(x)
+        assert _is_widened(iv, x, x)
+
+    def test_degenerate_rigorous_false_no_widen(self):
+        """interval(x, rigorous=False) should NOT widen."""
+        x = jnp.float32(3.14)
+        iv = interval(x, rigorous=False)
+        assert _is_exact(iv, x, x)
+
+    def test_passthrough_interval(self):
+        """interval(iv) returns iv unchanged."""
+        iv0 = Interval(jnp.float32(1.0), jnp.float32(2.0))
+        iv = interval(iv0)
+        assert iv is iv0
+
+    def test_vector(self):
+        lo = jnp.array([1.0, 2.0], dtype=jnp.float32)
+        hi = jnp.array([3.0, 4.0], dtype=jnp.float32)
+        iv = interval(lo, hi)
+        assert _is_widened(iv, lo, hi)
+
+
+class TestIcentpertConstructorRigorous:
+    """icentpert() should widen by default."""
+
+    def test_default_widens(self):
+        c = jnp.float32(1.0)
+        p = jnp.float32(0.5)
+        iv = icentpert(c, p)
+        assert _is_widened(iv, c - p, c + p)
+
+    def test_rigorous_false_no_widen(self):
+        c = jnp.float32(1.0)
+        p = jnp.float32(0.5)
+        iv = icentpert(c, p, rigorous=False)
+        assert _is_exact(iv, c - p, c + p)
+
+
+class TestContextManagers:
+    """rigorous / non_rigorous context managers."""
+
+    def test_kwarg_true_overrides_non_rigorous(self):
+        """Explicit rigorous=True wins over non_rigorous() context."""
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        with non_rigorous():
+            iv = interval(lo, hi, rigorous=True)
+        assert _is_widened(iv, lo, hi)
+
+    def test_kwarg_false_overrides_rigorous(self):
+        """Explicit rigorous=False wins over rigorous() context."""
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        with rigorous():
+            iv = interval(lo, hi, rigorous=False)
+        assert _is_exact(iv, lo, hi)
+
+    def test_nesting_inner_wins(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        with non_rigorous():
+            with rigorous():
+                iv = interval(lo, hi)
+        assert _is_widened(iv, lo, hi)
+
+    def test_nesting_restores_outer(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        with non_rigorous():
+            with rigorous():
+                pass
+            iv = interval(lo, hi)
+        assert _is_exact(iv, lo, hi)
+
+    def test_context_restores_after_exit(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        with non_rigorous():
+            pass
+        iv = interval(lo, hi)
+        assert _is_widened(iv, lo, hi)
+
+    def test_non_rigorous_icentpert(self):
+        c = jnp.float32(1.0)
+        p = jnp.float32(0.5)
+        with non_rigorous():
+            iv = icentpert(c, p)
+        assert _is_exact(iv, c - p, c + p)
+
+
+class TestResolveRigorous:
+    def test_default(self):
+        assert _resolve_rigorous() is True
+
+    def test_kwarg_overrides_default(self):
+        assert _resolve_rigorous(False) is False
+
+    def test_kwarg_overrides_context(self):
+        with non_rigorous():
+            assert _resolve_rigorous(True) is True
+        with rigorous():
+            assert _resolve_rigorous(False) is False
+
+
+class TestStructuralNoWiden:
+    """Structural operations (reshape, intersect, etc.) must NOT widen."""
+
+    def test_reshape_no_widen(self):
+        iv = Interval(jnp.array([1.0, 2.0]), jnp.array([3.0, 4.0]))
+        iv2 = iv.reshape(2, 1)
+        np.testing.assert_array_equal(np.asarray(iv2.lower), np.asarray(iv.lower.reshape(2, 1)))
+        np.testing.assert_array_equal(np.asarray(iv2.upper), np.asarray(iv.upper.reshape(2, 1)))
+
+    def test_intersect_no_widen(self):
+        from immrax.inclusion import interval_intersect
+        a = Interval(jnp.array([1.0]), jnp.array([3.0]))
+        b = Interval(jnp.array([2.0]), jnp.array([4.0]))
+        c = interval_intersect([a, b])
+        np.testing.assert_array_equal(np.asarray(c.lower), [2.0])
+        np.testing.assert_array_equal(np.asarray(c.upper), [3.0])

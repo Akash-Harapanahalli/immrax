@@ -14,6 +14,9 @@ from .interval import (
     interval_intersect,
     interval_union,
     widen,
+    rigorous,
+    non_rigorous,
+    set_rigorous,
 )
 
 from . import nif as nif
@@ -76,4 +79,7 @@ __all__ = [
     "hmjacM",
     "taylor_bounds",
     "widen",
+    "rigorous",
+    "non_rigorous",
+    "set_rigorous",
 ]
