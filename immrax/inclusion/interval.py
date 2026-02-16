@@ -425,3 +425,60 @@ def scale (i: Interval, factor: Union[float, ArrayLike]) -> Interval:
 def isinterval(x) -> bool:
     """Check if x is an Interval."""
     return isinstance(x, Interval)
+
+
+# ---------------------------------------------------------------------------
+# Rigorous widening primitives
+# ---------------------------------------------------------------------------
+
+@jax.custom_jvp
+def _widen_lower(x):
+    """Push *x* toward :math:`-\\infty` by one ULP."""
+    return jnp.nextafter(x, jnp.full_like(x, -jnp.inf))
+
+
+@_widen_lower.defjvp
+def _widen_lower_jvp(primals, tangents):
+    (x,) = primals
+    (t,) = tangents
+    return _widen_lower(x), t
+
+
+@jax.custom_jvp
+def _widen_upper(x):
+    """Push *x* toward :math:`+\\infty` by one ULP."""
+    return jnp.nextafter(x, jnp.full_like(x, jnp.inf))
+
+
+@_widen_upper.defjvp
+def _widen_upper_jvp(primals, tangents):
+    (x,) = primals
+    (t,) = tangents
+    return _widen_upper(x), t
+
+
+def widen(iv: Interval, n: int = 1) -> Interval:
+    """Widen an interval by *n* ULPs in each direction.
+
+    Pushes ``iv.lower`` toward :math:`-\\infty` and ``iv.upper`` toward
+    :math:`+\\infty` by *n* units in the last place.  The custom JVP
+    rules treat the widening as the identity so that automatic
+    differentiation passes through unchanged.
+
+    Parameters
+    ----------
+    iv : Interval
+        Interval to widen.
+    n : int
+        Number of ULPs to widen by (default 1).
+
+    Returns
+    -------
+    Interval
+        Widened interval.
+    """
+    lo, hi = iv.lower, iv.upper
+    for _ in range(n):
+        lo = _widen_lower(lo)
+        hi = _widen_upper(hi)
+    return Interval(lo, hi)

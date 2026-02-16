@@ -13,6 +13,7 @@ from .interval import (
     izeros,
     interval_intersect,
     interval_union,
+    widen,
 )
 
 from . import nif as nif
@@ -74,4 +75,5 @@ __all__ = [
     "mjacM",
     "hmjacM",
     "taylor_bounds",
+    "widen",
 ]
