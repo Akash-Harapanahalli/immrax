@@ -125,26 +125,42 @@ class Interval:
             jnp.minimum(self.lower, other.lower), jnp.maximum(self.upper, other.upper)
         )
 
+    def _format_bounds(self) -> str:
+        """Format interval bounds as ｢lo, hi｣ pairs. Falls back to None for JAX tracers."""
+        try:
+            lo = onp.asarray(self.lower)
+            hi = onp.asarray(self.upper)
+        except Exception:
+            return None
+        if lo.ndim == 0:
+            return f"｢{lo.item()}, {hi.item()}｣"
+        if lo.ndim == 1:
+            rows = [f"  ｢{l}, {h}｣" for l, h in zip(lo, hi)]
+            return "[\n" + "\n".join(rows) + "\n]"
+        # General n-d: format recursively by slicing along first axis
+        def _fmt(lo_arr, hi_arr, indent=0):
+            prefix = " " * indent
+            if lo_arr.ndim == 0:
+                return f"｢{lo_arr.item()}, {hi_arr.item()}｣"
+            if lo_arr.ndim == 1:
+                rows = [f"{prefix}  ｢{l}, {h}｣" for l, h in zip(lo_arr, hi_arr)]
+                return f"[\n" + "\n".join(rows) + f"\n{prefix}]"
+            inner = [_fmt(lo_arr[i], hi_arr[i], indent + 1) for i in range(lo_arr.shape[0])]
+            sep = f"\n{prefix} "
+            return f"[{sep.join(inner)}]"
+        return _fmt(lo, hi)
+
     def __str__(self) -> str:
-        # return (
-        #     onp.array(
-        #         [
-        #             [(l, u)]
-        #             for (l, u) in zip(self.lower.reshape(-1), self.upper.reshape(-1))
-        #         ],
-        #         dtype=onp.dtype([("f1", float), ("f2", float)]),
-        #     )
-        #     .reshape(self.shape + (1,))
-        #     .__str__()
-        # )
-        return self.lower.__str__() + " <= x <= " + self.upper.__str__()
+        s = self._format_bounds()
+        if s is None:
+            return f"Interval(lower={self.lower}, upper={self.upper})"
+        return s
 
     def __repr__(self) -> str:
-        # return onp.array([[(l,u)] for (l,u) in
-        #                 zip(self.lower.reshape(-1),self.upper.reshape(-1))],
-        #                 dtype=onp.dtype([('f1',float), ('f2', float)])).reshape(self.shape + (1,)).__str__()
-        # dtype=np.dtype([('f1',float), ('f2', float)])).reshape(self.shape + (1,)).__repr__()
-        return self.lower.__str__() + " <= x <= " + self.upper.__str__()
+        s = self._format_bounds()
+        if s is None:
+            return f"Interval(lower={self.lower}, upper={self.upper})"
+        return f"Interval({s})"
 
     def __getitem__(self, i: Union[slice, ArrayLike]) -> "Interval":
         return Interval(self.lower[i], self.upper[i])
