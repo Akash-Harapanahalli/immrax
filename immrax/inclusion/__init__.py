@@ -23,6 +23,9 @@ from . import nif as nif
 from .nif import natif
 from .custom_if import custom_if
 
+from . import linbp as linbp
+from .linbp import LinearBound, linbp as linbp_fn
+
 from .jacobian import (
     jacif,
     jacM,
@@ -82,4 +85,7 @@ __all__ = [
     "rigorous",
     "non_rigorous",
     "set_rigorous",
+    "linbp",
+    "LinearBound",
+    "linbp_fn",
 ]
