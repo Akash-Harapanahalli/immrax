@@ -22,8 +22,12 @@ from jax._src.lax import linalg as LA
 
 # TODO: import only necessary things
 from immrax.inclusion.interval import (
-    Interval, interval, isinterval, widen,
-    _get_rigorous, _set_rigorous,
+    Interval,
+    interval,
+    isinterval,
+    widen,
+    _get_rigorous,
+    _set_rigorous,
 )
 from functools import partial
 
@@ -98,14 +102,18 @@ def natif(
 
         # Representative values for tracing (lower bounds of intervals)
         getlower = lambda x: x.lower if isinterval(x) else jnp.asarray(x)
-        build_iv_args = jax.tree_util.tree_map(getlower, interval_args, is_leaf=isinterval)
+        build_iv_args = jax.tree_util.tree_map(
+            getlower, interval_args, is_leaf=isinterval
+        )
 
         # Build jaxpr from the closure — fixed args and kwargs become constants
         closed_jaxpr = eqx.filter_make_jaxpr(f_interval)(*build_iv_args)[0]
 
         # Evaluate the jaxpr with interval arguments
         out = natif_jaxpr(
-            closed_jaxpr.jaxpr, closed_jaxpr.literals, *interval_args,
+            closed_jaxpr.jaxpr,
+            closed_jaxpr.literals,
+            *interval_args,
             rigorous=rigorous,
         )
         if len(out) == 1:
@@ -116,7 +124,9 @@ def natif(
 
 
 def natif_jaxpr(
-    jaxpr: Jaxpr, consts, *args,
+    jaxpr: Jaxpr,
+    consts,
+    *args,
     rigorous: bool = True,
     propagate_source_info: bool = True,
 ) -> list[Any]:
@@ -137,7 +147,9 @@ def natif_jaxpr(
         lu = last_used(jaxpr)
         for eqn in jaxpr.eqns:
             subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
-            name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
+            name_stack = (
+                source_info_util.current_name_stack() + eqn.source_info.name_stack
+            )
             traceback = eqn.source_info.traceback if propagate_source_info else None
             with source_info_util.user_context(traceback, name_stack=name_stack):
                 invars = safe_map(read, eqn.invars)
@@ -166,7 +178,9 @@ def natif_jaxpr(
         _set_rigorous(old_rigorous)
 
 
-def _make_inclusion_passthrough_p(primitive: Primitive, n_ulps: int = 0) -> Callable[..., Interval]:
+def _make_inclusion_passthrough_p(
+    primitive: Primitive, n_ulps: int = 0
+) -> Callable[..., Interval]:
     """Creates an inclusion function that applies to the lower and upper bounds individually."""
 
     def _inclusion_p(*args, **kwargs) -> Interval:
@@ -193,7 +207,7 @@ def _add_passthrough_to_registry(primitive: Primitive, n_ulps: int = 0) -> None:
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
 _add_passthrough_to_registry(lax.slice_p)
-if hasattr(lax, 'split_p'):
+if hasattr(lax, "split_p"):
     _add_passthrough_to_registry(lax.split_p)
 _add_passthrough_to_registry(lax.dynamic_slice_p)
 _add_passthrough_to_registry(lax.squeeze_p)
@@ -221,7 +235,7 @@ _add_passthrough_to_registry(lax.exp_p, n_ulps=1)
 
 def _inclusion_reduce_sum_p(x: Interval, **kwargs) -> Interval:
     """Interval reduce_sum with rigorous widening scaled by reduction size."""
-    axes = kwargs['axes']
+    axes = kwargs["axes"]
     lo = lax.reduce_sum_p.bind(x.lower, **kwargs)
     hi = lax.reduce_sum_p.bind(x.upper, **kwargs)
     result = Interval(lo, hi)
@@ -260,12 +274,13 @@ def _inclusion_reduce_prod_p(x: Interval, *, axes) -> Interval:
         x = result
     return x
 
+
 _inclusion_reduce_prod_p.n_ulps = 2
 inclusion_registry[lax.reduce_prod_p] = _inclusion_reduce_prod_p
 _add_passthrough_to_registry(lax.pad_p)
 _add_passthrough_to_registry(lax.ne_p)
 _add_passthrough_to_registry(lax.lt_p)
-if hasattr(lax, 'lt_to_p'):
+if hasattr(lax, "lt_to_p"):
     _add_passthrough_to_registry(lax.lt_to_p)
 _add_passthrough_to_registry(debug_callback_p)
 
@@ -308,7 +323,7 @@ def _inclusion_pjit_p(*args, **bind_params) -> Interval:
 
 
 # jax >= 0.9 renamed pjit_p to jit_p
-_jit_primitive = getattr(jax._src.pjit, 'jit_p', getattr(jax._src.pjit, 'pjit_p', None))
+_jit_primitive = getattr(jax._src.pjit, "jit_p", getattr(jax._src.pjit, "pjit_p", None))
 if _jit_primitive is not None:
     inclusion_registry[_jit_primitive] = _inclusion_pjit_p
 
@@ -361,6 +376,7 @@ inclusion_registry[lax.add_p] = _inclusion_add_p
 inclusion_registry[ad_util.add_any_p] = _inclusion_add_p
 Interval.__add__ = _inclusion_add_p
 Interval.__radd__ = _inclusion_add_p
+
 
 def _inclusion_sub_p(x: Interval, y: Interval) -> Interval:
     if isinstance(x, Interval) and isinstance(y, Interval):
@@ -492,7 +508,7 @@ def _inclusion_square_p(x: Interval) -> Interval:
 
 
 _inclusion_square_p.n_ulps = 1
-if hasattr(lax, 'square_p'):
+if hasattr(lax, "square_p"):
     inclusion_registry[lax.square_p] = _inclusion_square_p
 
 
@@ -656,9 +672,7 @@ _add_passthrough_to_registry(lax.atan_p, n_ulps=1)
 
 
 def _inclusion_asin_p(x: Interval, accuracy=None) -> Interval:
-    return Interval(
-        lax.asin(x.lower), lax.asin(x.upper)
-    )
+    return Interval(lax.asin(x.lower), lax.asin(x.upper))
 
 
 _inclusion_asin_p.n_ulps = 1
@@ -679,26 +693,29 @@ def _inclusion_rsqrt_p(x: Interval, accuracy=None) -> Interval:
     # rsqrt = 1/sqrt(x) is monotonically decreasing
     # Map [a, b] -> [rsqrt(b), rsqrt(a)]
     # Handle domain x > 0.
-    ol = jnp.where((x.upper <= 0), -jnp.inf, lax.rsqrt(x.upper)) # if upper <= 0, invalid. if lower <= 0, rsqrt(lower) inv.
+    ol = jnp.where(
+        (x.upper <= 0), -jnp.inf, lax.rsqrt(x.upper)
+    )  # if upper <= 0, invalid. if lower <= 0, rsqrt(lower) inv.
     # Actually, interval semantics: if input contains invalid points, result is usually entire real line or restricted.
     # Existing sqrt uses -inf for invalid.
     # rsqrt(0) -> inf.
-    # if x.lower <= 0, rsqrt(x.lower) is usually nan/inf. 
+    # if x.lower <= 0, rsqrt(x.lower) is usually nan/inf.
     # Let's match JAX behavior but swap bounds.
-    
+
     # Simple swap:
     lower_r = lax.rsqrt(x.upper)
     upper_r = lax.rsqrt(x.lower)
-    
+
     # Handle negative inputs:
     # If upper < 0, result is invalid.
     ol = jnp.where(x.upper < 0, -jnp.inf, lower_r)
     ou = jnp.where(x.lower < 0, jnp.inf, upper_r)
-    
+
     return Interval(ol, ou)
 
+
 _inclusion_rsqrt_p.n_ulps = 1
-if hasattr(lax, 'rsqrt_p'):
+if hasattr(lax, "rsqrt_p"):
     inclusion_registry[lax.rsqrt_p] = _inclusion_rsqrt_p
 else:
     # Fallback if rsqrt_p is not directly exposed (it usually is)
@@ -736,10 +753,12 @@ def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
     )
     return Interval(resl.reshape(xsh), resu.reshape(xsh))
 
+
 _inclusion_pow_p.n_ulps = 2
 inclusion_registry[lax.pow_p] = _inclusion_pow_p
 
-def _inclusion_abs_p (x: Interval) -> Interval:
+
+def _inclusion_abs_p(x: Interval) -> Interval:
     ol = jnp.where(
         jnp.logical_and(x.lower <= 0, x.upper >= 0),
         0.0,
@@ -747,6 +766,7 @@ def _inclusion_abs_p (x: Interval) -> Interval:
     )
     ou = jnp.maximum(lax.abs(x.lower), lax.abs(x.upper))
     return Interval(ol, ou)
+
 
 _inclusion_abs_p.n_ulps = 0
 inclusion_registry[lax.abs_p] = _inclusion_abs_p
@@ -758,18 +778,22 @@ inclusion_registry[lax.abs_p] = _inclusion_abs_p
 _add_passthrough_to_registry(lax.tanh_p, n_ulps=1)
 _add_passthrough_to_registry(lax.logistic_p, n_ulps=1)
 
-def _inclusion_log_p(x: Interval, accuracy=None) -> Interval :
+
+def _inclusion_log_p(x: Interval, accuracy=None) -> Interval:
     ol = jnp.where((x.lower < 0), -jnp.inf, jnp.log(x.lower))
     ou = jnp.where((x.lower < 0), -jnp.inf, jnp.log(x.upper))
     return Interval(ol, ou)
 
+
 _inclusion_log_p.n_ulps = 1
 inclusion_registry[lax.log_p] = _inclusion_log_p
 
-def _inclusion_log1p_p(x: Interval, accuracy=None) -> Interval :
+
+def _inclusion_log1p_p(x: Interval, accuracy=None) -> Interval:
     ol = jnp.where((x.lower < -1), -jnp.inf, jnp.log1p(x.lower))
     ou = jnp.where((x.lower < -1), -jnp.inf, jnp.log1p(x.upper))
     return Interval(ol, ou)
+
 
 _inclusion_log1p_p.n_ulps = 1
 inclusion_registry[lax.log1p_p] = _inclusion_log1p_p
