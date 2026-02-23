@@ -283,6 +283,8 @@ _add_passthrough_to_registry(lax.lt_p)
 if hasattr(lax, "lt_to_p"):
     _add_passthrough_to_registry(lax.lt_to_p)
 _add_passthrough_to_registry(debug_callback_p)
+if hasattr(lax, "nextafter_p"):
+    _add_passthrough_to_registry(lax.nextafter_p)
 
 """
 TODO: Handle higher order primitives
@@ -326,6 +328,26 @@ def _inclusion_pjit_p(*args, **bind_params) -> Interval:
 _jit_primitive = getattr(jax._src.pjit, "jit_p", getattr(jax._src.pjit, "pjit_p", None))
 if _jit_primitive is not None:
     inclusion_registry[_jit_primitive] = _inclusion_pjit_p
+
+
+def _inclusion_custom_jvp_call_p(primal_fn, jvp_fn, *args, **bind_params) -> Any:
+    """Handle custom_jvp_call by natif-ing the primal, ignoring the JVP rule.
+
+    The JVP rule exists for AD transforms and is irrelevant for interval
+    arithmetic. primal_fn wraps jaxpr_as_fun(call_jaxpr); we extract the
+    ClosedJaxpr directly and recurse with natif_jaxpr, mirroring pjit_p.
+    """
+    call_jaxpr = primal_fn.f.args[0]
+    if isinstance(call_jaxpr, jax.extend.core.ClosedJaxpr):
+        return natif_jaxpr(call_jaxpr.jaxpr, call_jaxpr.consts, *args, rigorous=_get_rigorous())
+    return natif_jaxpr(call_jaxpr, [], *args, rigorous=_get_rigorous())
+
+
+_custom_jvp_call_primitive = getattr(
+    jax._src.custom_derivatives, "custom_jvp_call_p", None
+)
+if _custom_jvp_call_primitive is not None:
+    inclusion_registry[_custom_jvp_call_primitive] = _inclusion_custom_jvp_call_p
 
 
 def _inclusion_scan_p(*args, **bind_params) -> Interval:

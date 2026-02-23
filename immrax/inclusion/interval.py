@@ -200,36 +200,37 @@ class Interval:
         )
 
     def _format_bounds(self) -> str:
-        """Format interval bounds as ｢lo, hi｣ pairs. Falls back to None for JAX tracers."""
+        """Format interval bounds numpy-style, replacing each scalar with ⟦lo, hi⟧."""
         try:
             lo = onp.asarray(self.lower)
             hi = onp.asarray(self.upper)
         except Exception:
             return None
-        # lc, rc = "⌞", "⌝"
-        # lc, rc = "⸤", "⸣"
+
         lc, rc = "⟦", "⟧"
+        SEP = "\x00"  # null byte won't appear in numeric strings
+
         if lo.ndim == 0:
-            return f"{lc}{lo.item()}, {hi.item()}{rc}"
-        if lo.ndim == 1:
-            rows = [f"  {lc}{l}, {h}{rc}" for l, h in zip(lo, hi)]
-            return "[\n" + "\n".join(rows) + "\n]"
+            combined = onp.array([lo.item(), hi.item()])
+            s = onp.array2string(combined, max_line_width=10**9, separator=SEP)
+            lo_s, hi_s = (p.strip() for p in s.strip("[]").split(SEP))
+            return f"{lc}{lo_s}, {hi_s}{rc}"
 
-        # General n-d: format recursively by slicing along first axis
-        def _fmt(lo_arr, hi_arr, indent=0):
-            prefix = " " * indent
-            if lo_arr.ndim == 0:
-                return f"{lc}{lo_arr.item()}, {hi_arr.item()}{rc}"
-            if lo_arr.ndim == 1:
-                rows = [f"{prefix}  {lc}{l}, {h}{rc}" for l, h in zip(lo_arr, hi_arr)]
-                return "[\n" + "\n".join(rows) + f"\n{prefix}]"
-            inner = [
-                _fmt(lo_arr[i], hi_arr[i], indent + 1) for i in range(lo_arr.shape[0])
-            ]
-            sep = f"\n{prefix} "
-            return f"[{sep.join(inner)}]"
+        # Format all lo and hi values together so both bounds share the same
+        # numeric precision/notation that numpy would choose for this data.
+        all_flat = onp.concatenate([lo.ravel(), hi.ravel()])
+        all_s = onp.array2string(all_flat, max_line_width=10**9, separator=SEP)
+        all_strs = [p.strip() for p in all_s.strip("[]").split(SEP)]
 
-        return _fmt(lo, hi)
+        n = lo.size
+        interval_strs = [
+            f"{lc}{l}, {h}{rc}" for l, h in zip(all_strs[:n], all_strs[n:])
+        ]
+
+        # Delegate all layout (brackets, indentation, line-wrapping, alignment)
+        # to numpy via an object-dtype array.  JAX does not support object dtype.
+        obj = onp.array(interval_strs, dtype=object).reshape(lo.shape)
+        return onp.array2string(obj, formatter={"object": lambda s: s})
 
     def __str__(self) -> str:
         s = self._format_bounds()

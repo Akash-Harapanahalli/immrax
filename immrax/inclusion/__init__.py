@@ -51,6 +51,7 @@ from .tensor import (
     ltdiff,
     taylor_approx,
     mdit,
+    dit,
 )
 
 __all__ = [
@@ -92,6 +93,7 @@ __all__ = [
     "ltdiff",
     "taylor_approx",
     "mdit",
+    "dit",
     "widen",
     "rigorous",
     "non_rigorous",

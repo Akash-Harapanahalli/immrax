@@ -285,10 +285,12 @@ def ltdiff(f, p):
             alphas = list(get_multiindices(n, k))
 
             # Stack direction arrays for all order-k multi-indices: (num_alphas, k, n)
-            D_k = jnp.stack([
-                jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
-                for alpha in alphas
-            ])
+            D_k = jnp.stack(
+                [
+                    jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                    for alpha in alphas
+                ]
+            )
 
             # One vmap call — tower compiled once, batched over multi-indices
             tower_k = _jvp_tower(f, k)
@@ -367,10 +369,12 @@ def mdit(f, p):
         for k in range(1, p + 1):
             alphas = list(get_multiindices(n, k))
 
-            D_k = jnp.stack([
-                jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
-                for alpha in alphas
-            ])
+            D_k = jnp.stack(
+                [
+                    jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                    for alpha in alphas
+                ]
+            )
 
             tower_k = _jvp_tower(f, k)
             all_vals = jax.vmap(lambda D, t=tower_k: t(xc, D))(D_k)
@@ -402,15 +406,15 @@ def mdit(f, p):
         alphas_p1 = list(get_multiindices(n, p + 1))
 
         # Direction arrays for every order-(p+1) multi-index: (num_alphas, p+1, n)
-        D_p1 = jnp.stack([
-            jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
-            for alpha in alphas_p1
-        ])
+        D_p1 = jnp.stack(
+            [
+                jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                for alpha in alphas_p1
+            ]
+        )
 
         # Weight vectors α/(p+1) for each multi-index: (num_alphas, n)
-        alpha_arrs = jnp.stack([
-            jnp.asarray(alpha, dtype=float) for alpha in alphas_p1
-        ])
+        alpha_arrs = jnp.stack([jnp.asarray(alpha, dtype=float) for alpha in alphas_p1])
 
         tower_p1 = _jvp_tower(f, p + 1)
 
@@ -439,3 +443,83 @@ def mdit(f, p):
         return result
 
     return _mdit
+
+
+def dit(f, p):
+    """Function transform computing all partial derivative LTTs of f up to order p,
+    as well as the Derivative Interval Tensor bounding the remainder of the
+    Taylor expansion.
+
+    Uses vmap over multi-index direction arrays: one Jaxpr is compiled per
+    derivative order rather than a separate JVP chain per multi-index.
+
+    Parameters
+    ----------
+    f : Callable
+        Function to differentiate, mapping R^n -> R^m.
+    p : int
+        Maximum derivative order.
+
+    Returns
+    -------
+    Callable
+        A function (ix, xc) -> list of p+2 SparseLowerTriangularTensors.
+        Indices 0..p hold all k-th order partial derivatives of f at xc;
+        index p+1 is the interval-valued DIT bounding the Taylor remainder.
+    """
+
+    def _dit(ix, xc, permutation=None):
+        n = xc.shape[0]
+        e = jnp.eye(n)
+        f0 = f(xc)
+        m = f0.shape
+
+        if permutation is None:
+            permutation = standard_permutation(n)[0]
+
+        ## LTTs of orders 0 through p
+
+        t0 = SparseLowerTriangularTensor(0, m)
+        t0[MultiIndex(*([0] * n))] = f0
+        result = [t0]
+
+        for k in range(1, p + 1):
+            alphas = list(get_multiindices(n, k))
+
+            D_k = jnp.stack(
+                [
+                    jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                    for alpha in alphas
+                ]
+            )
+
+            tower_k = _jvp_tower(f, k)
+            all_vals = jax.vmap(lambda D, t=tower_k: t(xc, D))(D_k)
+
+            t_k = SparseLowerTriangularTensor(k, m)
+            for i, alpha in enumerate(alphas):
+                t_k[alpha] = all_vals[i]
+            result.append(t_k)
+
+        ## DIT of order p+1
+
+        alphas = list(get_multiindices(n, p + 1))
+
+        D_k = jnp.stack(
+            [jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)]) for alpha in alphas]
+        )
+
+        # Freeze D and evaluate the (p+1)-th derivative at the full interval ix
+        tower_k = natif(_jvp_tower(f, p + 1))
+
+        all_vals = jax.vmap(lambda D, t=tower_k: t(ix, D))(D_k)
+
+        J = SparseLowerTriangularTensor(p + 1, m)
+
+        for i, alpha in enumerate(alphas):
+            J[alpha] = all_vals[i]
+
+        result.append(J)
+        return result
+
+    return _dit
