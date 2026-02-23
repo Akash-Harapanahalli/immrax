@@ -42,8 +42,15 @@ from .jacobian import (
     get_corners,
     mjacif,
     mjacM,
-    hmjacM,
-    taylor_bounds,
+)
+
+from .tensor import (
+    MultiIndex,
+    SparseLowerTriangularTensor,
+    get_multiindices,
+    ltdiff,
+    taylor_approx,
+    mdit,
 )
 
 __all__ = [
@@ -79,8 +86,12 @@ __all__ = [
     "get_corners",
     "mjacif",
     "mjacM",
-    "hmjacM",
-    "taylor_bounds",
+    "MultiIndex",
+    "SparseLowerTriangularTensor",
+    "get_multiindices",
+    "ltdiff",
+    "taylor_approx",
+    "mdit",
     "widen",
     "rigorous",
     "non_rigorous",

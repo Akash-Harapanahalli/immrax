@@ -11,7 +11,7 @@ import numpy as onp
 # Rigorous-mode global state and helpers
 # ---------------------------------------------------------------------------
 
-_rigorous: bool = True              # global default
+_rigorous: bool = False  # global default
 _rigorous_forced: Optional[bool] = None  # set by context managers
 
 
@@ -167,18 +167,22 @@ class Interval:
         return Interval(self.lower.transpose(*args), self.upper.transpose(*args))
 
     def broadcast_to(self, shape) -> "Interval":
-        return Interval(jnp.broadcast_to(self.lower, shape), jnp.broadcast_to(self.upper, shape))
+        return Interval(
+            jnp.broadcast_to(self.lower, shape), jnp.broadcast_to(self.upper, shape)
+        )
 
     def squeeze(self, axis=None) -> "Interval":
-        return Interval(jnp.squeeze(self.lower, axis=axis), jnp.squeeze(self.upper, axis=axis))
+        return Interval(
+            jnp.squeeze(self.lower, axis=axis), jnp.squeeze(self.upper, axis=axis)
+        )
 
     def sum(self, axis=None, keepdims=False) -> "Interval":
         return Interval(
             jnp.sum(self.lower, axis=axis, keepdims=keepdims),
-            jnp.sum(self.upper, axis=axis, keepdims=keepdims)
+            jnp.sum(self.upper, axis=axis, keepdims=keepdims),
         )
 
-    def scale (self, factor: Union[float, ArrayLike]) -> "Interval":
+    def scale(self, factor: Union[float, ArrayLike]) -> "Interval":
         return icentpert(self.center, self.pert * factor)
 
     @property
@@ -202,22 +206,29 @@ class Interval:
             hi = onp.asarray(self.upper)
         except Exception:
             return None
+        # lc, rc = "⌞", "⌝"
+        # lc, rc = "⸤", "⸣"
+        lc, rc = "⟦", "⟧"
         if lo.ndim == 0:
-            return f"｢{lo.item()}, {hi.item()}｣"
+            return f"{lc}{lo.item()}, {hi.item()}{rc}"
         if lo.ndim == 1:
-            rows = [f"  ｢{l}, {h}｣" for l, h in zip(lo, hi)]
+            rows = [f"  {lc}{l}, {h}{rc}" for l, h in zip(lo, hi)]
             return "[\n" + "\n".join(rows) + "\n]"
+
         # General n-d: format recursively by slicing along first axis
         def _fmt(lo_arr, hi_arr, indent=0):
             prefix = " " * indent
             if lo_arr.ndim == 0:
-                return f"｢{lo_arr.item()}, {hi_arr.item()}｣"
+                return f"{lc}{lo_arr.item()}, {hi_arr.item()}{rc}"
             if lo_arr.ndim == 1:
-                rows = [f"{prefix}  ｢{l}, {h}｣" for l, h in zip(lo_arr, hi_arr)]
-                return f"[\n" + "\n".join(rows) + f"\n{prefix}]"
-            inner = [_fmt(lo_arr[i], hi_arr[i], indent + 1) for i in range(lo_arr.shape[0])]
+                rows = [f"{prefix}  {lc}{l}, {h}{rc}" for l, h in zip(lo_arr, hi_arr)]
+                return "[\n" + "\n".join(rows) + f"\n{prefix}]"
+            inner = [
+                _fmt(lo_arr[i], hi_arr[i], indent + 1) for i in range(lo_arr.shape[0])
+            ]
             sep = f"\n{prefix} "
             return f"[{sep.join(inner)}]"
+
         return _fmt(lo, hi)
 
     def __str__(self) -> str:
@@ -246,7 +257,9 @@ class Interval:
 # HELPER FUNCTIONS
 
 
-def interval(lower: ArrayLike, upper: Optional[ArrayLike] = None, rigorous: Optional[bool] = None) -> Interval:
+def interval(
+    lower: ArrayLike, upper: Optional[ArrayLike] = None, rigorous: Optional[bool] = None
+) -> Interval:
     """interval: Helper to create a Interval from a lower and upper bound.
 
     Parameters
@@ -307,7 +320,9 @@ def icopy(i: Interval) -> Interval:
     return Interval(jnp.copy(i.lower), jnp.copy(i.upper))
 
 
-def icentpert(cent: ArrayLike, pert: ArrayLike, rigorous: Optional[bool] = None) -> Interval:
+def icentpert(
+    cent: ArrayLike, pert: ArrayLike, rigorous: Optional[bool] = None
+) -> Interval:
     """icentpert: Helper to create a Interval from a center of an interval and a perturbation.
 
     Parameters
@@ -506,7 +521,8 @@ def iconcatenate(intervals: Iterable[Interval], axis: int = 0) -> Interval:
         jnp.concatenate([i.upper for i in intervals], axis=axis),
     )
 
-def scale (i: Interval, factor: Union[float, ArrayLike]) -> Interval:
+
+def scale(i: Interval, factor: Union[float, ArrayLike]) -> Interval:
     """Scale an interval by a given factor around its center.
 
     Parameters
@@ -514,7 +530,7 @@ def scale (i: Interval, factor: Union[float, ArrayLike]) -> Interval:
     i : Interval
         The interval to scale.
     factor : float | ArrayLike
-        Scaling factor. 
+        Scaling factor.
 
     Returns
     -------
@@ -532,6 +548,7 @@ def isinterval(x) -> bool:
 # ---------------------------------------------------------------------------
 # Rigorous widening primitives
 # ---------------------------------------------------------------------------
+
 
 @jax.custom_jvp
 def _widen_lower(x):
@@ -588,8 +605,8 @@ def widen(iv: Interval, n: int = 1) -> Interval:
             hi = _widen_upper(hi)
     else:
         # O(1) widening: compute 1-ULP step, scale by n, add 1 ULP margin
-        lo_step = _widen_lower(lo) - lo   # negative
-        hi_step = _widen_upper(hi) - hi   # positive
+        lo_step = _widen_lower(lo) - lo  # negative
+        hi_step = _widen_upper(hi) - hi  # positive
         lo = _widen_lower(lo + n * lo_step)
         hi = _widen_upper(hi + n * hi_step)
     return Interval(lo, hi)
