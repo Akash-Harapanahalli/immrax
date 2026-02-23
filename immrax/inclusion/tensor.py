@@ -207,21 +207,54 @@ class SparseLowerTriangularTensor:
         return cls(p, m, dict(zip(keys, children)))
 
 
-def _last_nz_idx(alpha):
-    """Index of the last (largest) nonzero component of a MultiIndex."""
-    for i in reversed(range(len(alpha))):
-        if alpha[i] > 0:
-            return i
-    raise ValueError(f"zero multi-index {alpha} has no nonzero index")
+def alpha_to_dir_indices(alpha):
+    """Map a MultiIndex to a JVP direction-index sequence, innermost first.
+
+    Repeatedly peels off the highest active dimension (last-nonzero-index
+    rule) until the multi-index is exhausted, then reverses so that the
+    first element is the innermost (first-applied) JVP direction.
+
+    Returns a list of length |alpha| with values in [0, n).
+    """
+    dirs = []
+    a = list(alpha)
+    while any(x > 0 for x in a):
+        j = max(i for i in range(len(a)) if a[i] > 0)
+        dirs.append(j)
+        a[j] -= 1
+    dirs.reverse()  # innermost first
+    return dirs
+
+
+def _jvp_tower(f, k):
+    """Build the k-th order directional derivative function.
+
+    Returns _tower(x, D) which computes the k-th order directional derivative
+    of f at x in directions D[0], D[1], ..., D[k-1].  D has shape (k, n).
+
+    The for-loop is unrolled at Python/trace time because k is static.
+    D's rows are JAX-traced values, so passing this to jax.vmap over a
+    batch of direction arrays compiles one Jaxpr regardless of batch size,
+    rather than one Jaxpr fragment per multi-index.
+    """
+
+    def _tower(x, D):
+        g = f
+        for i in range(k):
+            d = D[i]
+            g_prev = g
+            g = lambda y, g=g_prev, d=d: jax.jvp(g, (y,), (d,))[1]
+        return g(x)
+
+    return _tower
 
 
 def ltdiff(f, p):
     """Function transform computing all partial derivative LTTs of f up to order p.
 
-    Uses a bottom-up approach: a dict of functions {MultiIndex -> callable} is
-    maintained at each level. For each α of order k, exactly one jax.jvp call is
-    made to its parent function g_β in direction eⱼ (j = last nonzero index of α),
-    giving T_k[α] = ∂g_β/∂xⱼ. No full dense Jacobian is ever formed.
+    Uses vmap over multi-index direction arrays: one Jaxpr is compiled per
+    derivative order k (shared across all multi-indices at that order) rather
+    than a separate JVP chain per multi-index.
 
     Parameters
     ----------
@@ -243,31 +276,28 @@ def ltdiff(f, p):
         f0 = f(x)
         m = f0.shape
 
-        # Order 0: the function value, stored under the zero multi-index
+        # Order 0: function value
         t0 = SparseLowerTriangularTensor(0, m)
         t0[MultiIndex(*([0] * n))] = f0
         result = [t0]
 
-        # prev_fns: MultiIndex of order k-1 -> callable R^n -> R^m
-        prev_fns = {MultiIndex(*([0] * n)): f}
-
         for k in range(1, p + 1):
-            curr_fns = {}
+            alphas = list(get_multiindices(n, k))
+
+            # Stack direction arrays for all order-k multi-indices: (num_alphas, k, n)
+            D_k = jnp.stack([
+                jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                for alpha in alphas
+            ])
+
+            # One vmap call — tower compiled once, batched over multi-indices
+            tower_k = _jvp_tower(f, k)
+            all_vals = jax.vmap(lambda D, t=tower_k: t(x, D))(D_k)
+
             t_k = SparseLowerTriangularTensor(k, m)
-
-            for alpha in get_multiindices(n, k):
-                j = _last_nz_idx(alpha)
-                beta = MultiIndex(*(alpha[i] - (1 if i == j else 0) for i in range(n)))
-
-                # One JVP call in direction eⱼ only — no dense Jacobian formed
-                def g_alpha(y, g=prev_fns[beta], ej=e[j]):
-                    return jax.jvp(g, (y,), (ej,))[1]
-
-                curr_fns[alpha] = g_alpha
-                t_k[alpha] = g_alpha(x)
-
+            for i, alpha in enumerate(alphas):
+                t_k[alpha] = all_vals[i]
             result.append(t_k)
-            prev_fns = curr_fns
 
         return result
 
@@ -301,13 +331,8 @@ def mdit(f, p):
     as well as the Mixed Derivative Interval Tensor bounding the remainder of the
     Taylor expansion.
 
-    Uses a bottom-up approach: a dict of functions {MultiIndex -> callable} is
-    maintained at each level. For each α of order k, exactly one jax.jvp call is
-    made to its parent function g_β in direction eⱼ (j = last nonzero index of α),
-    giving T_k[α] = ∂g_β/∂xⱼ. No full dense Jacobian is ever formed.
-
-    Finally, the MDIT is computed through mixed interval/fixed point evaluations of
-    (p+1)-th order derivatives.
+    Uses vmap over multi-index direction arrays: one Jaxpr is compiled per
+    derivative order rather than a separate JVP chain per multi-index.
 
     Parameters
     ----------
@@ -319,8 +344,9 @@ def mdit(f, p):
     Returns
     -------
     Callable
-        A function x -> list of p+1 SparseLowerTriangularTensors, where index k
-        holds all k-th order partial derivatives of f at x.
+        A function (ix, xc) -> list of p+2 SparseLowerTriangularTensors.
+        Indices 0..p hold all k-th order partial derivatives of f at xc;
+        index p+1 is the interval-valued MDIT bounding the Taylor remainder.
     """
 
     def _mdit(ix, xc, permutation=None):
@@ -332,35 +358,29 @@ def mdit(f, p):
         if permutation is None:
             permutation = standard_permutation(n)[0]
 
-        ## First compute the LTTs to order p
+        ## LTTs of orders 0 through p
 
-        # Order 0: the function value, stored under the zero multi-index
         t0 = SparseLowerTriangularTensor(0, m)
         t0[MultiIndex(*([0] * n))] = f0
         result = [t0]
 
-        # prev_fns: MultiIndex of order k-1 -> callable R^n -> R^m
-        prev_fns = {MultiIndex(*([0] * n)): f}
-
         for k in range(1, p + 1):
-            curr_fns = {}
+            alphas = list(get_multiindices(n, k))
+
+            D_k = jnp.stack([
+                jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+                for alpha in alphas
+            ])
+
+            tower_k = _jvp_tower(f, k)
+            all_vals = jax.vmap(lambda D, t=tower_k: t(xc, D))(D_k)
+
             t_k = SparseLowerTriangularTensor(k, m)
-
-            for alpha in get_multiindices(n, k):
-                j = _last_nz_idx(alpha)
-                beta = MultiIndex(*(alpha[i] - (1 if i == j else 0) for i in range(n)))
-
-                # One JVP call in direction eⱼ only — no dense Jacobian formed
-                def g_alpha(y, g=prev_fns[beta], ej=e[j]):
-                    return jax.jvp(g, (y,), (ej,))[1]
-
-                curr_fns[alpha] = g_alpha
-                t_k[alpha] = g_alpha(xc)
-
+            for i, alpha in enumerate(alphas):
+                t_k[alpha] = all_vals[i]
             result.append(t_k)
-            prev_fns = curr_fns
 
-        ## Now compute the MDIT.
+        ## MDIT of order p+1
 
         _z = ix.lower
         z_ = ix.upper
@@ -379,22 +399,43 @@ def mdit(f, p):
             ),
         )
 
+        alphas_p1 = list(get_multiindices(n, p + 1))
+
+        # Direction arrays for every order-(p+1) multi-index: (num_alphas, p+1, n)
+        D_p1 = jnp.stack([
+            jnp.stack([e[j] for j in alpha_to_dir_indices(alpha)])
+            for alpha in alphas_p1
+        ])
+
+        # Weight vectors α/(p+1) for each multi-index: (num_alphas, n)
+        alpha_arrs = jnp.stack([
+            jnp.asarray(alpha, dtype=float) for alpha in alphas_p1
+        ])
+
+        tower_p1 = _jvp_tower(f, p + 1)
+
+        def compute_M_alpha(D, alpha_arr):
+            # Evaluate the (p+1)-th derivative at each permutation row of Z,
+            # then compute the weighted sum Σᵢ αᵢ/(p+1) · g(Zᵢ).
+            # einsum contracts along the permutation axis only, preserving any
+            # output dimensions of f (fixes broadcast bug for non-scalar outputs).
+            def eval_at_z(z):
+                return natif(lambda y: tower_p1(y, D))(z)
+
+            partials = jax.vmap(eval_at_z)(Z)
+            weights = alpha_arr / (p + 1)
+            return interval(
+                natif(lambda w, p: jnp.einsum("i,i...->...", w, p))(weights, partials)
+            )
+
+        # One vmap call over all order-(p+1) multi-indices
+        all_M_vals = jax.vmap(compute_M_alpha)(D_p1, alpha_arrs)
+
         M = SparseLowerTriangularTensor(p + 1, m)
-
-        for alpha in get_multiindices(n, p + 1):
-            j = _last_nz_idx(alpha)
-            beta = MultiIndex(*(alpha[i] - (1 if i == j else 0) for i in range(n)))
-
-            def g_alpha(y, g=prev_fns[beta], ej=e[j]):
-                return jax.jvp(g, (y,), (ej,))[1]
-
-            # Vmap g_alpha over Z, then weighted sum by alpha(i)/(p+1).
-            partials = jax.vmap(natif(g_alpha))(Z)
-            res = natif(jnp.sum)((jnp.asarray(alpha) / (p + 1)) * partials)
-            M[alpha] = res
+        for i, alpha in enumerate(alphas_p1):
+            M[alpha] = Interval(all_M_vals.lower[i], all_M_vals.upper[i])
 
         result.append(M)
-
         return result
 
     return _mdit

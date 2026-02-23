@@ -41,7 +41,7 @@ def f_cubic(x):
 
 
 def f_sin_cos_2d(x):
-    return jnp.array([jnp.sin(x[0]) * jnp.cos(x[1])])
+    return jnp.sin(x[0]) * jnp.cos(x[1])
 
 
 def f_quadratic_2d(x):
@@ -172,7 +172,7 @@ def _check_remainder_enclosure(f, result, p, xc, ix, n_samples=200, atol=1e-5):
         x = samples[i]
         dx = x - xc
         poly = irx.taylor_approx(poly_tensors, xc, x)
-        rem = M.contract(dx, scale=True)
+        rem = M.contract(dx, True)
         rem = irx.interval(rem)
         fint = poly + rem
         fx = f(x)
