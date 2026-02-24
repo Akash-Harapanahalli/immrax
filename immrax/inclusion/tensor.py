@@ -226,27 +226,18 @@ def alpha_to_dir_indices(alpha):
     return dirs
 
 
-def _jvp_tower(f, k):
-    """Build the k-th order directional derivative function.
+def _jvp_tower(f_km1):
+    """Build the k-th order directional derivative function given f^{(k-1)}.
 
     Returns _tower(x, D) which computes the k-th order directional derivative
     of f at x in directions D[0], D[1], ..., D[k-1].  D has shape (k, n).
-
-    The for-loop is unrolled at Python/trace time because k is static.
-    D's rows are JAX-traced values, so passing this to jax.vmap over a
-    batch of direction arrays compiles one Jaxpr regardless of batch size,
-    rather than one Jaxpr fragment per multi-index.
     """
 
-    def _tower(x, D):
-        g = f
-        for i in range(k):
-            d = D[i]
-            g_prev = g
-            g = lambda y, g=g_prev, d=d: jax.jvp(g, (y,), (d,))[1]
-        return g(x)
+    @jax.jit
+    def _f_k(x, D):
+        return jax.jvp(lambda y: f_km1(y, D[:-1]), (x,), (D[-1],))[1]
 
-    return _tower
+    return _f_k
 
 
 def ltdiff(f, p):
@@ -365,9 +356,17 @@ def mdit(f, p):
         t0 = SparseLowerTriangularTensor(0, m)
         t0[MultiIndex(*([0] * n))] = f0
         result = [t0]
+        fks = [lambda x, _: f(x)]  # f^{(0)} = f
 
         for k in range(1, p + 1):
             alphas = list(get_multiindices(n, k))
+
+            @jax.jit
+            def f_k(x, D):
+                return jax.jvp(lambda y: fks[-1](y, D[:-1]), (x,), (D[-1],))[1]
+
+            # fks.append(f_k)  # f^{(k)} = _jvp_tower(f^{(k-1)})
+            fks.append(_jvp_tower(fks[-1]))
 
             D_k = jnp.stack(
                 [
@@ -376,8 +375,7 @@ def mdit(f, p):
                 ]
             )
 
-            tower_k = _jvp_tower(f, k)
-            all_vals = jax.vmap(lambda D, t=tower_k: t(xc, D))(D_k)
+            all_vals = jax.vmap(lambda D, t=fks[-1]: t(xc, D))(D_k)
 
             t_k = SparseLowerTriangularTensor(k, m)
             for i, alpha in enumerate(alphas):
@@ -416,7 +414,7 @@ def mdit(f, p):
         # Weight vectors α/(p+1) for each multi-index: (num_alphas, n)
         alpha_arrs = jnp.stack([jnp.asarray(alpha, dtype=float) for alpha in alphas_p1])
 
-        tower_p1 = _jvp_tower(f, p + 1)
+        fks.append(_jvp_tower(fks[-1]))  # f^{(p+1)} = _jvp_tower(f^{(p)})
 
         def compute_M_alpha(D, alpha_arr):
             # Evaluate the (p+1)-th derivative at each permutation row of Z,
@@ -424,7 +422,7 @@ def mdit(f, p):
             # einsum contracts along the permutation axis only, preserving any
             # output dimensions of f (fixes broadcast bug for non-scalar outputs).
             def eval_at_z(z):
-                return natif(lambda y: tower_p1(y, D))(z)
+                return natif(lambda y: fks[-1](y, D))(z)
 
             partials = jax.vmap(eval_at_z)(Z)
             weights = alpha_arr / (p + 1)
