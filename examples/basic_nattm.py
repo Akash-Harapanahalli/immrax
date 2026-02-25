@@ -18,8 +18,8 @@ print(tm0(0.))
 def f (x) :
     return jnp.sin(x) - x
 
-jit_or1 = jax.jit(irx.nattm(f, max_order=1))
-jit_or2 = jax.jit(irx.nattm(f, max_order=4))
+jit_or1 = jax.jit(irx.pjetm(f, max_order=1))
+jit_or2 = jax.jit(irx.pjetm(f, max_order=4))
 
 res_or1, times_or1 = irx.utils.run_times(100, jit_or1, tm0)
 res_or2, times_or2 = irx.utils.run_times(100, jit_or2, tm0)

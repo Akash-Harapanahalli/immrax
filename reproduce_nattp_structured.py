@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from immrax.taylor.taylor_polynomial import taylor_polynomial_identity, TaylorPolynomial
-from immrax.taylor.nattp import nattp
+from immrax.taylor.pjet import pjet
 from immrax.inclusion import interval
 
 
@@ -15,18 +15,19 @@ def reproduction():
     int_y = interval(2.0, 3.0)
     domain = (int_x, int_y)
 
-    # Create an identity TP for this structured domain
-    tp = taylor_polynomial_identity(domain, order=2)
+    # Create an identity TP centered at the domain midpoints
+    center = jax.tree_util.tree_map(lambda iv: iv.center, domain)
+    tp = taylor_polynomial_identity(center, order=2)
 
-    # Use nattp (auto-detects structured mode from _output_pytree)
+    # Use pjet (auto-detects structured mode from _output_pytree)
     # The function f expects (x, y), but we pass the single structured TP
-    # nattp should unpack it based on the output pytree structure
+    # pjet should unpack it based on the output pytree structure
 
     # We need to wrap f to match the unpacked signature if we were calling it normally?
-    # No, nattp traces f using the flattened args.
+    # No, pjet traces f using the flattened args.
     # When we call the wrapped function, we pass the single TP.
-    # But wait, nattp traces f(*args).
-    # If structured_center is True, nattp expects the Input to be a single TP.
+    # But wait, pjet traces f(*args).
+    # If structured_center is True, pjet expects the Input to be a single TP.
     # But internally it traces f with UNPACKED args.
     # So f should expect the unpacked args.
     # The domain {'x': ..., 'y': ...} flattens to [x, y] in alphabetic order usually or standard pytree order.
@@ -40,7 +41,7 @@ def reproduction():
     def f_flat(x, y):
         return x * y
 
-    f_tp = nattp(f_flat)
+    f_tp = pjet(f_flat)
 
     # Call with the single structured TP
     res = f_tp(tp)

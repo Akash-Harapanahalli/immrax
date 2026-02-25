@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import immrax as irx
 from immrax.taylor import (
-    BasicTMFlowpipeGenerator, nattm, nattp,
+    BasicTMFlowpipeGenerator, pjetm, pjet,
     TaylorModel, taylor_model_identity, tm_integrate_variable,
 )
 from immrax.taylor.algorithms.base import tx_tm_eval, tps_to_tx
@@ -56,7 +56,7 @@ for step_idx in range(3):
     # Manually apply the Picard operator
     tm_ic = tx_tm_eval(tube, tube.domain[0].lower, t_order)
     tm_id = taylor_model_identity(tube.domain, order=tube._per_leaf_order)
-    f_tm_tx = nattm(sys.f)(tm_id[0:1], tube)
+    f_tm_tx = pjetm(sys.f)(tm_id[0:1], tube)
     tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
     con_sh = tm_ic.coeffs.shape

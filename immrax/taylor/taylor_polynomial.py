@@ -11,25 +11,24 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
-from jaxtyping import Array, ArrayLike
+from jaxtyping import Array, ArrayLike, PyTree
 
 from immrax.inclusion import Interval, interval, icentpert
 import jax.tree_util
 
-from immrax.taylor.taylor_model import (
-    TaylorModel,
+from immrax.taylor.base import (
     PyTreeShape,
-    _get_canonical_exponents,
     _get_leaf_total_degree_exponents,
     _check_per_leaf_bounds,
-    _leaf_slice,
     _merge_taylor_terms,
     _pytree_to_flattened_array,
-    _unflatten_array_to_pytree,
-    _compute_per_leaf_order_from_exponents,
     _normalize_order_pytree,
     _is_interval_or_array_leaf,
 )
+
+# TaylorModel imported here for to_taylor_model; the property TaylorModel.polynomial
+# lazily imports TaylorPolynomial to avoid a circular eager import.
+from immrax.taylor.taylor_model import TaylorModel
 
 
 @register_pytree_node_class
@@ -59,13 +58,9 @@ class TaylorPolynomial:
         exponents: ArrayLike,
         flat_center: ArrayLike,
         *,
-        _input_pytree: "PyTreeShape | None" = None,
+        _input_pytree: "PyTreeShape",
         _output_pytree: "PyTreeShape | None" = None,
-        _per_leaf_order: "tuple[int, ...] | None" = None,
-        # Legacy kwargs for backward compatibility
-        _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
-        _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
-        _static_order: "int | tuple[int, ...] | None" = None,  # Deprecated, ignored
+        _per_leaf_order: "tuple[int, ...]",
     ) -> None:
         import math
 
@@ -74,25 +69,13 @@ class TaylorPolynomial:
         self.flat_center = jnp.asarray(flat_center)
 
         self._output_shape = self.coeffs.shape[:-1]
+        self._input_pytree = _input_pytree
+        self._per_leaf_order = _per_leaf_order
 
-        # Handle _input_pytree: either from new kwarg or legacy kwargs
-        if _input_pytree is not None:
-            self._input_pytree = _input_pytree
-        elif _domain_treedef is not None and _leaf_shapes is not None:
-            self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
-        else:
-            raise ValueError("Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided")
-
-        # Handle _output_pytree
         if _output_pytree is not None:
             self._output_pytree = _output_pytree
         else:
             self._output_pytree = PyTreeShape.flat(self._output_shape)
-
-        self._per_leaf_order = _per_leaf_order
-
-        if self._per_leaf_order is None:
-            raise ValueError("_per_leaf_order cannot be None")
 
         # Validate _output_pytree.flat_size matches output shape
         expected_flat = math.prod(self._output_shape) if self._output_shape else 1
@@ -118,11 +101,6 @@ class TaylorPolynomial:
                 f"flat_center must match exponents dimension: "
                 f"{self.flat_center.shape[0]} vs {self.exponents.shape[0]}"
             )
-
-    @property
-    def domain_center(self) -> Array:
-        """Alias for flat_center for backward compatibility."""
-        return self.flat_center
 
     @property
     def _domain_treedef(self):
@@ -164,15 +142,18 @@ class TaylorPolynomial:
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorPolynomial":
-        input_pytree = aux_data.get("_input_pytree") if aux_data else None
-        output_pytree = aux_data.get("_output_pytree") if aux_data else None
-        per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
-        return cls(
-            *children,
-            _input_pytree=input_pytree,
-            _output_pytree=output_pytree,
-            _per_leaf_order=per_leaf_order,
-        )
+        # Bypass __init__ to avoid jnp.asarray — JAX/equinox may pass
+        # non-array sentinels (e.g. booleans) through tree operations.
+        coeffs, exponents, flat_center = children
+        obj = object.__new__(cls)
+        obj.coeffs = coeffs
+        obj.exponents = exponents
+        obj.flat_center = flat_center
+        obj._output_shape = coeffs.shape[:-1]
+        obj._input_pytree = aux_data.get("_input_pytree") if aux_data else None
+        obj._output_pytree = aux_data.get("_output_pytree") if aux_data else None
+        obj._per_leaf_order = aux_data.get("_per_leaf_order") if aux_data else None
+        return obj
 
     # --- Properties ---
 
@@ -222,14 +203,9 @@ class TaylorPolynomial:
         return self._input_pytree.leaf_shapes
 
     @property
-    def per_leaf_order(self) -> "tuple[int, ...] | None":
-        """Per-leaf total degree bounds, or None for per-variable mode."""
+    def per_leaf_order(self) -> "tuple[int, ...]":
+        """Per-leaf total degree bounds."""
         return self._per_leaf_order
-
-    @property
-    def is_structured(self) -> bool:
-        """Always True now."""
-        return True
 
     @property
     def constant_term(self) -> Array:
@@ -453,7 +429,7 @@ class TaylorPolynomial:
             raise TypeError("Scalar TaylorPolynomial has no len()")
         return self._output_shape[0]
 
-    # --- Arithmetic stubs (implemented in nattp.py) ---
+    # --- Arithmetic stubs (implemented in pjet.py) ---
 
     def __add__(self, other): ...
     def __radd__(self, other): ...
@@ -483,49 +459,22 @@ class TaylorPolynomial:
 
 def _taylor_polynomial_constant_impl(
     val: ArrayLike,
-    d: int,
-    order: "int | tuple[int, ...]" = 1,
-    center=None,
-    _domain_treedef: "jax.tree_util.PyTreeDef | None" = None,
-    _leaf_shapes: "tuple[tuple[int, ...], ...] | None" = None,
-    _per_leaf_order: "tuple[int, ...] | None" = None,
-    flat_center=None,
-    _input_pytree: "PyTreeShape | None" = None,
+    flat_center: ArrayLike,
+    _input_pytree: "PyTreeShape",
+    _per_leaf_order: "tuple[int, ...]",
     _output_pytree: "PyTreeShape | None" = None,
 ) -> TaylorPolynomial:
     """Internal implementation for taylor_polynomial_constant."""
     val = jnp.asarray(val)
     output_shape = val.shape
-
-    # Resolve _input_pytree
-    if _input_pytree is None:
-        if _leaf_shapes is None:
-            _leaf_shapes = ((d,),)
-        if _domain_treedef is None:
-            _domain_treedef = jax.tree_util.tree_structure(jnp.zeros(d))
-        _input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
-    else:
-        _leaf_shapes = _input_pytree.leaf_shapes
-
-    num_leaves = len(_leaf_shapes)
-
-    # Set default per_leaf_order if not provided
-    if _per_leaf_order is None:
-        if isinstance(order, int):
-            _per_leaf_order = tuple([order] * num_leaves)
-        else:
-            _per_leaf_order = tuple(order)
+    _leaf_shapes = _input_pytree.leaf_shapes
 
     # Generate exponents with per-leaf total degree bounds
     exponents = _get_leaf_total_degree_exponents(_leaf_shapes, _per_leaf_order)
 
-    # Coeffs: constant term is val
+    # Coeffs: constant term is val, all others zero
     coeffs = jnp.zeros((*output_shape, exponents.shape[1]), dtype=val.dtype)
     coeffs = coeffs.at[..., 0].set(val)
-
-    # If flat_center not provided, assume zero
-    if flat_center is None:
-        flat_center = jnp.zeros(d, dtype=val.dtype)
 
     if _output_pytree is None:
         _output_pytree = PyTreeShape.flat(output_shape)
@@ -566,7 +515,6 @@ def taylor_polynomial_constant(
     """
     # Process domain and metadata
     treedef, leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
-    d = flat_domain.shape[0]
 
     # Infer per_leaf_order
     num_leaves = len(leaf_shapes)
@@ -582,86 +530,63 @@ def taylor_polynomial_constant(
 
     return _taylor_polynomial_constant_impl(
         val,
-        d,
-        order,
-        center=None,
-        _input_pytree=PyTreeShape(treedef, leaf_shapes),
-        _per_leaf_order=per_leaf_order,
-        flat_center=flat_center,
+        flat_center,
+        PyTreeShape(treedef, leaf_shapes),
+        per_leaf_order,
     )
 
 
 def taylor_polynomial_identity(
-    domain: "Interval | PyTree[Interval]",
-    center: "ArrayLike | PyTree[ArrayLike]" = None,
+    center: "ArrayLike | PyTree[ArrayLike]",
     order: "int | PyTree[int]" = 1,
 ) -> TaylorPolynomial:
-    """Create a Taylor polynomial representing the identity function over a domain.
+    """Create a Taylor polynomial representing the identity function.
 
-    Supports domain as a single Interval or any pytree structure of Intervals
-    (list, dict, nested structures). When domain is a pytree, order can also
-    be specified as a matching pytree to give per-leaf total degree bounds.
+    The polynomial is ``p(x) = x``, expanded around ``center``.
+    The pytree structure of ``center`` determines the domain layout
+    (leaf shapes and per-leaf degree bounds).
 
     Parameters
     ----------
-    domain : Interval or PyTree[Interval]
-        The domain.
-    center : ArrayLike or PyTree[ArrayLike], optional
-        Expansion point. Default is domain center.
+    center : ArrayLike or PyTree[ArrayLike]
+        Expansion point. Pytree structure determines the domain layout.
     order : int or PyTree[int], optional
-        Polynomial degree bounds.
+        Polynomial degree bounds. If a pytree, must match the structure
+        of ``center`` for per-leaf degree bounds.
 
     Returns
     -------
     TaylorPolynomial
-        Identity polynomial.
+        Identity polynomial satisfying ``p(center) == center``.
     """
-    # domain is a structure of Intervals
-    treedef, leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
+    treedef, leaf_shapes, flat_center = _pytree_to_flattened_array(center)
     per_leaf_order = _normalize_order_pytree(order, treedef, leaf_shapes)
-
-    if center is None:
-        center_flat = flat_domain.center
-    else:
-        # Make sure center is a pytree matching domain structure
-        center_treedef, center_leaf_shapes, center_flat = _pytree_to_flattened_array(
-            center
-        )
-        if center_treedef != treedef or center_leaf_shapes != leaf_shapes:
-            raise ValueError("Center must have the same structure as domain")
-
-    total_dim = center_flat.shape[0]
+    total_dim = flat_center.shape[0]
 
     # Generate exponents with per-leaf total degree bounds
     exponents = _get_leaf_total_degree_exponents(leaf_shapes, per_leaf_order)
-    num_monomials = exponents.shape[1]
 
-    # Build identity coefficients:
-    # - Constant term: center_flat[i] for each output i
-    # - Linear term: 1.0 for variable i in output i
-
-    # Identify constant monomial (all zeros)
+    # Identify constant monomial (all exponents zero)
     is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
 
-    # Identify linear monomials (unit vectors)
-    eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (total_dim, total_dim)
+    # Identify linear monomials (unit vectors e_i)
+    eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (d, d)
     is_linear = jnp.all(
         exponents[:, None, :] == eye_n[:, :, None], axis=0
-    )  # (total_dim, m)
+    )  # (d, m)
 
-    # Build coefficients: coeffs[i, j] = center[i] if constant, 1.0 if linear for var i
-    coeffs = jnp.where(is_constant[None, :], center_flat[:, None], 0.0) + jnp.where(
+    # coeffs[i, j] = center[i] for constant monomial, 1.0 for e_i monomial, else 0
+    coeffs = jnp.where(is_constant[None, :], flat_center[:, None], 0.0) + jnp.where(
         is_linear, 1.0, 0.0
-    )  # (total_dim, m)
+    )  # (d, m)
 
     input_pytree = PyTreeShape(treedef, leaf_shapes)
-    # For identity, output matches domain structure
     output_pytree = PyTreeShape(treedef, leaf_shapes)
 
     return TaylorPolynomial(
         coeffs,
         exponents,
-        center_flat,
+        flat_center,
         _input_pytree=input_pytree,
         _output_pytree=output_pytree,
         _per_leaf_order=per_leaf_order,

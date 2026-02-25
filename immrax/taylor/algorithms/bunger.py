@@ -19,17 +19,14 @@ from immrax.system import System
 from immrax.utils import inv_fact, prolongation, check_containment
 from .. import (
     TaylorModel,
-    nattm,
-    nattp,
+    pjetm,
+    pjet,
     tm_integrate_variable,
     taylor_model_concatenate,
     taylor_model_identity,
 )
-from ..taylor_model import (
-    PyTreeShape,
-    _bound_monomials_over_domain,
-    _get_leaf_total_degree_exponents,
-)
+from ..taylor_model import _bound_monomials_over_domain
+from ..base import PyTreeShape, _get_leaf_total_degree_exponents
 from .base import TMFlowpipeGenerator, tx_tm_eval, tps_to_tx
 
 from typing import Tuple
@@ -74,9 +71,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
         if u is not None:
-            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx, u)
+            f_tm_tx = pjetm(self.sys.f)(tm_id[0:1], tm_tx, u)
         else:
-            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx)
+            f_tm_tx = pjetm(self.sys.f)(tm_id[0:1], tm_tx)
         tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
         con_sh = tm_ic.coeffs.shape
@@ -254,9 +251,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         # Step 1: Taylor expansion of the flow map
         if u is not None:
-            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x, u))(tmi.polynomial)
+            poly_coeffs = pjet(lambda x: self._prolonged_f(t, x, u))(tmi.polynomial)
         else:
-            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
+            poly_coeffs = pjet(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
         poly = tps_to_tx(
             poly_coeffs,
             interval(jnp.zeros_like(tmi.remainder.lower)),

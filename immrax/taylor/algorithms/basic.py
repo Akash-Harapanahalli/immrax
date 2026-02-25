@@ -6,8 +6,8 @@ from immrax.system import System
 from immrax.utils import inv_fact, prolongation, check_containment
 from .. import (
     TaylorModel,
-    nattm,
-    nattp,
+    pjetm,
+    pjet,
     tm_integrate_variable,
     taylor_model_concatenate,
     taylor_model_identity,
@@ -60,12 +60,12 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         # Initial condition
         tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower, self.t_order)
 
-        # nattm now handles multi-arg: pass t identity and tm_tx as separate args
+        # pjetm now handles multi-arg: pass t identity and tm_tx as separate args
         tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
         if u is not None:
-            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx, u)
+            f_tm_tx = pjetm(self.sys.f)(tm_id[0:1], tm_tx, u)
         else:
-            f_tm_tx = nattm(self.sys.f)(tm_id[0:1], tm_tx)
+            f_tm_tx = pjetm(self.sys.f)(tm_id[0:1], tm_tx)
         tm_int = tm_integrate_variable(f_tm_tx, var_idx=0, keep_order=True)
 
         con_sh = tm_ic.coeffs.shape
@@ -92,9 +92,9 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
         # Step 1: Compute the Taylor expansion of the flow map to t_order, x_order
 
         if u is not None:
-            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x, u))(tmi.polynomial)
+            poly_coeffs = pjet(lambda x: self._prolonged_f(t, x, u))(tmi.polynomial)
         else:
-            poly_coeffs = nattp(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
+            poly_coeffs = pjet(lambda x: self._prolonged_f(t, x))(tmi.polynomial)
         poly = tps_to_tx(
             poly_coeffs,
             # tmi.remainder,

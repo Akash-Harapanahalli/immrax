@@ -1,13 +1,12 @@
 """Taylor model module for immrax.
 
 This module provides Taylor model and Taylor polynomial representations,
-and the natural function transformations (nattm, nattp) for propagating
+and the natural function transformations (pjetm, pjet) for propagating
 them through functions, similar to natif for intervals.
 """
 
 from .taylor_model import (
     TaylorModel,
-    PyTreeShape,
     taylor_model,
     taylor_model_identity,
     taylor_model_constant,
@@ -15,6 +14,10 @@ from .taylor_model import (
     taylor_model_concatenate,
     tm_integrate_variable,
     integrate_variable,
+)
+
+from .base import (
+    PyTreeShape,
     _generate_exponents,
     _get_canonical_exponents,
     _get_leaf_total_degree_exponents,
@@ -25,18 +28,23 @@ from .taylor_model import (
     _normalize_order_pytree,
 )
 
-from .taylor_polynomial import TaylorPolynomial, taylor_polynomial_concatenate
+from .taylor_polynomial import (
+    TaylorPolynomial,
+    taylor_polynomial_concatenate,
+    taylor_polynomial_constant,
+    taylor_polynomial_identity,
+)
 
-from .nattm import (
-    nattm,
-    nattm_jaxpr,
+from .pjetm import (
+    pjetm,
+    pjetm_jaxpr,
     tm_inclusion_registry,
     istaylormodel,
 )
 
-from .nattp import (
-    nattp,
-    nattp_jaxpr,
+from .pjet import (
+    pjet,
+    pjet_jaxpr,
     tp_inclusion_registry,
     istaylorpolynomial,
 )
@@ -58,17 +66,19 @@ __all__ = [
     "taylor_model_from_function",
     "taylor_model_concatenate",
     "integrate_variable",
-    # Taylor Polynomial class
+    # Taylor Polynomial class and constructors
     "TaylorPolynomial",
     "taylor_polynomial_concatenate",
+    "taylor_polynomial_constant",
+    "taylor_polynomial_identity",
     # Natural Taylor Model function
-    "nattm",
-    "nattm_jaxpr",
+    "pjetm",
+    "pjetm_jaxpr",
     "tm_inclusion_registry",
     "istaylormodel",
     # Natural Taylor Polynomial function
-    "nattp",
-    "nattp_jaxpr",
+    "pjet",
+    "pjet_jaxpr",
     "tp_inclusion_registry",
     "istaylorpolynomial",
 ]

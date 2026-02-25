@@ -44,7 +44,7 @@ print(tm0.coeffs)
 # irx.taylor._get_leaf_total_degree_exponents(((),(2,)), (4,2))
 
 # %%
-pr_coeffs = irx.nattp(lambda x : prolonged_f(t0, x))(tmx.polynomial)
+pr_coeffs = irx.pjet(lambda x : prolonged_f(t0, x))(tmx.polynomial)
 print(pr_coeffs)
 print(pr_coeffs[0].exponents)
 print(pr_coeffs[0].coeffs)

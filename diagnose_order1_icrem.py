@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import immrax as irx
 from immrax.taylor import (
-    BasicTMFlowpipeGenerator, nattm, nattp,
+    BasicTMFlowpipeGenerator, pjetm, pjet,
     TaylorModel, taylor_model_identity, tm_integrate_variable,
 )
 from immrax.taylor.algorithms.base import tx_tm_eval, tps_to_tx

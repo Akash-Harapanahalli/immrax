@@ -1,4 +1,4 @@
-"""Compare nattm (Taylor Model) vs natif (Interval) for function bounding.
+"""Compare pjetm (Taylor Model) vs natif (Interval) for function bounding.
 
 This script demonstrates the tighter bounds achievable with Taylor models
 compared to pure interval arithmetic for various nonlinear functions,
@@ -12,7 +12,7 @@ import numpy as np
 import immrax as irx
 from immrax.inclusion import interval, icentpert, natif
 from immrax.taylor.taylor_model import taylor_model_identity
-from immrax.taylor.nattm import nattm
+from immrax.taylor.pjetm import pjetm
 from immrax.utils import run_times
 
 
@@ -52,13 +52,13 @@ def to_scalar(x):
 
 
 def compare_scalar(name, f, iv, tm_order=4, num_runs=100):
-    """Compare natif vs nattm for scalar output functions."""
+    """Compare natif vs pjetm for scalar output functions."""
     # Create inputs
     tm = taylor_model_identity(iv, order=tm_order)
 
     # Compile and warm up
     natif_f = jax.jit(natif(f))
-    nattm_f = jax.jit(lambda tm: nattm(f, max_order=tm_order)(tm).interval_hull())
+    nattm_f = jax.jit(lambda tm: pjetm(f, max_order=tm_order)(tm).interval_hull())
 
     # Warm-up runs
     iv_result = natif_f(iv)
@@ -94,12 +94,12 @@ def compare_scalar(name, f, iv, tm_order=4, num_runs=100):
 
 
 def compare_vector(name, f, iv, tm_order=4, num_runs=100):
-    """Compare natif vs nattm for vector output functions."""
+    """Compare natif vs pjetm for vector output functions."""
     tm = taylor_model_identity(iv, order=tm_order)
 
     # Compile and warm up
     natif_f = jax.jit(natif(f))
-    nattm_f = jax.jit(lambda tm: nattm(f, max_order=tm_order)(tm).interval_hull())
+    nattm_f = jax.jit(lambda tm: pjetm(f, max_order=tm_order)(tm).interval_hull())
 
     iv_result = natif_f(iv)
     tm_result = nattm_f(tm)
@@ -137,14 +137,14 @@ def compare_vector(name, f, iv, tm_order=4, num_runs=100):
 def print_table(results, is_vector=False):
     """Print results in a formatted table."""
     if is_vector:
-        print(f"{'Function':<25} {'In->Out':<10} {'Avg Improv':<12} {'natif (ms)':<12} {'nattm (ms)':<12}")
+        print(f"{'Function':<25} {'In->Out':<10} {'Avg Improv':<12} {'natif (ms)':<12} {'pjetm (ms)':<12}")
         print("-" * 75)
         for r in results:
             dims = f"{r['input_dim']}->{r['output_dim']}"
             print(f"{r['name']:<25} {dims:<10} {r['avg_improvement']:<12.2f}x "
                   f"{r['natif_time_ms']:<12.3f} {r['nattm_time_ms']:<12.3f}")
     else:
-        print(f"{'Function':<25} {'True Width':<12} {'natif Width':<12} {'nattm Width':<12} {'Improv':<10} {'natif (ms)':<10} {'nattm (ms)':<10}")
+        print(f"{'Function':<25} {'True Width':<12} {'natif Width':<12} {'pjetm Width':<12} {'Improv':<10} {'natif (ms)':<10} {'pjetm (ms)':<10}")
         print("-" * 100)
         for r in results:
             print(f"{r['name']:<25} {r['true_width']:<12.6f} {r['natif_width']:<12.6f} "
@@ -154,7 +154,7 @@ def print_table(results, is_vector=False):
 
 def main():
     print("=" * 100)
-    print("Comparison: nattm (Taylor Model) vs natif (Interval) for Function Bounding")
+    print("Comparison: pjetm (Taylor Model) vs natif (Interval) for Function Bounding")
     print("=" * 100)
 
     num_runs = 100
@@ -381,7 +381,7 @@ def main():
             nattm_w = float(r['nattm_widths'][i])
             true_w = float(r['true_widths'][i])
             improv = natif_w / nattm_w if nattm_w > 1e-10 else float('inf')
-            print(f"  dim {i}: true={true_w:.4f}, natif={natif_w:.4f}, nattm={nattm_w:.4f}, improv={improv:.2f}x")
+            print(f"  dim {i}: true={true_w:.4f}, natif={natif_w:.4f}, pjetm={nattm_w:.4f}, improv={improv:.2f}x")
 
     # =========================================================================
     # Summary Statistics
@@ -412,18 +412,18 @@ def main():
 
     print(f"\nTiming (all tests):")
     print(f"  Average natif time: {np.mean(natif_times):.3f} ms")
-    print(f"  Average nattm time: {np.mean(nattm_times):.3f} ms")
-    print(f"  nattm/natif ratio:  {np.mean(nattm_times)/np.mean(natif_times):.2f}x slower")
+    print(f"  Average pjetm time: {np.mean(nattm_times):.3f} ms")
+    print(f"  pjetm/natif ratio:  {np.mean(nattm_times)/np.mean(natif_times):.2f}x slower")
 
     print("\n" + "=" * 100)
     print("NOTES")
     print("=" * 100)
     print("""
-- 'Improvement' = natif_width / nattm_width (higher is better for nattm)
+- 'Improvement' = natif_width / nattm_width (higher is better for pjetm)
 - Taylor models provide tighter bounds by tracking polynomial dependencies
 - The 'x - x' case shows the dependency problem: intervals give non-zero width,
   Taylor models correctly give zero (since x - x = 0 algebraically)
-- nattm is slower than natif due to polynomial coefficient propagation
+- pjetm is slower than natif due to polynomial coefficient propagation
 - For dynamical systems, tighter bounds compound over time, making the
   computational overhead worthwhile for reachability analysis
 """)

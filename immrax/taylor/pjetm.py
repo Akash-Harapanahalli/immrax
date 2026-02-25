@@ -1,7 +1,7 @@
 """
 This file implements the Natural Taylor Model Function as an interpreter of Jaxprs.
 
-Similar to natif for intervals, nattm transforms functions to operate on Taylor models,
+Similar to natif for intervals, pjetm transforms functions to operate on Taylor models,
 propagating polynomial approximations with rigorous remainder bounds.
 """
 
@@ -31,18 +31,17 @@ from immrax.inclusion.interval import Interval, interval, icentpert
 from immrax.utils import fact, inv_fact
 from immrax.taylor.taylor_model import (
     TaylorModel,
-    PyTreeShape,
-    taylor_model,
     _taylor_model_constant_impl,
     taylor_model_concatenate,
-    _generate_exponents,
-    _get_canonical_exponents,
+    _bound_monomials_over_domain,
+)
+from immrax.taylor.base import (
+    PyTreeShape,
     _get_leaf_total_degree_exponents,
     _check_per_leaf_bounds,
     _leaf_slice,
     _merge_taylor_terms,
     _max_order,
-    _bound_monomials_over_domain,
 )
 
 
@@ -83,7 +82,7 @@ def istaylormodel(x) -> bool:
     return isinstance(x, TaylorModel)
 
 
-def nattm(
+def pjetm(
     f: Callable[..., jax.Array],
     *,
     max_order: "int | tuple[int, ...] | None" = None,
@@ -167,7 +166,7 @@ def nattm(
         rep_args = tuple(jnp.zeros(shape) for shape in output_pytree.leaf_shapes)
         closed_jaxpr = eqx.filter_make_jaxpr(f_tm)(*rep_args)[0]
 
-        out = nattm_jaxpr(
+        out = pjetm_jaxpr(
             closed_jaxpr.jaxpr,
             closed_jaxpr.literals,
             tm_concat,
@@ -182,7 +181,7 @@ def nattm(
     return wrapped
 
 
-def nattm_jaxpr(
+def pjetm_jaxpr(
     jaxpr: Jaxpr,
     consts,
     *args,
@@ -708,10 +707,13 @@ def _tm_pjit_p(*args, max_order=None, **bind_params) -> TaylorModel:
         if max_order is None:
             max_order = (2,)
 
-    return nattm_jaxpr(bind_jaxpr, [], *args, max_order=max_order)
+    return pjetm_jaxpr(bind_jaxpr, [], *args, max_order=max_order)
 
 
-tm_inclusion_registry[jax._src.pjit.pjit_p] = _tm_pjit_p
+# jax >= 0.9 renamed pjit_p to jit_p
+_jit_primitive = getattr(jax._src.pjit, "jit_p", getattr(jax._src.pjit, "pjit_p", None))
+if _jit_primitive is not None:
+    tm_inclusion_registry[_jit_primitive] = _tm_pjit_p
 
 
 # --- Arithmetic operations ---
@@ -1510,8 +1512,8 @@ def _tm_dot_general_p(
 
 tm_inclusion_registry[lax.dot_general_p] = _tm_dot_general_p
 
-TaylorModel.__matmul__ = nattm(jnp.matmul)
-TaylorModel.__rmatmul__ = lambda self, other: nattm(jnp.matmul)(other, self)
+TaylorModel.__matmul__ = pjetm(jnp.matmul)
+TaylorModel.__rmatmul__ = lambda self, other: pjetm(jnp.matmul)(other, self)
 
 
 # --- Comparison operations (return intervals/arrays, not TMs) ---

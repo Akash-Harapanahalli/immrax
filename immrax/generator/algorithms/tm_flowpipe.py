@@ -26,7 +26,7 @@ from ...taylor.taylor_model import (
     taylor_model_identity,
     taylor_model_concatenate,
 )
-from ...taylor.nattm import nattm
+from ...taylor.pjetm import pjetm
 from .base import BaseSetGenerator, GenericReachSets
 
 
@@ -91,7 +91,7 @@ def tm_flowpipe_step(
 
     The algorithm:
     1. Compute time Taylor coefficients x^(k)(x₀) for k=0,...,order_time
-       using nattm to propagate TMs through the prolongation
+       using pjetm to propagate TMs through the prolongation
     2. Evaluate the time Taylor polynomial: Σₖ x^(k) * h^k / k!
     3. Bound the Lagrange remainder using interval arithmetic
 
@@ -122,12 +122,12 @@ def tm_flowpipe_step(
     # Each x^(k) is a TM in the initial state
     prolonged = tm_prolongation(f, order_time)
 
-    # Apply nattm to get Taylor coefficients as Taylor models
+    # Apply pjetm to get Taylor coefficients as Taylor models
     def get_tm_coeffs(x0):
         return prolonged(t, x0)
 
     # x_coeffs is a list of TMs: [x^(0), x^(1), ..., x^(order_time)]
-    x_coeffs = nattm(get_tm_coeffs, max_order=order_state)(tm0)
+    x_coeffs = pjetm(get_tm_coeffs, max_order=order_state)(tm0)
 
     # Step 2: Evaluate time Taylor polynomial using Horner's method
     # x(t+h) ≈ Σₖ x^(k) * h^k / k! = x^(0) + h*(x^(1)/1! + h*(x^(2)/2! + ...))

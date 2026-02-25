@@ -11,7 +11,7 @@ from immrax.inclusion import Interval, interval
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
 from .. import TaylorModel, TaylorPolynomial, taylor_model, _pytree_to_flattened_array
-from ..taylor_model import PyTreeShape
+from ..base import PyTreeShape
 
 from typing import Tuple
 
