@@ -981,7 +981,12 @@ def _tp_univariate(
         primals = (val,)
         series = ((1.0,) + (0.0,) * (order - 1),)
         f_val, f_series = jet(prim_func, primals, series)
-        return jnp.array([f_val] + list(f_series))
+        # jet returns raw derivatives [f'(c), f''(c), ...]; divide by k! to get
+        # Taylor coefficients a_k = f^(k)(c) / k! stored in coeffs convention.
+        from immrax.utils import inv_fact
+        raw = jnp.array([f_val] + list(f_series))
+        scales = jnp.concatenate([jnp.ones(1), inv_fact(jnp.arange(1, order + 1))])
+        return raw * scales
 
     coeffs_raw = jax.vmap(get_coeffs)(c_flat)  # (n_flat, order+1)
 

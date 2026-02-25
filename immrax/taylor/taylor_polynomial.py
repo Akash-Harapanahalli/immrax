@@ -207,7 +207,15 @@ class TaylorPolynomial:
         # Evaluate each monomial: monomial_i = prod_j dx[j]^exponents[j, i]
         monomials = jnp.prod(dx[:, None] ** self.exponents, axis=0)  # (m,)
 
+        # Coefficients are Taylor coefficients a_alpha: p(x) = sum_alpha a_alpha (x-c)^alpha
         return jnp.sum(self.coeffs * monomials, axis=-1)
+
+    def evaluate_monomials(self, x: ArrayLike) -> Array:
+        x = jnp.asarray(x)
+        dx = x - self.flat_center
+        # Evaluate each monomial: monomial_i = prod_j dx[j]^exponents[j, i]
+        monomials = jnp.prod(dx[:, None] ** self.exponents, axis=0)  # (m,)
+        return monomials
 
     def evaluate_structured(self, *args):
         treedef, leaf_shapes, flat_x = pack_pytree(args)
@@ -217,6 +225,33 @@ class TaylorPolynomial:
                 f"got {treedef} and {leaf_shapes} instead of {self._domain_treedef} and {self._leaf_shapes}."
             )
         return self.evaluate(flat_x)
+
+    def __call__(self, *args):
+        """Alias for evaluate_structured"""
+        return self.evaluate_structured(*args)
+
+    def get_order(self, order: "int | tuple[int, ...]") -> "TaylorPolynomial":
+        """Get the specified order term of the Taylor expansion as a new (non-canonical) TaylorPolynomial."""
+        leaf_order = normalize_leaf_order(
+            order, self._domain_treedef, self._leaf_shapes
+        )
+        prev_leaf_order = tuple(o - 1 for o in leaf_order)
+        keep_mask = jnp.logical_and(
+            check_leaf_bounds(self.exponents, self._leaf_shapes, leaf_order),
+            ~check_leaf_bounds(self.exponents, self._leaf_shapes, prev_leaf_order),
+        )
+        return TaylorPolynomial(
+            self.coeffs[..., keep_mask],
+            self.exponents[:, keep_mask],
+            self.flat_center,
+            input_pytree=self.input_pytree,
+            output_pytree=self.output_pytree,
+            leaf_order=leaf_order,
+        )
+
+    def evaluate_order(self, order: "int | tuple[int, ...]", x: ArrayLike) -> Array:
+        """Evaluate the p-th term of the Taylor expansion at the point x."""
+        return self.get_order(order).evaluate(x)
 
     # --- Bounding ---
 
@@ -416,9 +451,13 @@ class TaylorPolynomial:
     # --- String representation ---
 
     def __str__(self) -> str:
+        in_shapes = self.input_pytree.leaf_shapes if self.input_pytree is not None else None
+        out_shapes = self.output_pytree.leaf_shapes if self.output_pytree is not None else (self._output_shape,)
+        in_str = in_shapes[0] if in_shapes is not None and len(in_shapes) == 1 else in_shapes
+        out_str = out_shapes[0] if out_shapes is not None and len(out_shapes) == 1 else out_shapes
         return (
-            f"TaylorPolynomial(shape={self.shape}, d={self.d}, order={self.order}, "
-            f"monomials={self.num_monomials})"
+            f"TaylorPolynomial(input_shape={in_str}, output_shape={out_str}, "
+            f"order={self.order}, monomials={self.num_monomials})"
         )
 
     def __repr__(self) -> str:
