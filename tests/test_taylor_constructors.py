@@ -42,16 +42,16 @@ def test_taylor_model_factory_defaults():
 
     assert tm._domain_treedef is not None
     assert tm._leaf_shapes is not None
-    assert tm._per_leaf_order is not None
+    assert tm.leaf_order is not None
     assert tm._leaf_shapes == ((1,),)
-    assert tm._per_leaf_order == (0,)  # exp is 0
+    assert tm.leaf_order == (0,)  # exp is 0
 
     # taylor_model_constant factory (infers metadata)
     tm_const = taylor_model_constant(interval(jnp.array([2.0])), domain, order=2)
 
     assert tm_const._domain_treedef is not None
     assert tm_const._leaf_shapes is not None
-    assert tm_const._per_leaf_order == (2,)
+    assert tm_const.leaf_order == (2,)
 
 
 def test_taylor_model_no_domain():

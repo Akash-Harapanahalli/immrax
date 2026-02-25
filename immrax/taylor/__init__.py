@@ -16,16 +16,18 @@ from .taylor_model import (
     integrate_variable,
 )
 
+identijetm = taylor_model_identity
+
 from .base import (
     PyTreeShape,
-    _generate_exponents,
-    _get_canonical_exponents,
-    _get_leaf_total_degree_exponents,
-    _check_per_leaf_bounds,
-    _leaf_slice,
-    _pytree_to_flattened_array,
-    _unflatten_array_to_pytree,
-    _normalize_order_pytree,
+    leaf_total_degree_exponents,
+    check_leaf_bounds,
+    leaf_slice,
+    pack_pytree,
+    unpack_pytree,
+    normalize_leaf_order,
+    max_leaf_order,
+    compute_leaf_order,
 )
 
 from .taylor_polynomial import (
@@ -34,6 +36,8 @@ from .taylor_polynomial import (
     taylor_polynomial_constant,
     taylor_polynomial_identity,
 )
+
+identijet = taylor_polynomial_identity
 
 from .pjetm import (
     pjetm,
@@ -62,6 +66,7 @@ __all__ = [
     "PyTreeShape",
     "taylor_model",
     "taylor_model_identity",
+    "identijetm",
     "taylor_model_constant",
     "taylor_model_from_function",
     "taylor_model_concatenate",
@@ -71,6 +76,7 @@ __all__ = [
     "taylor_polynomial_concatenate",
     "taylor_polynomial_constant",
     "taylor_polynomial_identity",
+    "identijet",
     # Natural Taylor Model function
     "pjetm",
     "pjetm_jaxpr",

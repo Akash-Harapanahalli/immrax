@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from immrax.inclusion import Interval, interval
 from immrax.system import System
 from immrax.utils import inv_fact, prolongation
-from .. import TaylorModel, TaylorPolynomial, taylor_model, _pytree_to_flattened_array
+from .. import TaylorModel, TaylorPolynomial, taylor_model, pack_pytree
 from ..base import PyTreeShape
 
 from typing import Tuple
@@ -72,9 +72,9 @@ def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
         remainder=tm.remainder,
         flat_domain=tm.flat_domain[1:],
         flat_center=tm.flat_center[1:],
-        _input_pytree=new_input_pytree,
-        _output_pytree=tm._output_pytree,
-        _per_leaf_order=tm._per_leaf_order[1:],
+        input_pytree=new_input_pytree,
+        output_pytree=tm.output_pytree,
+        leaf_order=tm.leaf_order[1:],
     )
 
 
@@ -84,7 +84,7 @@ def tps_to_tx(
     domain,
     center,
     *,
-    per_leaf_order=None,
+    leaf_order=None,
 ) -> TaylorModel:
     """Convert a list of TaylorPolynomials to a single TaylorModel with canonical
     coefficient structure, over the domain.
@@ -99,7 +99,7 @@ def tps_to_tx(
         Domain for the resulting TaylorModel.
     center : PyTree[ArrayLike]
         Expansion center for the resulting TaylorModel.
-    per_leaf_order : tuple[int, ...], optional
+    leaf_order : tuple[int, ...], optional
         Per-leaf polynomial orders. If provided, avoids inferring orders from
         exponents (required for JIT compatibility).
 
@@ -117,18 +117,18 @@ def tps_to_tx(
     exponents_bottom = jnp.concatenate([p.exponents for p in polys], axis=1)
     exponents = jnp.vstack((exponents_top, exponents_bottom))
 
-    if per_leaf_order is not None:
-        _domain_treedef, _leaf_shapes, flat_domain = _pytree_to_flattened_array(domain)
-        _, _, flat_center = _pytree_to_flattened_array(center)
+    if leaf_order is not None:
+        _domain_treedef, _leaf_shapes, flat_domain = pack_pytree(domain)
+        _, _, flat_center = pack_pytree(center)
         return TaylorModel(
             coeffs,
             exponents,
             remainder,
             flat_domain,
             flat_center,
-            _input_pytree=PyTreeShape(_domain_treedef, _leaf_shapes),
-            _output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
-            _per_leaf_order=per_leaf_order,
+            input_pytree=PyTreeShape(_domain_treedef, _leaf_shapes),
+            output_pytree=PyTreeShape.flat(coeffs.shape[:-1]),
+            leaf_order=leaf_order,
         )
 
     return taylor_model(
@@ -166,9 +166,9 @@ class TMFlowpipe:
         nsteps,
         success,
         *,
-        _input_pytree,
-        _output_pytree,
-        _per_leaf_order,
+        input_pytree,
+        output_pytree,
+        leaf_order,
         # Legacy kwargs
         _domain_treedef=None,
         _leaf_shapes=None,
@@ -178,18 +178,18 @@ class TMFlowpipe:
         self.exponents = exponents
         self.nsteps = nsteps
         self.success = success
-        if _input_pytree is not None:
-            self._input_pytree = _input_pytree
+        if input_pytree is not None:
+            self.input_pytree = input_pytree
         elif _domain_treedef is not None and _leaf_shapes is not None:
-            self._input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
+            self.input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
         else:
             raise ValueError(
-                "Either _input_pytree or both _domain_treedef and _leaf_shapes must be provided"
+                "Either input_pytree or both _domain_treedef and _leaf_shapes must be provided"
             )
-        self._output_pytree = (
-            _output_pytree if _output_pytree is not None else PyTreeShape.flat(())
+        self.output_pytree = (
+            output_pytree if output_pytree is not None else PyTreeShape.flat(())
         )
-        self._per_leaf_order = _per_leaf_order
+        self.leaf_order = leaf_order
 
     def __len__(self):
         return self.nsteps
@@ -205,9 +205,9 @@ class TMFlowpipe:
             interval(rem_lo, rem_hi),
             interval(dom_lo, dom_hi),
             center,
-            _input_pytree=self._input_pytree,
-            _output_pytree=self._output_pytree,
-            _per_leaf_order=self._per_leaf_order,
+            input_pytree=self.input_pytree,
+            output_pytree=self.output_pytree,
+            leaf_order=self.leaf_order,
         )
 
     def __call__(self, t):
@@ -230,7 +230,7 @@ class TMFlowpipe:
         idx = jnp.searchsorted(self.times, t, side="left")
         idx = jnp.clip(idx, 0, self.nsteps - 1)
         tube_tm = self[idx]
-        t_order = self._per_leaf_order[0]
+        t_order = self.leaf_order[0]
         return tx_tm_eval(tube_tm, t, t_order)
 
     def interval_hulls(self) -> Interval:
@@ -242,9 +242,9 @@ class TMFlowpipe:
                 interval(rem_lo, rem_hi),
                 interval(dom_lo, dom_hi),
                 center,
-                _input_pytree=self._input_pytree,
-                _output_pytree=self._output_pytree,
-                _per_leaf_order=self._per_leaf_order,
+                input_pytree=self.input_pytree,
+                output_pytree=self.output_pytree,
+                leaf_order=self.leaf_order,
             )
             return tm.interval_hull()
 
@@ -259,9 +259,9 @@ class TMFlowpipe:
             self.success,
         )
         aux = {
-            "_input_pytree": self._input_pytree,
-            "_output_pytree": self._output_pytree,
-            "_per_leaf_order": self._per_leaf_order,
+            "input_pytree": self.input_pytree,
+            "output_pytree": self.output_pytree,
+            "leaf_order": self.leaf_order,
         }
         return children, aux
 
@@ -274,9 +274,9 @@ class TMFlowpipe:
             exponents,
             nsteps,
             success,
-            _input_pytree=aux["_input_pytree"],
-            _output_pytree=aux["_output_pytree"],
-            _per_leaf_order=aux["_per_leaf_order"],
+            input_pytree=aux["input_pytree"],
+            output_pytree=aux["output_pytree"],
+            leaf_order=aux["leaf_order"],
         )
 
 
@@ -376,12 +376,12 @@ class TMFlowpipeGenerator(ABC):
 
         tube_domain = (interval(t0, t0 + dt_max), tm0.domain)
         tube_center = (t0, tm0.center)
-        _domain_treedef, _leaf_shapes, flat_tube_domain = _pytree_to_flattened_array(tube_domain)
-        _, _, flat_tube_center = _pytree_to_flattened_array(tube_center)
+        _domain_treedef, _leaf_shapes, flat_tube_domain = pack_pytree(tube_domain)
+        _, _, flat_tube_center = pack_pytree(tube_center)
 
         tube_input_pytree = PyTreeShape(_domain_treedef, _leaf_shapes)
         tube_output_pytree = PyTreeShape.flat((n_out,))
-        tube_per_leaf_order = (t_order,) + tm0._per_leaf_order
+        tube_leaf_order = (t_order,) + tm0.leaf_order
 
         # Dummy tube data for noop branch of lax.cond
         dummy_data = (
@@ -426,7 +426,7 @@ class TMFlowpipeGenerator(ABC):
             tube_exponents,
             final_steps,
             final_success,
-            _input_pytree=tube_input_pytree,
-            _output_pytree=tube_output_pytree,
-            _per_leaf_order=tube_per_leaf_order,
+            input_pytree=tube_input_pytree,
+            output_pytree=tube_output_pytree,
+            leaf_order=tube_leaf_order,
         )

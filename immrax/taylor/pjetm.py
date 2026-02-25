@@ -37,11 +37,11 @@ from immrax.taylor.taylor_model import (
 )
 from immrax.taylor.base import (
     PyTreeShape,
-    _get_leaf_total_degree_exponents,
-    _check_per_leaf_bounds,
-    _leaf_slice,
+    leaf_total_degree_exponents,
+    check_leaf_bounds,
+    leaf_slice,
     _merge_taylor_terms,
-    _max_order,
+    max_leaf_order,
 )
 
 
@@ -124,18 +124,18 @@ def pjetm(
             tm_concat = tm_args[0]
         else:
             tm_concat = taylor_model_concatenate(tm_args)
-        output_pytree = tm_concat._output_pytree
+        output_pytree = tm_concat.output_pytree
 
         # Determine effective_order as tuple[int, ...], matching domain leaves
         if max_order is not None:
             if isinstance(max_order, int):
                 effective_order = tuple(
-                    max_order for _ in tm_concat._per_leaf_order
+                    max_order for _ in tm_concat.leaf_order
                 )
             else:
                 effective_order = tuple(max_order)
         else:
-            effective_order = tm_concat._per_leaf_order
+            effective_order = tm_concat.leaf_order
 
         # Build f_tm that closes over non-TM args and kwargs,
         # receives the TM output leaves as positional args
@@ -144,13 +144,13 @@ def pjetm(
             leaf_idx = 0
             for i in range(len(args)):
                 if istaylormodel(args[i]):
-                    n = args[i]._output_pytree.num_leaves
+                    n = args[i].output_pytree.num_leaves
                     if n == 1:
                         full_args.append(tm_leaves[leaf_idx])
                         leaf_idx += 1
                     else:
                         leaves = tm_leaves[leaf_idx:leaf_idx + n]
-                        reconstructed = args[i]._output_pytree.treedef.unflatten(leaves)
+                        reconstructed = args[i].output_pytree.treedef.unflatten(leaves)
                         # If this was the only positional arg and f expects
                         # multiple args, spread the reconstructed pytree
                         if len(args) == 1 and isinstance(reconstructed, (list, tuple)):
@@ -314,9 +314,9 @@ def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
-            _input_pytree=ref_tm._input_pytree,
-            _output_pytree=ref_tm._output_pytree,
-            _per_leaf_order=ref_tm._per_leaf_order,
+            input_pytree=ref_tm.input_pytree,
+            output_pytree=ref_tm.output_pytree,
+            leaf_order=ref_tm.leaf_order,
         )
 
     return _tm_p
@@ -389,9 +389,9 @@ def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
-            _input_pytree=ref_tm._input_pytree,
-            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-            _per_leaf_order=ref_tm._per_leaf_order,
+            input_pytree=ref_tm.input_pytree,
+            output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            leaf_order=ref_tm.leaf_order,
         )
 
     tm_inclusion_registry[primitive] = _tm_p
@@ -471,9 +471,9 @@ def _tm_dynamic_slice_p(x, *start_indices, slice_sizes, max_order=None) -> Taylo
         interval(new_lower, new_upper),
         x.flat_domain,
         flat_center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        leaf_order=x.leaf_order,
     )
 
 
@@ -542,9 +542,9 @@ def _make_tm_scatter_p(primitive):
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
-            _input_pytree=ref_tm._input_pytree,
-            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-            _per_leaf_order=ref_tm._per_leaf_order,
+            input_pytree=ref_tm.input_pytree,
+            output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            leaf_order=ref_tm.leaf_order,
         )
 
     tm_inclusion_registry[primitive] = _tm_p
@@ -597,10 +597,10 @@ def _make_tm_scatter_nonlinear_p(primitive):
         return _taylor_model_constant_impl(
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
-            ref_tm._per_leaf_order,
+            ref_tm.leaf_order,
             center=ref_tm.flat_center,
-            _input_pytree=ref_tm._input_pytree,
-            _per_leaf_order=ref_tm._per_leaf_order,
+            input_pytree=ref_tm.input_pytree,
+            leaf_order=ref_tm.leaf_order,
         )
 
     tm_inclusion_registry[primitive] = _tm_p
@@ -646,9 +646,9 @@ def _tm_select_n_p(pred, *cases, max_order=None):
         interval(new_lower, new_upper),
         ref_tm.flat_domain,
         flat_center=ref_tm.flat_center,
-        _input_pytree=ref_tm._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=ref_tm._per_leaf_order,
+        input_pytree=ref_tm.input_pytree,
+        output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        leaf_order=ref_tm.leaf_order,
     )
 
 
@@ -674,9 +674,9 @@ def _tm_split_p(x, *, sizes, axis, max_order=None):
         TaylorModel(
             c, x.exponents, interval(lo, hi),
             x.flat_domain, flat_center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=PyTreeShape.flat(c.shape[:-1]),
-            _per_leaf_order=x._per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=PyTreeShape.flat(c.shape[:-1]),
+            leaf_order=x.leaf_order,
         )
         for c, lo, hi in zip(coeff_chunks, lo_chunks, hi_chunks)
     ]
@@ -700,9 +700,9 @@ def _tm_pjit_p(*args, max_order=None, **bind_params) -> TaylorModel:
         for arg in args:
             if istaylormodel(arg):
                 max_order = (
-                    arg._per_leaf_order
+                    arg.leaf_order
                     if max_order is None
-                    else _max_order(max_order, arg._per_leaf_order)
+                    else max_leaf_order(max_order, arg.leaf_order)
                 )
         if max_order is None:
             max_order = (2,)
@@ -743,7 +743,7 @@ def _tm_add_p(
         # Add remainders (Interval addition auto-broadcasts)
         new_remainder = x.remainder + y.remainder
 
-        per_leaf_order = _max_order(x._per_leaf_order, y._per_leaf_order)
+        leaf_order = max_leaf_order(x.leaf_order, y.leaf_order)
 
         result = TaylorModel(
             new_coeffs,
@@ -751,12 +751,12 @@ def _tm_add_p(
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=leaf_order,
         )
         # Convert to canonical form for compatibility
-        return result.to_canonical(per_leaf_order)
+        return result.to_canonical(leaf_order)
 
     elif istaylormodel(x):
         # TM + Array
@@ -788,11 +788,11 @@ def _tm_add_p(
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=x._per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=x.leaf_order,
         )
-        return result.to_canonical(x._per_leaf_order)
+        return result.to_canonical(x.leaf_order)
 
     elif istaylormodel(y):
         # Array + TM
@@ -831,9 +831,9 @@ def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         -x.remainder,
         x.flat_domain,
         flat_center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=x._output_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=x.output_pytree,
+        leaf_order=x.leaf_order,
     )
 
 
@@ -842,7 +842,7 @@ TaylorModel.__neg__ = _tm_neg_p
 
 
 def _truncate_product(
-    coeffs, exponents, max_order, shifted_domain, leaf_shapes=None, per_leaf_order=None
+    coeffs, exponents, max_order, shifted_domain, leaf_shapes=None, leaf_order=None
 ):
     """Truncate polynomial product terms above max_order into an interval remainder.
 
@@ -858,7 +858,7 @@ def _truncate_product(
         The shifted domain (D - center) for bounding monomials.
     leaf_shapes : tuple[tuple[int, ...], ...], optional
         If provided, use per-leaf total degree bounds instead of per-variable.
-    per_leaf_order : tuple[int, ...], optional
+    leaf_order : tuple[int, ...], optional
         Per-leaf total degree bounds. Required if leaf_shapes is provided.
 
     Returns
@@ -869,10 +869,10 @@ def _truncate_product(
         Rigorous bound on the contribution of the removed terms.
     """
     # Determine keep mask based on mode
-    if leaf_shapes is not None and per_leaf_order is not None:
+    if leaf_shapes is not None and leaf_order is not None:
         # Per-leaf total degree mode
-        keep_mask = _check_per_leaf_bounds(exponents, leaf_shapes, per_leaf_order)
-        static_max = max(per_leaf_order) * 2
+        keep_mask = check_leaf_bounds(exponents, leaf_shapes, leaf_order)
+        static_max = max(leaf_order) * 2
     else:
         # Per-variable mode (original behavior)
         if isinstance(max_order, int):
@@ -937,7 +937,7 @@ def _tm_mul_p(
         effective_order = (
             max_order
             if max_order is not None
-            else _max_order(x._per_leaf_order, y._per_leaf_order)
+            else max_leaf_order(x.leaf_order, y.leaf_order)
         )
 
         # Truncate high-order product terms into remainder
@@ -947,7 +947,7 @@ def _tm_mul_p(
             effective_order,
             x.shifted_domain,
             leaf_shapes=x._leaf_shapes,
-            per_leaf_order=effective_order,
+            leaf_order=effective_order,
         )
 
         new_exponents = all_exp
@@ -971,9 +971,9 @@ def _tm_mul_p(
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=effective_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=effective_order,
         )
 
         return result.to_canonical(effective_order)
@@ -1001,9 +1001,9 @@ def _tm_mul_p(
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=x._per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=x.leaf_order,
         )
 
     elif istaylormodel(y):
@@ -1040,12 +1040,12 @@ def _tm_univariate(
     if not istaylormodel(x):
         return primitive_p.bind(x)
 
-    per_leaf_order = max_order if max_order is not None else x._per_leaf_order
+    leaf_order = max_order if max_order is not None else x.leaf_order
     # For univariate composition, use max of per-leaf orders as expansion depth
-    if isinstance(per_leaf_order, tuple):
-        order = max(per_leaf_order)
+    if isinstance(leaf_order, tuple):
+        order = max(leaf_order)
     else:
-        order = per_leaf_order
+        order = leaf_order
     output_shape = x._output_shape
     c = x.constant_term  # (*output_shape,)
 
@@ -1096,23 +1096,23 @@ def _tm_univariate(
     result = _taylor_model_constant_impl(
         interval(init_coeff),
         x.flat_domain,
-        per_leaf_order,
+        leaf_order,
         center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=x._output_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=x.output_pytree,
+        leaf_order=x.leaf_order,
     )
     for coeff in horner_coeffs:
         term = _taylor_model_constant_impl(
             interval(coeff),
             x.flat_domain,
-            per_leaf_order,
+            leaf_order,
             center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=x._per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=x.leaf_order,
         )
-        result = result.multiply(z, max_order=per_leaf_order) + term
+        result = result.multiply(z, max_order=leaf_order) + term
 
     # 3. Compute Lagrange remainder: f^(order+1)(xi) / (order+1)! * z^(order+1)
     x_hull = x.interval_hull()
@@ -1185,9 +1185,9 @@ def _tm_univariate(
         final_remainder,
         result.flat_domain,
         flat_center=result.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=x._output_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=x.output_pytree,
+        leaf_order=x.leaf_order,
     )
 
 
@@ -1222,7 +1222,7 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
     if not istaylormodel(x):
         return lax.integer_pow(x, y)
 
-    order = max_order if max_order is not None else x._per_leaf_order
+    order = max_order if max_order is not None else x.leaf_order
 
     if y == 0:
         return _taylor_model_constant_impl(
@@ -1230,9 +1230,9 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
             x.flat_domain,
             order,
             center=x.flat_center,
-            _input_pytree=x._input_pytree,
-            _output_pytree=x._output_pytree,
-            _per_leaf_order=x._per_leaf_order,
+            input_pytree=x.input_pytree,
+            output_pytree=x.output_pytree,
+            leaf_order=x.leaf_order,
         )
     elif y < 0:
         # x^(-n) = 1/x^n
@@ -1243,9 +1243,9 @@ def _tm_integer_pow_p(x: TaylorModel, y: int, *, max_order=None) -> TaylorModel:
                 x.flat_domain,
                 order,
                 center=x.flat_center,
-                _input_pytree=x._input_pytree,
-                _output_pytree=x._output_pytree,
-                _per_leaf_order=x._per_leaf_order,
+                input_pytree=x.input_pytree,
+                output_pytree=x.output_pytree,
+                leaf_order=x.leaf_order,
             ),
             pos_pow,
             max_order=order,
@@ -1278,12 +1278,12 @@ def _tm_pow_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     if order is None:
         order = None
         if istaylormodel(x):
-            order = x._per_leaf_order
+            order = x.leaf_order
         if istaylormodel(y):
             order = (
-                y._per_leaf_order
+                y.leaf_order
                 if order is None
-                else _max_order(order, y._per_leaf_order)
+                else max_leaf_order(order, y.leaf_order)
             )
         if order is None:
             order = (2,)
@@ -1334,11 +1334,11 @@ def _tm_abs_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     return _taylor_model_constant_impl(
         icentpert(center, pert),
         x.flat_domain,
-        x._per_leaf_order,
+        x.leaf_order,
         center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=x._output_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=x.output_pytree,
+        leaf_order=x.leaf_order,
     )
 
 
@@ -1372,9 +1372,9 @@ def _tm_dot_general_array(arr, tm, dim_nums):
         new_remainder,
         tm.flat_domain,
         flat_center=tm.flat_center,
-        _input_pytree=tm._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=tm._per_leaf_order,
+        input_pytree=tm.input_pytree,
+        output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        leaf_order=tm.leaf_order,
     )
 
 
@@ -1426,9 +1426,9 @@ def _tm_dot_general_p(
                 new_remainder,
                 result.flat_domain,
                 flat_center=result.flat_center,
-                _input_pytree=result._input_pytree,
-                _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-                _per_leaf_order=result._per_leaf_order,
+                input_pytree=result.input_pytree,
+                output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+                leaf_order=result.leaf_order,
             )
         return result
 
@@ -1440,7 +1440,7 @@ def _tm_dot_general_p(
         effective_order = (
             max_order
             if max_order is not None
-            else _max_order(A._per_leaf_order, B._per_leaf_order)
+            else max_leaf_order(A.leaf_order, B.leaf_order)
         )
         d = A.d
         m1 = A.num_monomials
@@ -1475,7 +1475,7 @@ def _tm_dot_general_p(
             effective_order,
             A.shifted_domain,
             leaf_shapes=A._leaf_shapes,
-            per_leaf_order=A._per_leaf_order,
+            leaf_order=A.leaf_order,
         )
 
         # Cross terms: p_A · r_B + r_A · p_B + r_A · r_B
@@ -1501,9 +1501,9 @@ def _tm_dot_general_p(
             new_remainder,
             A.flat_domain,
             flat_center=A.flat_center,
-            _input_pytree=A._input_pytree,
-            _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-            _per_leaf_order=effective_order,
+            input_pytree=A.input_pytree,
+            output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+            leaf_order=effective_order,
         )
         return result.to_canonical(effective_order)
 
@@ -1542,11 +1542,11 @@ def _tm_max_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     return _taylor_model_constant_impl(
         result_interval,
         ref.flat_domain,
-        ref._per_leaf_order,
+        ref.leaf_order,
         center=ref.flat_center,
-        _input_pytree=ref._input_pytree,
-        _output_pytree=ref._output_pytree,
-        _per_leaf_order=ref._per_leaf_order,
+        input_pytree=ref.input_pytree,
+        output_pytree=ref.output_pytree,
+        leaf_order=ref.leaf_order,
     )
 
 
@@ -1574,11 +1574,11 @@ def _tm_min_p(x: TaylorModel, y: TaylorModel, *, max_order=None) -> TaylorModel:
     return _taylor_model_constant_impl(
         result_interval,
         ref.flat_domain,
-        ref._per_leaf_order,
+        ref.leaf_order,
         center=ref.flat_center,
-        _input_pytree=ref._input_pytree,
-        _output_pytree=ref._output_pytree,
-        _per_leaf_order=ref._per_leaf_order,
+        input_pytree=ref.input_pytree,
+        output_pytree=ref.output_pytree,
+        leaf_order=ref.leaf_order,
     )
 
 
@@ -1588,13 +1588,13 @@ tm_inclusion_registry[lax.min_p] = _tm_min_p
 # --- Reduction operations ---
 
 
-def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
+def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None, **kwargs) -> TaylorModel:
     """Taylor model sum reduction over output shape dimensions.
 
     Sum preserves polynomial structure (sum of polynomials is a polynomial).
     """
     if not istaylormodel(x):
-        return lax.reduce_sum_p.bind(x, axes=axes)
+        return lax.reduce_sum_p.bind(x, axes=axes, **kwargs)
 
     # axes refer to output shape dimensions, not monomial axis
     # coeffs has shape (*output_shape, m)
@@ -1609,22 +1609,22 @@ def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
         new_remainder,
         x.flat_domain,
         flat_center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        leaf_order=x.leaf_order,
     )
 
 
 tm_inclusion_registry[lax.reduce_sum_p] = _tm_reduce_sum_p
 
 
-def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
+def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None, **kwargs) -> TaylorModel:
     """Taylor model max reduction.
 
     Max is not polynomial-preserving, so we fall back to interval bounds.
     """
     if not istaylormodel(x):
-        return lax.reduce_max_p.bind(x, axes=axes)
+        return lax.reduce_max_p.bind(x, axes=axes, **kwargs)
 
     hull = x.interval_hull()
     result = interval(jnp.max(hull.lower, axis=axes), jnp.max(hull.upper, axis=axes))
@@ -1632,23 +1632,23 @@ def _tm_reduce_max_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     return _taylor_model_constant_impl(
         result,
         x.flat_domain,
-        x._per_leaf_order,
+        x.leaf_order,
         center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        leaf_order=x.leaf_order,
     )
 
 
 tm_inclusion_registry[lax.reduce_max_p] = _tm_reduce_max_p
 
 
-def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
+def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None, **kwargs) -> TaylorModel:
     """Taylor model min reduction.
 
     Min is not polynomial-preserving, so we fall back to interval bounds.
     """
     if not istaylormodel(x):
-        return lax.reduce_min_p.bind(x, axes=axes)
+        return lax.reduce_min_p.bind(x, axes=axes, **kwargs)
 
     hull = x.interval_hull()
     result = interval(jnp.min(hull.lower, axis=axes), jnp.min(hull.upper, axis=axes))
@@ -1656,10 +1656,10 @@ def _tm_reduce_min_p(x: TaylorModel, *, axes, max_order=None) -> TaylorModel:
     return _taylor_model_constant_impl(
         result,
         x.flat_domain,
-        x._per_leaf_order,
+        x.leaf_order,
         center=x.flat_center,
-        _input_pytree=x._input_pytree,
-        _per_leaf_order=x._per_leaf_order,
+        input_pytree=x.input_pytree,
+        leaf_order=x.leaf_order,
     )
 
 
@@ -1678,7 +1678,7 @@ _register_tm_univariate(lax.atan_p, jnp.arctan)  # no jet rule for atan
 def _tm_reciprocal_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
     """Taylor model reciprocal: 1/x."""
     eff_order = (
-        max_order if max_order else (x._per_leaf_order if istaylormodel(x) else (2,))
+        max_order if max_order else (x.leaf_order if istaylormodel(x) else (2,))
     )
     one = _taylor_model_constant_impl(
         interval(
@@ -1690,8 +1690,8 @@ def _tm_reciprocal_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         x.flat_domain if istaylormodel(x) else icentpert(jnp.zeros(1), jnp.ones(1)),
         eff_order,
         center=x.flat_center if istaylormodel(x) else None,
-        _input_pytree=x._input_pytree if istaylormodel(x) else None,
-        _output_pytree=x._output_pytree if istaylormodel(x) else None,
-        _per_leaf_order=x._per_leaf_order if istaylormodel(x) else None,
+        input_pytree=x.input_pytree if istaylormodel(x) else None,
+        output_pytree=x.output_pytree if istaylormodel(x) else None,
+        leaf_order=x.leaf_order if istaylormodel(x) else None,
     )
     return _tm_div_p(one, x, max_order=max_order)

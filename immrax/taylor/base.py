@@ -1,7 +1,7 @@
 """Shared base utilities for the Taylor model and Taylor polynomial frameworks.
 
 This module provides the common infrastructure used by both TaylorModel and
-TaylorPolynomial: pytree helpers, the PyTreeShape descriptor, and all canonical
+TaylorPolynomial: pytree helpers, the PyTreeShape descriptor, and per-leaf
 exponent-generation functions.
 """
 
@@ -28,7 +28,7 @@ def _is_interval_or_array_leaf(x):
     return isinstance(x, Interval) or isinstance(x, Array)
 
 
-def _pytree_to_flattened_array(pytree, is_leaf=_is_interval_or_array_leaf):
+def pack_pytree(pytree, is_leaf=_is_interval_or_array_leaf):
     """Extract pytree structure and leaf info from pytree.
 
     Essentially a double flattening: PyTree -> Leaves -> Flattened Array/Interval.
@@ -70,7 +70,7 @@ def _pytree_to_flattened_array(pytree, is_leaf=_is_interval_or_array_leaf):
     return treedef, leaf_shapes, flat_domain
 
 
-def _unflatten_array_to_pytree(treedef, leaf_shapes, flat_array):
+def unpack_pytree(treedef, leaf_shapes, flat_array):
     """Unflatten a 1D Array/Interval into a pytree structure matching leaf_shapes and treedef.
 
     Parameters
@@ -138,11 +138,11 @@ class PyTreeShape:
 
     def unflatten(self, flat_array):
         """Reshape a flat array into the pytree structure."""
-        return _unflatten_array_to_pytree(self.treedef, self.leaf_shapes, flat_array)
+        return unpack_pytree(self.treedef, self.leaf_shapes, flat_array)
 
     def leaf_slice(self, idx: int) -> slice:
         """Get contiguous slice for leaf ``idx`` in the flat representation."""
-        return _leaf_slice(self.leaf_shapes, idx)
+        return leaf_slice(self.leaf_shapes, idx)
 
     # --- Constructors ---
 
@@ -175,7 +175,7 @@ class PyTreeShape:
         return f"PyTreeShape(treedef={self.treedef}, leaf_shapes={self.leaf_shapes})"
 
 
-def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
+def normalize_leaf_order(order, domain_treedef, leaf_shapes):
     """Normalize order specification to a per-leaf tuple.
 
     Parameters
@@ -190,13 +190,13 @@ def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
 
     Returns
     -------
-    per_leaf_order : tuple[int, ...]
+    leaf_order : tuple[int, ...]
         Total degree bound for each leaf (one per leaf).
     """
     num_leaves = len(leaf_shapes)
 
     if isinstance(order, int):
-        per_leaf_order = tuple([order] * num_leaves)
+        leaf_order = tuple([order] * num_leaves)
     else:
         order_pytree = jax.tree_util.tree_structure(order)
         order_leaves = jax.tree_util.tree_leaves(order)
@@ -206,12 +206,12 @@ def _normalize_order_pytree(order, domain_treedef, leaf_shapes):
                 f"{order_pytree} and {domain_treedef}, and "
                 f"{len(order_leaves)} and {num_leaves} leaves respectively"
             )
-        per_leaf_order = tuple(int(o) for o in order_leaves)
+        leaf_order = tuple(int(o) for o in order_leaves)
 
-    return per_leaf_order
+    return leaf_order
 
 
-def _leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> slice:
+def leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> slice:
     """Get slice for domain variables of a given leaf.
 
     Parameters
@@ -231,7 +231,7 @@ def _leaf_slice(leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_idx: int) -> sl
     return slice(start, start + sizes[leaf_idx])
 
 
-def _max_order(a: "tuple[int, ...]", b: "tuple[int, ...]") -> "tuple[int, ...]":
+def max_leaf_order(a: "tuple[int, ...]", b: "tuple[int, ...]") -> "tuple[int, ...]":
     """Element-wise maximum of two order tuples."""
     return tuple(max(ai, bi) for ai, bi in zip(a, b))
 
@@ -239,32 +239,6 @@ def _max_order(a: "tuple[int, ...]", b: "tuple[int, ...]") -> "tuple[int, ...]":
 # ---------------------------------------------------------------------------
 # Exponent generation
 # ---------------------------------------------------------------------------
-
-
-@lru_cache(maxsize=128)
-def _get_canonical_exponents(d: int, max_orders: "int | tuple[int, ...]") -> Array:
-    """Get cached canonical exponents for given dimension and per-variable orders.
-
-    Parameters
-    ----------
-    d : int
-        Number of variables.
-    max_orders : int or tuple[int, ...]
-        Per-variable maximum exponent.  If int, broadcast to all variables.
-    """
-    if isinstance(max_orders, int):
-        max_orders = tuple([max_orders] * d)
-    return _generate_exponents_impl(d, max_orders)
-
-
-def _generate_exponents_impl(d: int, max_orders: "tuple[int, ...]") -> Array:
-    """Generate all exponent multi-indices with per-variable bounds."""
-    from itertools import product
-    import numpy as np
-
-    ranges = [range(max_orders[i] + 1) for i in range(d)]
-    exponents = list(product(*ranges))
-    return np.array(exponents, dtype=np.int32).T
 
 
 def _enumerate_total_degree(dim: int, max_deg: int) -> "list[tuple[int, ...]]":
@@ -294,8 +268,8 @@ def _enumerate_total_degree(dim: int, max_deg: int) -> "list[tuple[int, ...]]":
 
 
 @lru_cache(maxsize=128)
-def _get_leaf_total_degree_exponents(
-    leaf_shapes: "tuple[tuple[int, ...], ...]", per_leaf_order: "tuple[int, ...]"
+def leaf_total_degree_exponents(
+    leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_order: "tuple[int, ...]"
 ) -> Array:
     """Generate exponents with per-leaf total degree bounds.
 
@@ -306,7 +280,7 @@ def _get_leaf_total_degree_exponents(
     ----------
     leaf_shapes : tuple[tuple[int, ...], ...]
         Shape of each leaf Interval.
-    per_leaf_order : tuple[int, ...]
+    leaf_order : tuple[int, ...]
         Maximum total degree for each leaf.
 
     Returns
@@ -317,7 +291,7 @@ def _get_leaf_total_degree_exponents(
     Example
     -------
     For domain = [interval_t, interval_x] where t: () and x: (2,),
-    with per_leaf_order = (2, 3):
+    with leaf_order = (2, 3):
     - Generates monomials t^a * x1^b1 * x2^b2 where a <= 2 and b1+b2 <= 3
     - Count: (2+1) * C(2+3, 3) = 3 * 10 = 30 monomials
     """
@@ -327,7 +301,7 @@ def _get_leaf_total_degree_exponents(
     leaf_sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
 
     leaf_indices = []
-    for size, max_ord in zip(leaf_sizes, per_leaf_order):
+    for size, max_ord in zip(leaf_sizes, leaf_order):
         leaf_indices.append(_enumerate_total_degree(size, max_ord))
 
     all_exponents = []
@@ -338,10 +312,10 @@ def _get_leaf_total_degree_exponents(
     return np.array(all_exponents, dtype=np.int32).T
 
 
-def _check_per_leaf_bounds(
+def check_leaf_bounds(
     exponents: Array,
     leaf_shapes: "tuple[tuple[int, ...], ...]",
-    per_leaf_order: "tuple[int, ...]",
+    leaf_order: "tuple[int, ...]",
 ) -> Array:
     """Return boolean mask for monomials within per-leaf total degree bounds.
 
@@ -351,7 +325,7 @@ def _check_per_leaf_bounds(
         Exponent matrix.
     leaf_shapes : tuple[tuple[int, ...], ...]
         Shape of each leaf Interval.
-    per_leaf_order : tuple[int, ...]
+    leaf_order : tuple[int, ...]
         Maximum total degree for each leaf.
 
     Returns
@@ -362,13 +336,13 @@ def _check_per_leaf_bounds(
     num_leaves = len(leaf_shapes)
     masks = []
     for leaf_idx in range(num_leaves):
-        slc = _leaf_slice(leaf_shapes, leaf_idx)
+        slc = leaf_slice(leaf_shapes, leaf_idx)
         leaf_total = jnp.sum(exponents[slc, :], axis=0)
-        masks.append(leaf_total <= per_leaf_order[leaf_idx])
+        masks.append(leaf_total <= leaf_order[leaf_idx])
     return jnp.all(jnp.stack(masks), axis=0)
 
 
-def _compute_per_leaf_order_from_exponents(
+def compute_leaf_order(
     exponents: Array, leaf_shapes: "tuple[tuple[int, ...], ...]"
 ) -> "tuple[int, ...]":
     """Compute per-leaf total degree from exponent matrix.
@@ -387,7 +361,7 @@ def _compute_per_leaf_order_from_exponents(
     """
     result = []
     for leaf_idx in range(len(leaf_shapes)):
-        slc = _leaf_slice(leaf_shapes, leaf_idx)
+        slc = leaf_slice(leaf_shapes, leaf_idx)
         leaf_total = jnp.max(jnp.sum(exponents[slc, :], axis=0))
         result.append(int(leaf_total))
     return tuple(result)
@@ -431,26 +405,3 @@ def _compact_taylor_terms(coeffs: Array, exponents: Array) -> "Tuple[Array, Arra
     return coeffs_compact, exponents
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatibility alias
-# ---------------------------------------------------------------------------
-
-
-def _generate_exponents(d: int, max_order: "int | tuple[int, ...]") -> Array:
-    """Generate all exponent multi-indices up to given order.
-
-    Alias for :func:`_get_canonical_exponents`.
-
-    Parameters
-    ----------
-    d : int
-        Number of variables.
-    max_order : int or tuple[int, ...]
-        Maximum per-variable degree (int is broadcast to all variables).
-
-    Returns
-    -------
-    Array
-        Exponent matrix, shape (d, num_monomials).
-    """
-    return _get_canonical_exponents(d, max_order)

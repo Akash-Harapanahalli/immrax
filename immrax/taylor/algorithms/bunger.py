@@ -26,7 +26,7 @@ from .. import (
     taylor_model_identity,
 )
 from ..taylor_model import _bound_monomials_over_domain
-from ..base import PyTreeShape, _get_leaf_total_degree_exponents
+from ..base import PyTreeShape, leaf_total_degree_exponents
 from .base import TMFlowpipeGenerator, tx_tm_eval, tps_to_tx
 
 from typing import Tuple
@@ -69,7 +69,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
         """Apply the Picard operator (identical to BasicTMFlowpipeGenerator)."""
         tm_ic = tx_tm_eval(tm_tx, tm_tx.domain[0].lower, self.t_order)
 
-        tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx._per_leaf_order)
+        tm_id = taylor_model_identity(tm_tx.domain, order=tm_tx.leaf_order)
         if u is not None:
             f_tm_tx = pjetm(self.sys.f)(tm_id[0:1], tm_tx, u)
         else:
@@ -88,9 +88,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             remainder=tm_int.remainder + ic_remainder,
             flat_domain=tm_int.flat_domain,
             flat_center=tm_int.flat_center,
-            _input_pytree=tm_int._input_pytree,
-            _output_pytree=tm_int._output_pytree,
-            _per_leaf_order=tm_int._per_leaf_order,
+            input_pytree=tm_int.input_pytree,
+            output_pytree=tm_int.output_pytree,
+            leaf_order=tm_int.leaf_order,
         )
 
     # ------------------------------------------------------------------
@@ -161,9 +161,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             remainder=interval(jnp.zeros_like(c0)),
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,
-            _input_pytree=tm._input_pytree,
-            _output_pytree=tm._output_pytree,
-            _per_leaf_order=tm._per_leaf_order,
+            input_pytree=tm.input_pytree,
+            output_pytree=tm.output_pytree,
+            leaf_order=tm.leaf_order,
         )
         new_poly_bounds = new_tm._bound_polynomial()
 
@@ -189,9 +189,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             remainder=interval(final_rem_lo, final_rem_hi),
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,
-            _input_pytree=tm._input_pytree,
-            _output_pytree=tm._output_pytree,
-            _per_leaf_order=tm._per_leaf_order,
+            input_pytree=tm.input_pytree,
+            output_pytree=tm.output_pytree,
+            leaf_order=tm.leaf_order,
         )
 
     # ------------------------------------------------------------------
@@ -237,9 +237,9 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             remainder=new_remainder,
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,
-            _input_pytree=tm._input_pytree,
-            _output_pytree=tm._output_pytree,
-            _per_leaf_order=tm._per_leaf_order,
+            input_pytree=tm.input_pytree,
+            output_pytree=tm.output_pytree,
+            leaf_order=tm.leaf_order,
         )
 
     # ------------------------------------------------------------------
@@ -259,7 +259,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             interval(jnp.zeros_like(tmi.remainder.lower)),
             (interval(t, t + dt_max), tmi.domain),
             (t, tmi.center),
-            per_leaf_order=(self.t_order,) + tmi._per_leaf_order,
+            leaf_order=(self.t_order,) + tmi.leaf_order,
         )
 
         # Step 2: eps-inflation Picard contraction check

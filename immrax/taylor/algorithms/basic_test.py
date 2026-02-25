@@ -41,7 +41,7 @@ print(tmx._domain_treedef, tmx._leaf_shapes)
 print(tm0.exponents)
 print(tm0.coeffs)
 
-# irx.taylor._get_leaf_total_degree_exponents(((),(2,)), (4,2))
+# irx.taylor.leaf_total_degree_exponents(((),(2,)), (4,2))
 
 # %%
 pr_coeffs = irx.pjet(lambda x : prolonged_f(t0, x))(tmx.polynomial)
