@@ -6,6 +6,7 @@ from itertools import combinations_with_replacement
 from .interval import Interval, interval, isinterval
 from .jacobian import Permutation, standard_permutation
 from .nif import natif
+from ..taylor import TaylorPolynomial, pjet
 
 
 def get_multiindices(n, p):
