@@ -98,7 +98,7 @@ print(f"  tube remainder: {poly1.remainder}")
 
 # How many extra inflations would the correct check need?
 test_poly = TaylorModel(
-    poly1.coeffs, poly1.exponents, E_prev_1,  # start with E_prev
+    poly1.coeffs, poly1.multiindices, E_prev_1,  # start with E_prev
     poly1.flat_domain, poly1.flat_center,
     _input_pytree=poly1._input_pytree,
     _output_pytree=poly1._output_pytree,

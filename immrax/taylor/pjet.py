@@ -34,6 +34,7 @@ from immrax.taylor.taylor_polynomial import (
     _taylor_polynomial_constant_impl,
 )
 from immrax.taylor.base import (
+    MultiIndexArray,
     PyTreeShape,
     check_leaf_bounds,
     _merge_taylor_terms,
@@ -254,7 +255,7 @@ def _make_tp_passthrough(primitive: Primitive):
 
         return TaylorPolynomial(
             new_coeffs,
-            ref.exponents,
+            ref.multiindices,
             ref.flat_center,
             input_pytree=ref.input_pytree,
             output_pytree=ref.output_pytree,
@@ -311,7 +312,7 @@ def _make_tp_structural_p(primitive, adapt_coeff_kwargs):
 
         return TaylorPolynomial(
             new_coeffs,
-            ref_tp.exponents,
+            ref_tp.multiindices,
             ref_tp.flat_center,
             input_pytree=ref_tp.input_pytree,
             output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -382,7 +383,7 @@ def _tp_dynamic_slice_p(x, *start_indices, slice_sizes):
     )
     return TaylorPolynomial(
         new_coeffs,
-        x.exponents,
+        x.multiindices,
         x.flat_center,
         input_pytree=x.input_pytree,
         output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -439,7 +440,7 @@ def _make_tp_scatter_p(primitive):
 
         return TaylorPolynomial(
             new_coeffs,
-            ref_tp.exponents,
+            ref_tp.multiindices,
             ref_tp.flat_center,
             input_pytree=ref_tp.input_pytree,
             output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -515,7 +516,7 @@ def _tp_select_n_p(pred, *cases):
 
     return TaylorPolynomial(
         new_coeffs,
-        ref_tp.exponents,
+        ref_tp.multiindices,
         ref_tp.flat_center,
         input_pytree=ref_tp.input_pytree,
         output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -542,7 +543,7 @@ def _tp_split_p(x, *, sizes, axis):
 
     return [
         TaylorPolynomial(
-            c, x.exponents, x.flat_center,
+            c, x.multiindices, x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(c.shape[:-1]),
             leaf_order=x.leaf_order,
@@ -592,8 +593,8 @@ def _tp_add_p(x, y):
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, y._output_shape)
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, y.num_monomials))
-        new_coeffs, new_exp = _merge_taylor_terms(
-            x_coeffs, x.exponents, y_coeffs, y.exponents
+        new_coeffs, new_mia = _merge_taylor_terms(
+            x_coeffs, x.multiindices, y_coeffs, y.multiindices
         )
 
         # For addition, we can just use the per-leaf order from one of the operands
@@ -603,7 +604,7 @@ def _tp_add_p(x, y):
 
         result = TaylorPolynomial(
             new_coeffs,
-            new_exp,
+            new_mia,
             x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(broadcast_shape),
@@ -614,16 +615,16 @@ def _tp_add_p(x, y):
     elif istaylorpolynomial(x):
         val = jnp.asarray(y)
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, val.shape)
-        const_exp = jnp.zeros((x.d, 1), dtype=jnp.int32)
+        const_mia = MultiIndexArray(jnp.zeros((x.d, 1), dtype=jnp.int32))
         val_broadcast = jnp.broadcast_to(val, broadcast_shape)
         const_coeff = val_broadcast[..., None]
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
-        new_coeffs, new_exp = _merge_taylor_terms(
-            x_coeffs, x.exponents, const_coeff, const_exp
+        new_coeffs, new_mia = _merge_taylor_terms(
+            x_coeffs, x.multiindices, const_coeff, const_mia
         )
         result = TaylorPolynomial(
             new_coeffs,
-            new_exp,
+            new_mia,
             x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(broadcast_shape),
@@ -648,7 +649,7 @@ def _tp_neg_p(x):
         return -x
     return TaylorPolynomial(
         -x.coeffs,
-        x.exponents,
+        x.multiindices,
         x.flat_center,
         input_pytree=x.input_pytree,
         output_pytree=x.output_pytree,
@@ -681,9 +682,10 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         m1 = x.num_monomials
         m2 = y.num_monomials
 
-        exp1 = x.exponents[:, :, None]
-        exp2 = y.exponents[:, None, :]
+        exp1 = x.multiindices.to_jnp()[:, :, None]
+        exp2 = y.multiindices.to_jnp()[:, None, :]
         all_exp = (exp1 + exp2).reshape(d, m1 * m2)
+        all_mia = MultiIndexArray(all_exp)
 
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, m1))
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, m2))
@@ -693,13 +695,13 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         all_coeffs = (coeff1 * coeff2).reshape(*broadcast_shape, m1 * m2)
 
         leaf_order = max_leaf_order(x.leaf_order, y.leaf_order)
-        keep_mask = check_leaf_bounds(all_exp, x._leaf_shapes, leaf_order)
+        keep_mask = check_leaf_bounds(all_mia, x._leaf_shapes, leaf_order)
 
         kept_coeffs = jnp.where(keep_mask, all_coeffs, 0.0)
 
         result = TaylorPolynomial(
             kept_coeffs,
-            all_exp,
+            all_mia,
             x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(broadcast_shape),
@@ -715,7 +717,7 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         new_coeffs = alpha_bc[..., None] * x_coeffs
         return TaylorPolynomial(
             new_coeffs,
-            x.exponents,
+            x.multiindices,
             x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(broadcast_shape),
@@ -783,7 +785,7 @@ def _tp_dot_general_array(arr, tp, dim_nums):
     new_coeffs = lax.dot_general(arr, tp.coeffs, dimension_numbers=dim_nums)
     return TaylorPolynomial(
         new_coeffs,
-        tp.exponents,
+        tp.multiindices,
         tp.flat_center,
         input_pytree=tp.input_pytree,
         output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -817,7 +819,7 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
             new_coeffs = jnp.transpose(result.coeffs, perm)
             return TaylorPolynomial(
                 new_coeffs,
-                result.exponents,
+                result.multiindices,
                 result.flat_center,
                 input_pytree=result.input_pytree,
                 output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
@@ -835,9 +837,10 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         m1 = A.num_monomials
         m2 = B.num_monomials
 
-        product_exp = (A.exponents[:, :, None] + B.exponents[:, None, :]).reshape(
-            d, m1 * m2
-        )
+        product_exp = (
+            A.multiindices.to_jnp()[:, :, None] + B.multiindices.to_jnp()[:, None, :]
+        ).reshape(d, m1 * m2)
+        product_mia = MultiIndexArray(product_exp)
 
         contract_over_m2 = jax.vmap(
             lambda a, b: lax.dot_general(a, b, dimension_numbers=dimension_numbers),
@@ -848,13 +851,13 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         result_coeffs_mm = contract_over_m1m2(A.coeffs, B.coeffs)
         result_coeffs = result_coeffs_mm.reshape(*result_coeffs_mm.shape[:-2], m1 * m2)
 
-        keep_mask = check_leaf_bounds(product_exp, A._leaf_shapes, leaf_order)
+        keep_mask = check_leaf_bounds(product_mia, A._leaf_shapes, leaf_order)
 
         kept_coeffs = jnp.where(keep_mask, result_coeffs, 0.0)
 
         result = TaylorPolynomial(
             kept_coeffs,
-            product_exp,
+            product_mia,
             A.flat_center,
             input_pytree=A.input_pytree,
             output_pytree=PyTreeShape.flat(kept_coeffs.shape[:-1]),
@@ -883,7 +886,7 @@ def _tp_reduce_sum_p(x, *, axes, **kwargs):
     new_coeffs = jnp.sum(x.coeffs, axis=axes)
     return TaylorPolynomial(
         new_coeffs,
-        x.exponents,
+        x.multiindices,
         x.flat_center,
         input_pytree=x.input_pytree,
         output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),

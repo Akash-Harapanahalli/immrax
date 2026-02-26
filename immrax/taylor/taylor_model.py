@@ -18,6 +18,8 @@ import jax.tree_util
 from immrax.inclusion import Interval, interval, icentpert
 
 from immrax.taylor.base import (
+    MultiIndex,
+    MultiIndexArray,
     _is_interval_or_array_leaf,
     pack_pytree,
     unpack_pytree,
@@ -75,7 +77,7 @@ class TaylorModel:
     """
 
     coeffs: Array  # Polynomial coefficients, shape (*output_shape, num_monomials)
-    exponents: Array  # Exponent matrix, shape (d, num_monomials)
+    multiindices: MultiIndexArray  # Tuple of MultiIndex objects, one per monomial
     remainder: Interval  # Interval remainder, shape (*output_shape,)
     input_pytree: PyTreeShape
     output_pytree: PyTreeShape
@@ -84,7 +86,7 @@ class TaylorModel:
     def __init__(
         self,
         coeffs,
-        exponents,
+        multiindices,
         remainder: Interval,
         flat_domain: Interval,
         flat_center,
@@ -101,7 +103,11 @@ class TaylorModel:
         validation.
         """
         self.coeffs = jnp.asarray(coeffs)
-        self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
+        self.multiindices = (
+            multiindices
+            if isinstance(multiindices, MultiIndexArray)
+            else MultiIndexArray(multiindices)
+        )
         self.remainder = remainder
         self.flat_domain = flat_domain
         self.flat_center = jnp.asarray(flat_center) if flat_center is not None else None
@@ -133,16 +139,16 @@ class TaylorModel:
 
     def tree_flatten(
         self,
-    ) -> Tuple[Tuple[Array, Array, Interval, Interval, Array], dict]:
+    ) -> Tuple[Tuple[Array, Interval, Interval, Array], dict]:
         return (
             (
                 self.coeffs,
-                self.exponents,
                 self.remainder,
                 self.flat_domain,
                 self.flat_center,
             ),
             {
+                "multiindices": self.multiindices,
                 "input_pytree": self.input_pytree,
                 "output_pytree": self.output_pytree,
                 "leaf_order": self.leaf_order,
@@ -153,10 +159,10 @@ class TaylorModel:
     def tree_unflatten(cls, aux_data, children) -> "TaylorModel":
         # Bypass __init__ to avoid jnp.asarray — JAX/equinox may pass
         # non-array sentinels (e.g. booleans) through tree operations.
-        coeffs, exponents, remainder, flat_domain, flat_center = children
+        coeffs, remainder, flat_domain, flat_center = children
         obj = object.__new__(cls)
         obj.coeffs = coeffs
-        obj.exponents = exponents
+        obj.multiindices = aux_data.get("multiindices") if aux_data else None
         obj.remainder = remainder
         obj.flat_domain = flat_domain
         obj.flat_center = flat_center
@@ -187,7 +193,7 @@ class TaylorModel:
     @property
     def d(self) -> int:
         """Domain (input) dimension."""
-        return self.exponents.shape[0]
+        return self.multiindices.d
 
     @property
     def num_monomials(self) -> int:
@@ -249,7 +255,7 @@ class TaylorModel:
 
         return TaylorModel(
             c,
-            self.exponents,
+            self.multiindices,
             rem,
             self.flat_domain,
             self.flat_center,
@@ -275,11 +281,8 @@ class TaylorModel:
 
         Returns array with shape (*output_shape,).
         """
-        # Find the column where all exponents are 0
-        is_constant = jnp.all(self.exponents == 0, axis=0)  # (num_monomials,)
-        # Broadcast mask to match coeffs shape and sum along monomial axis (last)
-        # is_constant has shape (m,), coeffs has shape (*output_shape, m)
-        # We need to broadcast is_constant to match coeffs for the where operation
+        exponents = self.multiindices.to_jnp()  # (d, m)
+        is_constant = jnp.all(exponents == 0, axis=0)  # (num_monomials,)
         return jnp.sum(jnp.where(is_constant, self.coeffs, 0.0), axis=-1)
 
     # --- Polynomial evaluation ---
@@ -290,7 +293,7 @@ class TaylorModel:
 
         return TaylorPolynomial(
             self.coeffs,
-            self.exponents,
+            self.multiindices,
             self.flat_center,
             input_pytree=self.input_pytree,
             output_pytree=self.output_pytree,
@@ -311,17 +314,9 @@ class TaylorModel:
             Polynomial value, shape (*output_shape,)
         """
         x = jnp.asarray(x)
-        # Shift to centered coordinates (x - center)
         x_centered = x - self.flat_center
-
-        # Evaluate each monomial: monomial_i = prod_j x_centered[j]^exponents[j, i]
-        # x_centered (d,) -> (d, 1), exponents (d, m) -> x_centered^exponents (d, m)
-        # Note: No factorial division here - coefficients already store D^α f(c) / α!
-        monomials = jnp.prod(x_centered[:, None] ** self.exponents, axis=0)  # (m,)
-
-        # Sum coeffs * monomials along the last (monomial) axis
-        # coeffs has shape (*output_shape, m), monomials has shape (m,)
-
+        exponents = self.multiindices.to_jnp()  # (d, m)
+        monomials = jnp.prod(x_centered[:, None] ** exponents, axis=0)  # (m,)
         return jnp.sum(self.coeffs * monomials, axis=-1)
 
     def evaluate(self, x: ArrayLike) -> Interval:
@@ -406,12 +401,13 @@ class TaylorModel:
 
         # Compute monomial bounds over shifted domain (D - center)
         mono_bounds = _bound_monomials_over_domain(
-            self.exponents, self.shifted_domain, self.max_order
+            self.multiindices, self.shifted_domain, self.max_order
         )
         mono_center = (mono_bounds.lower + mono_bounds.upper) / 2  # (m,)
         mono_radius = (mono_bounds.upper - mono_bounds.lower) / 2  # (m,)
 
-        is_constant = jnp.all(self.exponents == 0, axis=0)  # (m,)
+        _exponents = self.multiindices.to_jnp()  # (d, m)
+        is_constant = jnp.all(_exponents == 0, axis=0)  # (m,)
 
         # Center contribution: sum of coeff_i * mono_center_i for non-constant terms
         center_shift = jnp.sum(
@@ -499,24 +495,26 @@ class TaylorModel:
 
         leaf_order = tuple(leaf_order)
 
-        # Generate canonical exponents with per-leaf total degree bounds
-        canonical_exp = leaf_total_degree_exponents(leaf_shapes, leaf_order)
-        num_canonical = canonical_exp.shape[1]
+        # Generate canonical multiindices with per-leaf total degree bounds
+        canonical_mia = leaf_total_degree_exponents(leaf_shapes, leaf_order)
+        num_canonical = canonical_mia.num_monomials
 
         # Auto-select method
         if method is None:
             method = "searchsorted" if num_canonical > 50 else "broadcast"
 
         # Compute hash for current and canonical exponents
-        # Need a hash that's unique across all possible exponents
         base = self.max_order + max(leaf_order) + 2
         powers = base ** jnp.arange(self.d)
 
-        current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
+        current_exp = self.multiindices.to_jnp()    # (d, m)
+        canonical_exp = canonical_mia.to_jnp()      # (d, num_canonical)
+
+        current_hash = jnp.sum(current_exp * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
         # Check if current terms are within per-leaf bounds
-        has_match = check_leaf_bounds(self.exponents, leaf_shapes, leaf_order)
+        has_match = check_leaf_bounds(self.multiindices, leaf_shapes, leaf_order)
 
         if method == "broadcast":
             match_matrix = current_hash[:, None] == canonical_hash[None, :]
@@ -541,7 +539,7 @@ class TaylorModel:
         # Bound terms above target order
         absorb_mask = ~has_match
         mono_bounds = _bound_monomials_over_domain(
-            self.exponents, self.shifted_domain, self.max_order
+            self.multiindices, self.shifted_domain, self.max_order
         )
 
         absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)
@@ -559,7 +557,7 @@ class TaylorModel:
 
         return TaylorModel(
             new_coeffs,
-            canonical_exp,
+            canonical_mia,
             new_remainder,
             self.flat_domain,
             self.flat_center,
@@ -588,46 +586,35 @@ class TaylorModel:
             target_order = tuple(target_order)
 
         # Separate terms to keep and terms to absorb using per-leaf bounds
-        keep_mask = check_leaf_bounds(
-            self.exponents, self._leaf_shapes, target_order
-        )
+        keep_mask = check_leaf_bounds(self.multiindices, self._leaf_shapes, target_order)
         absorb_mask = ~keep_mask  # (m,)
 
         # Compute monomial bounds over shifted domain (D - center)
         mono_bounds_iv = _bound_monomials_over_domain(
-            self.exponents, self.shifted_domain, self.max_order
+            self.multiindices, self.shifted_domain, self.max_order
         )
         mono_lower = mono_bounds_iv.lower  # (m,)
         mono_upper = mono_bounds_iv.upper  # (m,)
 
-        # Only absorb terms above target_order
-        # Broadcasting: absorb_mask (m,) with coeffs (*output_shape, m)
         absorb_coeffs = jnp.where(absorb_mask, self.coeffs, 0.0)  # (*output_shape, m)
 
         zeros = jnp.zeros_like(absorb_coeffs)
-        c_pos = jnp.maximum(absorb_coeffs, zeros)  # (*output_shape, m)
-        c_neg = jnp.minimum(absorb_coeffs, zeros)  # (*output_shape, m)
+        c_pos = jnp.maximum(absorb_coeffs, zeros)
+        c_neg = jnp.minimum(absorb_coeffs, zeros)
 
-        # mono_lower/upper have shape (m,), broadcasting works naturally
-        term_lower = c_pos * mono_lower + c_neg * mono_upper  # (*output_shape, m)
-        term_upper = c_pos * mono_upper + c_neg * mono_lower  # (*output_shape, m)
+        term_lower = c_pos * mono_lower + c_neg * mono_upper
+        term_upper = c_pos * mono_upper + c_neg * mono_lower
 
-        # Sum along monomial axis (last axis)
-        absorbed_lower = jnp.sum(term_lower, axis=-1)  # (*output_shape,)
-        absorbed_upper = jnp.sum(term_upper, axis=-1)  # (*output_shape,)
+        absorbed_lower = jnp.sum(term_lower, axis=-1)
+        absorbed_upper = jnp.sum(term_upper, axis=-1)
 
         absorbed_remainder = interval(absorbed_lower, absorbed_upper)
-
-        # New remainder includes absorbed terms
         new_remainder = self.remainder + absorbed_remainder
-
-        # Filter coefficients (zero out instead of filtering for JIT)
-        # Broadcasting: keep_mask (m,) with coeffs (*output_shape, m)
         new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorModel(
             new_coeffs,
-            self.exponents,
+            self.multiindices,
             new_remainder,
             self.flat_domain,
             self.flat_center,
@@ -646,7 +633,7 @@ class TaylorModel:
 
     def __repr__(self) -> str:
         return (
-            f"TaylorModel(coeffs={self.coeffs!r}, exponents={self.exponents!r}, "
+            f"TaylorModel(coeffs={self.coeffs!r}, multiindices={self.multiindices!r}, "
             f"remainder={self.remainder!r}, flat_domain={self.flat_domain!r}, "
             f"flat_center={self.flat_center!r})"
         )
@@ -656,7 +643,9 @@ class TaylorModel:
 
 
 def _bound_monomials_over_domain(
-    exponents: Array, norm_domain: Interval, max_order: int | None = None
+    exponents: "MultiIndexArray | Array",
+    norm_domain: Interval,
+    max_order: int | None = None,
 ) -> Interval:
     """Bound each monomial prod_j u_j^{e_j} over a domain interval.
 
@@ -665,7 +654,7 @@ def _bound_monomials_over_domain(
 
     Parameters
     ----------
-    exponents : Array, shape (d, m)
+    exponents : MultiIndexArray or Array, shape (d, m)
     norm_domain : Interval, shape (d,)
     max_order : int, optional
         Maximum exponent value (static). If None, computed from exponents
@@ -678,8 +667,9 @@ def _bound_monomials_over_domain(
     """
     from immrax.inclusion import natif
 
-    d = exponents.shape[0]
-    max_e = max_order if max_order is not None else int(jnp.max(exponents))
+    exp_arr = exponents.to_jnp() if isinstance(exponents, MultiIndexArray) else exponents
+    d = exp_arr.shape[0]
+    max_e = max_order if max_order is not None else int(jnp.max(exp_arr))
 
     # Build a (d, max_e+1) table of interval powers: pow_table[j, e] = norm_domain[j] ** e
     # Using natif(integer_pow) for each static exponent value, vmapped over d variables.
@@ -692,8 +682,8 @@ def _bound_monomials_over_domain(
         hi_table = hi_table.at[:, e].set(pow_vals.upper)
 
     # Gather per-(variable, monomial) powers: shape (d, m)
-    gather_lo = jax.vmap(lambda row, idx: row[idx])(lo_table, exponents)
-    gather_hi = jax.vmap(lambda row, idx: row[idx])(hi_table, exponents)
+    gather_lo = jax.vmap(lambda row, idx: row[idx])(lo_table, exp_arr)
+    gather_hi = jax.vmap(lambda row, idx: row[idx])(hi_table, exp_arr)
     grid = Interval(gather_lo, gather_hi)  # (d, m)
 
     # Reduce-product over variable dimension (axis 0)
@@ -738,10 +728,13 @@ def taylor_model(
         The constructed Taylor model
     """
     coeffs = jnp.asarray(coeffs)
-    exponents = jnp.asarray(exponents, dtype=jnp.int32)
+    if isinstance(exponents, MultiIndexArray):
+        mia = exponents
+    else:
+        mia = MultiIndexArray(jnp.asarray(exponents, dtype=jnp.int32))
 
     output_shape = coeffs.shape[:-1]
-    d = exponents.shape[0]
+    d = mia.d
 
     if remainder is None:
         if len(output_shape) == 0:
@@ -760,7 +753,7 @@ def taylor_model(
         # Domain provided - flatten it and get metadata
         _domain_treedef, _leaf_shapes, flat_domain = pack_pytree(domain)
 
-    leaf_order = compute_leaf_order(exponents, _leaf_shapes)
+    leaf_order = compute_leaf_order(mia, _leaf_shapes)
 
     if center is not None:
         # Flatten center if provided, assuming it matches domain structure
@@ -775,27 +768,22 @@ def taylor_model(
     # Validate shapes
     if coeffs.ndim < 1:
         raise ValueError(f"coeffs must be at least 1D, got shape {coeffs.shape}")
-    if exponents.ndim != 2:
-        raise ValueError(f"exponents must be 2D, got shape {exponents.shape}")
-    if coeffs.shape[-1] != exponents.shape[1]:
+    if mia.d == 0 or mia.num_monomials == 0:
+        raise ValueError(f"exponents must be non-empty, got MultiIndexArray with d={mia.d}")
+    if coeffs.shape[-1] != mia.num_monomials:
         raise ValueError(
             f"coeffs and exponents must have same number of monomials: "
-            f"{coeffs.shape[-1]} vs {exponents.shape[1]}"
+            f"{coeffs.shape[-1]} vs {mia.num_monomials}"
         )
     if remainder.shape != output_shape:
         raise ValueError(
             f"remainder and coeffs must have same output shape: "
             f"{remainder.shape} vs {output_shape}"
         )
-    if flat_domain.lower.shape[0] != exponents.shape[0]:
-        raise ValueError(
-            f"domain must match exponents dimension: "
-            f"{flat_domain.lower.shape[0]} vs {exponents.shape[0]}"
-        )
 
     return TaylorModel(
         coeffs,
-        exponents,
+        mia,
         remainder,
         flat_domain,
         flat_center,
@@ -845,7 +833,7 @@ def _taylor_model_constant_impl(
     exponents = leaf_total_degree_exponents(_leaf_shapes, leaf_order)
 
     # Coeffs: constant term is iv.center
-    coeffs = jnp.zeros((*output_shape, exponents.shape[1]), dtype=iv.lower.dtype)
+    coeffs = jnp.zeros((*output_shape, exponents.num_monomials), dtype=iv.lower.dtype)
     coeffs = coeffs.at[..., 0].set(iv.center)
 
     if output_pytree is None:
@@ -979,19 +967,20 @@ def taylor_model_identity(
 
     # Generate exponents with per-leaf total degree bounds
     exponents = leaf_total_degree_exponents(leaf_shapes, leaf_order)
-    num_monomials = exponents.shape[1]
+    exp_arr = exponents.to_jnp()
+    num_monomials = exponents.num_monomials
 
     # Build identity coefficients:
     # - Constant term: center_flat[i] for each output i
     # - Linear term: 1.0 for variable i in output i
 
     # Identify constant monomial (all zeros)
-    is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
+    is_constant = jnp.sum(exp_arr, axis=0) == 0  # (m,)
 
     # Identify linear monomials (unit vectors)
     eye_n = jnp.eye(total_dim, dtype=jnp.int32)  # (total_dim, total_dim)
     is_linear = jnp.all(
-        exponents[:, None, :] == eye_n[:, :, None], axis=0
+        exp_arr[:, None, :] == eye_n[:, :, None], axis=0
     )  # (total_dim, m)
 
     # Build coefficients: coeffs[i, j] = center[i] if constant, 1.0 if linear for var i
@@ -1120,7 +1109,8 @@ def taylor_model_from_function(
 
     # Generate exponents
     exponents = leaf_total_degree_exponents(leaf_shapes, leaf_order)
-    num_monomials = exponents.shape[1]
+    exp_arr = exponents.to_jnp()
+    num_monomials = exponents.num_monomials
 
     # Compute Taylor coefficients using recursive jet
     # work_f takes flat input R^d -> R^n
@@ -1131,9 +1121,10 @@ def taylor_model_from_function(
     input_pytree = PyTreeShape(treedef, leaf_shapes)
 
     if max_k == 0:
+        zero_mia = MultiIndexArray(jnp.zeros((d, 1), dtype=jnp.int32))
         return TaylorModel(
             f_center.reshape(-1, 1),
-            jnp.zeros((d, 1), dtype=jnp.int32),
+            zero_mia,
             icentpert(jnp.zeros(n), jnp.zeros(n)),
             flat_domain,
             flat_center=expansion_center,
@@ -1162,7 +1153,7 @@ def taylor_model_from_function(
     coeffs = jnp.zeros((n, num_monomials), dtype=f_center.dtype)
 
     for i in range(num_monomials):
-        exp = exponents[:, i]  # (d,)
+        exp = exp_arr[:, i]  # (d,)
         order = jnp.sum(exp)
 
         # Only compute coeffs up to per-term order
@@ -1288,7 +1279,8 @@ def tm_evaluate_at_variable(
     v_shifted = value - tm.flat_center[var_idx]
 
     # Compute the scalar factor for each monomial: v_shifted^{exp[var_idx]}
-    var_exps = tm.exponents[var_idx, :]  # (m,)
+    tm_exp_arr = tm.multiindices.to_jnp()  # (d, m)
+    var_exps = tm_exp_arr[var_idx, :]  # (m,)
     var_factors = v_shifted**var_exps  # (m,)
 
     # Multiply coefficients by the variable factors
@@ -1297,7 +1289,7 @@ def tm_evaluate_at_variable(
 
     # Remove the variable from exponents → reduced exponents (d-1, m)
     keep = jnp.concatenate([jnp.arange(var_idx), jnp.arange(var_idx + 1, d)])
-    reduced_exps = tm.exponents[keep, :]  # (d-1, m)
+    reduced_exps = tm_exp_arr[keep, :]  # (d-1, m)
 
     # Group monomials with identical reduced exponents by hashing
     new_d = d - 1
@@ -1338,13 +1330,13 @@ def tm_evaluate_at_variable(
     canonical_exp = leaf_total_degree_exponents(
         new_leaf_shapes, new_leaf_order
     )
-    num_canonical = canonical_exp.shape[1]
+    num_canonical = canonical_exp.num_monomials
 
     # Hash for grouping
     base = max(new_leaf_order) + 2 if new_leaf_order else 2
     powers = base ** jnp.arange(new_d)
     reduced_hash = jnp.sum(reduced_exps * powers[:, None], axis=0)  # (m,)
-    canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)  # (mc,)
+    canonical_hash = jnp.sum(canonical_exp.to_jnp() * powers[:, None], axis=0)  # (mc,)
 
     # For each canonical monomial, sum contributions from matching reduced monomials
     # match[i, j] = True if reduced monomial j maps to canonical monomial i
@@ -1475,12 +1467,13 @@ def tm_integrate_variable(
 
     # --- 1. Shift coefficients ---
     # Each monomial (x_i - c_i)^{e_i} integrates to (x_i - c_i)^{e_i+1} / (e_i+1)
-    var_exps = tm.exponents[var_idx, :]  # (m,)
+    exp_arr = tm.multiindices.to_jnp()  # (d, m)
+    var_exps = exp_arr[var_idx, :]  # (m,)
     divisors = (var_exps + 1).astype(tm.coeffs.dtype)  # (m,)
     shifted_coeffs = tm.coeffs / divisors  # (*output_shape, m)
 
-    # New exponents: increment var_idx row by 1
-    shifted_exponents = tm.exponents.at[var_idx, :].add(1)
+    # New exponents: increment var_idx row by 1 (local jnp array for hash computation)
+    shifted_exponents = exp_arr.at[var_idx, :].add(1)
 
     # --- 2. Starting-point evaluation ---
     # The antiderivative evaluated at x_i = start gives a constant (in x_i)
@@ -1492,7 +1485,7 @@ def tm_integrate_variable(
     start_coeffs = shifted_coeffs * start_powers  # (*output_shape, m)
 
     # The starting-point terms have exponent 0 for var_idx (constant in x_i)
-    start_exponents = tm.exponents.at[var_idx, :].set(
+    start_exponents = exp_arr.at[var_idx, :].set(
         0
     )  # keep other exponents, set var_idx to 0
     # (these are the original exponents since var_idx exponent maps to the
@@ -1516,13 +1509,13 @@ def tm_integrate_variable(
 
     # Generate canonical exponents with the new per-leaf order
     canonical_exp = leaf_total_degree_exponents(leaf_shapes, new_leaf_order)
-    num_canonical = canonical_exp.shape[1]
+    num_canonical = canonical_exp.num_monomials
 
     # Hash-based scatter for both shifted and start terms
     base = max(new_leaf_order) + 2
     powers_hash = base ** jnp.arange(d)
 
-    canonical_hash = jnp.sum(canonical_exp * powers_hash[:, None], axis=0)  # (mc,)
+    canonical_hash = jnp.sum(canonical_exp.to_jnp() * powers_hash[:, None], axis=0)  # (mc,)
     shifted_hash = jnp.sum(shifted_exponents * powers_hash[:, None], axis=0)  # (m,)
     start_hash = jnp.sum(start_exponents * powers_hash[:, None], axis=0)  # (m,)
 
@@ -1552,7 +1545,7 @@ def tm_integrate_variable(
         )
 
         # Scatter from expanded to original canonical basis
-        orig_hash = jnp.sum(orig_canonical_exp * powers_hash[:, None], axis=0)
+        orig_hash = jnp.sum(orig_canonical_exp.to_jnp() * powers_hash[:, None], axis=0)
         keep_scatter = (canonical_hash[:, None] == orig_hash[None, :]).astype(
             tm.coeffs.dtype
         )
@@ -1634,7 +1627,7 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
 
     # Use first TM as reference
     ref = tms[0]
-    exponents = ref.exponents
+    multiindices = ref.multiindices
     # Element-wise max of per-leaf orders
     from functools import reduce
 
@@ -1662,7 +1655,7 @@ def taylor_model_concatenate(tms: list["TaylorModel"], axis: int = 0) -> "Taylor
 
     return TaylorModel(
         coeffs,
-        exponents,
+        multiindices,
         remainder,
         ref.flat_domain,
         flat_center=ref.flat_center,

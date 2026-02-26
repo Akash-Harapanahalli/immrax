@@ -84,7 +84,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         return TaylorModel(
             coeffs=coeffs,
-            exponents=tm_int.exponents,
+            multiindices=tm_int.multiindices,
             remainder=tm_int.remainder + ic_remainder,
             flat_domain=tm_int.flat_domain,
             flat_center=tm_int.flat_center,
@@ -143,7 +143,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
             0.0,
         )
 
-        is_constant = jnp.all(tm.exponents == 0, axis=0)  # (m,)
+        is_constant = jnp.all(tm.multiindices.to_jnp() == 0, axis=0)  # (m,)
 
         new_coeffs = jnp.where(
             is_constant,
@@ -157,7 +157,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
         # Build the new TM with zero remainder first to measure poly bounds
         new_tm = TaylorModel(
             coeffs=new_coeffs,
-            exponents=tm.exponents,
+            multiindices=tm.multiindices,
             remainder=interval(jnp.zeros_like(c0)),
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,
@@ -185,7 +185,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         return TaylorModel(
             coeffs=new_coeffs,
-            exponents=tm.exponents,
+            multiindices=tm.multiindices,
             remainder=interval(final_rem_lo, final_rem_hi),
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,
@@ -209,13 +209,14 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
         conditioned and reduces directional wrapping.
         """
         n = tm.coeffs.shape[0]  # output dimension
-        d = tm.exponents.shape[0]  # domain dimension
+        d = tm.d  # domain dimension
 
         # --- Extract linear coefficient matrix A (n x d) ---
         eye_d = jnp.eye(d, dtype=jnp.int32)
         # is_linear_var[j, k] = True if exponent column k equals e_j
+        tm_exp = tm.multiindices.to_jnp()
         is_linear_var = jnp.all(
-            tm.exponents[None, :, :] == eye_d[:, :, None], axis=1
+            tm_exp[None, :, :] == eye_d[:, :, None], axis=1
         )  # (d, m)
         A = tm.coeffs @ is_linear_var.T.astype(tm.coeffs.dtype)  # (n, d)
 
@@ -233,7 +234,7 @@ class BungerTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         return TaylorModel(
             coeffs=new_coeffs,
-            exponents=tm.exponents,
+            multiindices=tm.multiindices,
             remainder=new_remainder,
             flat_domain=tm.flat_domain,
             flat_center=tm.flat_center,

@@ -11,11 +11,159 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as onp
 from jaxtyping import Array, PyTreeDef
 
 import jax.tree_util
 
 from immrax.inclusion import Interval, iconcatenate
+
+
+# ---------------------------------------------------------------------------
+# MultiIndex and MultiIndexArray
+# ---------------------------------------------------------------------------
+
+
+class MultiIndex(tuple):
+    """Multi-index α = (α₁, ..., αₙ) with αᵢ ∈ ℕ₀.
+
+    Stores the count vector so that standard multi-index notation applies:
+      |α| = Σαᵢ,  α! = Π(αᵢ!),  x^α = Πxᵢ^αᵢ, etc.
+    """
+
+    def __new__(cls, *args):
+        return super().__new__(cls, args)
+
+    def __repr__(self):
+        return f"MultiIndex{super().__repr__()}"
+
+    # --- Component-wise arithmetic ---
+
+    def __add__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return MultiIndex(*(a + b for a, b in zip(self, other)))
+
+    def __sub__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return MultiIndex(*(a - b for a, b in zip(self, other)))
+
+    # --- Component-wise ordering (overrides tuple's lexicographic order) ---
+
+    def __le__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return all(a <= b for a, b in zip(self, other))
+
+    def __lt__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return all(a < b for a, b in zip(self, other))
+
+    def __ge__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return all(a >= b for a, b in zip(self, other))
+
+    def __gt__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return all(a > b for a, b in zip(self, other))
+
+    # --- Multi-index operations ---
+
+    def __abs__(self):
+        """Order of the multi-index: |α| = Σαᵢ."""
+        return sum(self)
+
+    def factorial(self):
+        """α! = α₁! · α₂! · ... · αₙ!"""
+        result = 1
+        for a in self:
+            result *= math.factorial(a)
+        return result
+
+    def inv_factorial(self):
+        """1/α! = exp(-Σᵢ lgamma(αᵢ + 1)), numerically stable via log-gamma."""
+        return math.exp(-sum(math.lgamma(a + 1) for a in self))
+
+    def binomial(self, other):
+        """Binomial coefficient C(α, β) = α! / (β! · (α−β)!), requires β ≤ α."""
+        if not (other <= self):
+            raise ValueError(f"β={other} must be ≤ α={self} component-wise")
+        diff = self - other
+        return self.factorial() // (other.factorial() * diff.factorial())
+
+    def multinomial(self):
+        """Multinomial coefficient: |α|! / α!"""
+        return math.factorial(abs(self)) // self.factorial()
+
+    def power(self, x):
+        """x^α = x₁^α₁ · x₂^α₂ · ... · xₙ^αₙ, requires len(x) == len(α)."""
+        if len(x) != len(self):
+            raise ValueError(f"len(x)={len(x)} must equal len(α)={len(self)}")
+        result = 1
+        for xi, ai in zip(x, self):
+            result = result * xi**ai
+        return result
+
+
+class MultiIndexArray(tuple):
+    """Ordered collection of MultiIndex objects, one per monomial.
+
+    Stores monomials as a tuple of MultiIndex objects, providing a hashable
+    representation of the exponent structure.  Use :meth:`to_jnp` to obtain
+    a ``(d, num_monomials)`` integer JAX array for numerical computation.
+
+    Parameters
+    ----------
+    indices : iterable of MultiIndex, or array-like of shape (d, m)
+        Either a sequence of MultiIndex objects (one per monomial) or a
+        2-D integer array whose columns are the per-monomial exponent vectors.
+    """
+
+    def __new__(cls, indices):
+        if hasattr(indices, "shape"):
+            # numpy / jnp array of shape (d, m) — columns are exponent vectors
+            d, m = indices.shape
+            mis = tuple(
+                MultiIndex(*[int(indices[i, j]) for i in range(d)]) for j in range(m)
+            )
+        else:
+            mis = tuple(indices)
+        return super().__new__(cls, mis)
+
+    def __repr__(self):
+        return f"MultiIndexArray({list(self)!r})"
+
+    # --- Conversion ---
+
+    def to_jnp(self) -> Array:
+        """Return a jnp integer array of shape ``(d, num_monomials)``."""
+        if len(self) == 0:
+            return jnp.zeros((0, 0), dtype=jnp.int32)
+        d = len(self[0])
+        return jnp.array([[mi[i] for mi in self] for i in range(d)], dtype=jnp.int32)
+
+    def to_numpy(self) -> "onp.ndarray":
+        """Return a numpy integer array of shape ``(d, num_monomials)``."""
+        if len(self) == 0:
+            return onp.zeros((0, 0), dtype=onp.int32)
+        d = len(self[0])
+        return onp.array([[mi[i] for mi in self] for i in range(d)], dtype=onp.int32)
+
+    # --- Convenience properties ---
+
+    @property
+    def d(self) -> int:
+        """Number of variables (length of each MultiIndex)."""
+        return len(self[0]) if self else 0
+
+    @property
+    def num_monomials(self) -> int:
+        """Number of monomials stored."""
+        return len(self)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +418,7 @@ def _enumerate_total_degree(dim: int, max_deg: int) -> "list[tuple[int, ...]]":
 @lru_cache(maxsize=128)
 def leaf_total_degree_exponents(
     leaf_shapes: "tuple[tuple[int, ...], ...]", leaf_order: "tuple[int, ...]"
-) -> Array:
+) -> "MultiIndexArray":
     """Generate exponents with per-leaf total degree bounds.
 
     For multi-leaf domains (pytree of Intervals), this generates all monomials
@@ -285,8 +433,8 @@ def leaf_total_degree_exponents(
 
     Returns
     -------
-    Array
-        Exponent matrix, shape (total_dim, num_monomials).
+    MultiIndexArray
+        Tuple of MultiIndex objects, one per monomial.
 
     Example
     -------
@@ -296,7 +444,6 @@ def leaf_total_degree_exponents(
     - Count: (2+1) * C(2+3, 3) = 3 * 10 = 30 monomials
     """
     from itertools import product
-    import numpy as np
 
     leaf_sizes = [math.prod(s) if s else 1 for s in leaf_shapes]
 
@@ -307,13 +454,13 @@ def leaf_total_degree_exponents(
     all_exponents = []
     for combo in product(*leaf_indices):
         flat_exp = [e for leaf_exp in combo for e in leaf_exp]
-        all_exponents.append(flat_exp)
+        all_exponents.append(tuple(flat_exp))
 
-    return np.array(all_exponents, dtype=np.int32).T
+    return MultiIndexArray(MultiIndex(*exp) for exp in all_exponents)
 
 
 def check_leaf_bounds(
-    exponents: Array,
+    multiindices: "MultiIndexArray",
     leaf_shapes: "tuple[tuple[int, ...], ...]",
     leaf_order: "tuple[int, ...]",
 ) -> Array:
@@ -321,8 +468,8 @@ def check_leaf_bounds(
 
     Parameters
     ----------
-    exponents : Array, shape (d, m)
-        Exponent matrix.
+    multiindices : MultiIndexArray
+        Tuple of MultiIndex objects, one per monomial.
     leaf_shapes : tuple[tuple[int, ...], ...]
         Shape of each leaf Interval.
     leaf_order : tuple[int, ...]
@@ -333,6 +480,7 @@ def check_leaf_bounds(
     Array
         Boolean mask of shape (m,), True for monomials within bounds.
     """
+    exponents = multiindices.to_jnp()  # (d, m)
     num_leaves = len(leaf_shapes)
     masks = []
     for leaf_idx in range(num_leaves):
@@ -343,22 +491,23 @@ def check_leaf_bounds(
 
 
 def compute_leaf_order(
-    exponents: Array, leaf_shapes: "tuple[tuple[int, ...], ...]"
+    multiindices: "MultiIndexArray", leaf_shapes: "tuple[tuple[int, ...], ...]"
 ) -> "tuple[int, ...]":
-    """Compute per-leaf total degree from exponent matrix.
+    """Compute per-leaf total degree from a MultiIndexArray.
 
     Parameters
     ----------
-    exponents : Array, shape (d, m)
-        Exponent matrix.
+    multiindices : MultiIndexArray
+        Tuple of MultiIndex objects, one per monomial.
     leaf_shapes : tuple[tuple[int, ...], ...]
         Shape of each leaf Interval.
 
     Returns
     -------
     tuple[int, ...]
-        Per-leaf total degree bounds inferred from exponents.
+        Per-leaf total degree bounds inferred from multiindices.
     """
+    exponents = multiindices.to_jnp()  # (d, m)
     result = []
     for leaf_idx in range(len(leaf_shapes)):
         slc = leaf_slice(leaf_shapes, leaf_idx)
@@ -373,19 +522,24 @@ def compute_leaf_order(
 
 
 def _merge_taylor_terms(
-    coeffs1: Array, exp1: Array, coeffs2: Array, exp2: Array
-) -> "Tuple[Array, Array]":
+    coeffs1: Array,
+    mia1: "MultiIndexArray",
+    coeffs2: Array,
+    mia2: "MultiIndexArray",
+) -> "Tuple[Array, MultiIndexArray]":
     """Merge Taylor terms from two polynomials.
 
     Coeffs have shape (*output_shape, num_monomials).
     Concatenates along the last (monomial) axis.
     """
     coeffs = jnp.concatenate([coeffs1, coeffs2], axis=-1)
-    exp = jnp.concatenate([exp1, exp2], axis=1)
-    return _compact_taylor_terms(coeffs, exp)
+    mia = MultiIndexArray(mia1 + mia2)
+    return _compact_taylor_terms(coeffs, mia)
 
 
-def _compact_taylor_terms(coeffs: Array, exponents: Array) -> "Tuple[Array, Array]":
+def _compact_taylor_terms(
+    coeffs: Array, multiindices: "MultiIndexArray"
+) -> "Tuple[Array, MultiIndexArray]":
     """Compact Taylor terms by zeroing negligible coefficients.
 
     Coeffs have shape (*output_shape, num_monomials).
@@ -402,6 +556,6 @@ def _compact_taylor_terms(coeffs: Array, exponents: Array) -> "Tuple[Array, Arra
 
     nonzero_mask = norms > 1e-12
     coeffs_compact = jnp.where(nonzero_mask, coeffs, 0.0)
-    return coeffs_compact, exponents
+    return coeffs_compact, multiindices
 
 

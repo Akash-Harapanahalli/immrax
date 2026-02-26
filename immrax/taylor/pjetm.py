@@ -36,6 +36,7 @@ from immrax.taylor.taylor_model import (
     _bound_monomials_over_domain,
 )
 from immrax.taylor.base import (
+    MultiIndexArray,
     PyTreeShape,
     leaf_total_degree_exponents,
     check_leaf_bounds,
@@ -56,7 +57,7 @@ def _bound_polynomial(tm: TaylorModel) -> Interval:
     """
     # Bound each monomial over the shifted domain (D - center): shape (m,)
     mono_bounds = _bound_monomials_over_domain(
-        tm.exponents, tm.shifted_domain, tm.max_order
+        tm.multiindices, tm.shifted_domain, tm.max_order
     )
 
     # Combine with coefficients: coeffs (*output_shape, m), mono bounds (m,)
@@ -310,7 +311,7 @@ def _make_tm_passthrough_p(primitive: Primitive) -> Callable[..., TaylorModel]:
 
         return TaylorModel(
             new_coeffs,
-            ref_tm.exponents,
+            ref_tm.multiindices,
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
@@ -385,7 +386,7 @@ def _make_tm_structural_p(primitive, adapt_coeff_kwargs):
 
         return TaylorModel(
             new_coeffs,
-            ref_tm.exponents,
+            ref_tm.multiindices,
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
@@ -467,7 +468,7 @@ def _tm_dynamic_slice_p(x, *start_indices, slice_sizes, max_order=None) -> Taylo
 
     return TaylorModel(
         new_coeffs,
-        x.exponents,
+        x.multiindices,
         interval(new_lower, new_upper),
         x.flat_domain,
         flat_center=x.flat_center,
@@ -538,7 +539,7 @@ def _make_tm_scatter_p(primitive):
 
         return TaylorModel(
             new_coeffs,
-            ref_tm.exponents,
+            ref_tm.multiindices,
             interval(new_lower, new_upper),
             ref_tm.flat_domain,
             flat_center=ref_tm.flat_center,
@@ -642,7 +643,7 @@ def _tm_select_n_p(pred, *cases, max_order=None):
 
     return TaylorModel(
         new_coeffs,
-        ref_tm.exponents,
+        ref_tm.multiindices,
         interval(new_lower, new_upper),
         ref_tm.flat_domain,
         flat_center=ref_tm.flat_center,
@@ -672,7 +673,7 @@ def _tm_split_p(x, *, sizes, axis, max_order=None):
 
     return [
         TaylorModel(
-            c, x.exponents, interval(lo, hi),
+            c, x.multiindices, interval(lo, hi),
             x.flat_domain, flat_center=x.flat_center,
             input_pytree=x.input_pytree,
             output_pytree=PyTreeShape.flat(c.shape[:-1]),
@@ -737,7 +738,7 @@ def _tm_add_p(
 
         # Merge polynomial terms
         new_coeffs, new_exponents = _merge_taylor_terms(
-            x_coeffs, x.exponents, y_coeffs, y.exponents
+            x_coeffs, x.multiindices, y_coeffs, y.multiindices
         )
 
         # Add remainders (Interval addition auto-broadcasts)
@@ -766,7 +767,7 @@ def _tm_add_p(
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, val.shape)
 
         # Create constant term coefficient
-        const_exp = jnp.zeros((x.d, 1), dtype=jnp.int32)
+        const_mia = MultiIndexArray(jnp.zeros((x.d, 1), dtype=jnp.int32))
 
         # Shape the constant coefficient to match broadcast shape
         val_broadcast = jnp.broadcast_to(val, broadcast_shape)
@@ -776,7 +777,7 @@ def _tm_add_p(
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
 
         new_coeffs, new_exponents = _merge_taylor_terms(
-            x_coeffs, x.exponents, const_coeff, const_exp
+            x_coeffs, x.multiindices, const_coeff, const_mia
         )
 
         # Broadcast remainder
@@ -827,7 +828,7 @@ def _tm_neg_p(x: TaylorModel, *, max_order=None) -> TaylorModel:
         return -x
     return TaylorModel(
         -x.coeffs,
-        x.exponents,
+        x.multiindices,
         -x.remainder,
         x.flat_domain,
         flat_center=x.flat_center,
@@ -850,7 +851,7 @@ def _truncate_product(
     ----------
     coeffs : array, shape (*output_shape, num_terms)
         Product coefficients (e.g. from outer product of two monomial sets).
-    exponents : array, shape (d, num_terms)
+    exponents : MultiIndexArray or array, shape (d, num_terms)
         Product exponents (sum of parent exponents for each term pair).
     max_order : int or tuple[int, ...]
         Per-variable maximum polynomial order to retain (used when leaf_shapes is None).
@@ -868,17 +869,25 @@ def _truncate_product(
     truncated_remainder : Interval, shape (*output_shape,)
         Rigorous bound on the contribution of the removed terms.
     """
+    # Normalise to both jnp array and MultiIndexArray forms
+    if isinstance(exponents, MultiIndexArray):
+        mia = exponents
+        exp_arr = exponents.to_jnp()
+    else:
+        exp_arr = exponents
+        mia = MultiIndexArray(exponents)
+
     # Determine keep mask based on mode
     if leaf_shapes is not None and leaf_order is not None:
         # Per-leaf total degree mode
-        keep_mask = check_leaf_bounds(exponents, leaf_shapes, leaf_order)
+        keep_mask = check_leaf_bounds(mia, leaf_shapes, leaf_order)
         static_max = max(leaf_order) * 2
     else:
         # Per-variable mode (original behavior)
         if isinstance(max_order, int):
-            max_order = tuple([max_order] * exponents.shape[0])
+            max_order = tuple([max_order] * exp_arr.shape[0])
         target_arr = jnp.array(max_order, dtype=jnp.int32)[:, None]  # (d, 1)
-        keep_mask = jnp.all(exponents <= target_arr, axis=0)  # (num_terms,)
+        keep_mask = jnp.all(exp_arr <= target_arr, axis=0)  # (num_terms,)
         static_max = (
             max(max_order) * 2 if isinstance(max_order, tuple) else max_order * 2
         )
@@ -887,7 +896,7 @@ def _truncate_product(
     truncated_coeffs = jnp.where(keep_mask, 0.0, coeffs)
 
     # Bound truncated monomials over shifted domain
-    mono_bounds = _bound_monomials_over_domain(exponents, shifted_domain, static_max)
+    mono_bounds = _bound_monomials_over_domain(mia, shifted_domain, static_max)
     mono_lower = mono_bounds.lower
     mono_upper = mono_bounds.upper
 
@@ -920,9 +929,10 @@ def _tm_mul_p(
         m2 = y.num_monomials
 
         # Compute all product exponents: shape (d, m1*m2)
-        exp1 = x.exponents[:, :, None]  # (d, m1, 1)
-        exp2 = y.exponents[:, None, :]  # (d, 1, m2)
+        exp1 = x.multiindices.to_jnp()[:, :, None]  # (d, m1, 1)
+        exp2 = y.multiindices.to_jnp()[:, None, :]  # (d, 1, m2)
         all_exp = (exp1 + exp2).reshape(d, m1 * m2)
+        all_mia = MultiIndexArray(all_exp)
 
         # Broadcast coefficients to compatible shapes
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, m1))
@@ -943,14 +953,12 @@ def _tm_mul_p(
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
             all_coeffs,
-            all_exp,
+            all_mia,
             effective_order,
             x.shifted_domain,
             leaf_shapes=x._leaf_shapes,
             leaf_order=effective_order,
         )
-
-        new_exponents = all_exp
 
         # Compute remainder bounds using Interval operations
         # (p1 + r1) * (p2 + r2) = p1*p2 + p1*r2 + r1*p2 + r1*r2
@@ -967,7 +975,7 @@ def _tm_mul_p(
 
         result = TaylorModel(
             new_coeffs,
-            new_exponents,
+            all_mia,
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
@@ -997,7 +1005,7 @@ def _tm_mul_p(
 
         return TaylorModel(
             new_coeffs,
-            x.exponents,
+            x.multiindices,
             new_remainder,
             x.flat_domain,
             flat_center=x.flat_center,
@@ -1181,7 +1189,7 @@ def _tm_univariate(
 
     return TaylorModel(
         result.coeffs,
-        result.exponents,
+        result.multiindices,
         final_remainder,
         result.flat_domain,
         flat_center=result.flat_center,
@@ -1368,7 +1376,7 @@ def _tm_dot_general_array(arr, tm, dim_nums):
 
     return TaylorModel(
         new_coeffs,
-        tm.exponents,
+        tm.multiindices,
         new_remainder,
         tm.flat_domain,
         flat_center=tm.flat_center,
@@ -1422,7 +1430,7 @@ def _tm_dot_general_p(
             new_remainder = result.remainder.transpose(*rem_perm)
             return TaylorModel(
                 new_coeffs,
-                result.exponents,
+                result.multiindices,
                 new_remainder,
                 result.flat_domain,
                 flat_center=result.flat_center,
@@ -1447,9 +1455,10 @@ def _tm_dot_general_p(
         m2 = B.num_monomials
 
         # Compute product exponents: (d, m1*m2)
-        product_exp = (A.exponents[:, :, None] + B.exponents[:, None, :]).reshape(
-            d, m1 * m2
-        )
+        product_exp = (
+            A.multiindices.to_jnp()[:, :, None] + B.multiindices.to_jnp()[:, None, :]
+        ).reshape(d, m1 * m2)
+        product_mia = MultiIndexArray(product_exp)
 
         # Compute product coefficients via double vmap over monomial axes (last axis)
         def contract_mono_pair(a_mono_coeffs, b_mono_coeffs):
@@ -1471,7 +1480,7 @@ def _tm_dot_general_p(
         # Truncate high-order product terms into remainder
         new_coeffs, truncated_remainder = _truncate_product(
             result_coeffs,
-            product_exp,
+            product_mia,
             effective_order,
             A.shifted_domain,
             leaf_shapes=A._leaf_shapes,
@@ -1497,7 +1506,7 @@ def _tm_dot_general_p(
 
         result = TaylorModel(
             new_coeffs,
-            product_exp,
+            product_mia,
             new_remainder,
             A.flat_domain,
             flat_center=A.flat_center,
@@ -1605,7 +1614,7 @@ def _tm_reduce_sum_p(x: TaylorModel, *, axes, max_order=None, **kwargs) -> Taylo
 
     return TaylorModel(
         new_coeffs,
-        x.exponents,
+        x.multiindices,
         new_remainder,
         x.flat_domain,
         flat_center=x.flat_center,

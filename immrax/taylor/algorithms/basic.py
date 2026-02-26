@@ -77,7 +77,7 @@ class BasicTMFlowpipeGenerator(TMFlowpipeGenerator):
 
         return TaylorModel(
             coeffs=coeffs,
-            exponents=tm_int.exponents,
+            multiindices=tm_int.multiindices,
             remainder=tm_int.remainder + ic_remainder,
             flat_domain=tm_int.flat_domain,
             flat_center=tm_int.flat_center,

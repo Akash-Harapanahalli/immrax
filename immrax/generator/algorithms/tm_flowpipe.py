@@ -165,7 +165,7 @@ def tm_flowpipe_step(
 
     return TaylorModel(
         result.coeffs,
-        result.exponents,
+        result.multiindices,
         new_remainder,
         result.domain_center,
         result.domain_radius,

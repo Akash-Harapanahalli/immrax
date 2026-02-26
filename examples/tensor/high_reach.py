@@ -17,7 +17,7 @@ def f(x):
 alpha = irx.pjet(lambda x: x.T @ x)(irx.identijet(jnp.zeros(2), 3))
 print(alpha)
 print(alpha.coeffs)
-print(alpha.exponents)
+print(alpha.multiindices)
 
 ox = jnp.array([1.0, 0.0])
 jet_x = irx.identijet(ox, 5)
@@ -35,7 +35,7 @@ print(inner(ox))
 res = outer(jet_x)
 print(res)
 print(res.coeffs)
-print(res.exponents)
+print(res.multiindices)
 
 # print(jet_x.evaluate_monomials(ox))
 # print(z_dot_tensor(ox))
@@ -43,4 +43,4 @@ print(res.exponents)
 
 # print(out)
 # print(out.coeffs)
-# print(out.exponents)
+# print(out.multiindices)

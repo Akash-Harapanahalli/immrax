@@ -48,12 +48,12 @@ def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
 
     # Since t is always the first variable, the exponent matrix is structured
     # in [0,0,0,...,1,1,1,...,t_order,t_order,t_order]
-    # i.e., tm.exponents[1:, L * i : L * (i + 1)] is the same for every i
+    # i.e., tm.multiindices.to_jnp()[1:, L * i : L * (i + 1)] is the same for every i
 
-    # t_order = tm.exponents[0, -1]
-    L = tm.exponents.shape[1] // (t_order + 1)
+    # t_order = tm.multiindices.to_jnp()[0, -1]
+    L = tm.multiindices.num_monomials // (t_order + 1)
 
-    exponents = tm.exponents[1:, 0:L]
+    exponents = tm.multiindices.to_jnp()[1:, 0:L]
     coeffs_list = jnp.split(tm.coeffs, t_order + 1, axis=1)
     t_shifted = t - tm.flat_center[0]
     coeffs = jnp.sum(
@@ -68,7 +68,7 @@ def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
     )
     return TaylorModel(
         coeffs=coeffs,
-        exponents=exponents,
+        multiindices=exponents,
         remainder=tm.remainder,
         flat_domain=tm.flat_domain[1:],
         flat_center=tm.flat_center[1:],
@@ -109,12 +109,12 @@ def tps_to_tx(
         The TaylorModel with canonical coefficient structure.
     """
     t_order = len(polys) - 1
-    mon_len = polys[0].exponents.shape[-1]
+    mon_len = polys[0].multiindices.num_monomials
     coeffs = jnp.concatenate(
         [polys[i].coeffs * inv_fact(i) for i in range(t_order + 1)], axis=1
     )
     exponents_top = jnp.repeat(jnp.arange(t_order + 1), mon_len)
-    exponents_bottom = jnp.concatenate([p.exponents for p in polys], axis=1)
+    exponents_bottom = jnp.concatenate([p.multiindices.to_jnp() for p in polys], axis=1)
     exponents = jnp.vstack((exponents_top, exponents_bottom))
 
     if leaf_order is not None:
@@ -366,12 +366,12 @@ class TMFlowpipeGenerator(ABC):
         )
 
         # Compute tube structure metadata from tm0 without running a step
-        mon_len = tm0.polynomial.exponents.shape[1]
+        mon_len = tm0.polynomial.multiindices.num_monomials
         n_out = tm0.coeffs.shape[0]
 
         tube_exponents = jnp.vstack((
             jnp.repeat(jnp.arange(t_order + 1), mon_len),
-            jnp.tile(tm0.polynomial.exponents, (1, t_order + 1)),
+            jnp.tile(tm0.polynomial.multiindices.to_jnp(), (1, t_order + 1)),
         ))
 
         tube_domain = (interval(t0, t0 + dt_max), tm0.domain)

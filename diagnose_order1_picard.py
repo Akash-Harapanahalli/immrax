@@ -74,7 +74,7 @@ for step_idx in range(3):
     # We need to bound it over the domain
     from immrax.taylor.taylor_model import _bound_monomials_over_domain
     mono_bounds = _bound_monomials_over_domain(
-        tube.exponents, tube.shifted_domain, max(tube._per_leaf_order)
+        tube.multiindices, tube.shifted_domain, max(tube._per_leaf_order)
     )
 
     # poly_diff has shape (n_out, n_monomials)

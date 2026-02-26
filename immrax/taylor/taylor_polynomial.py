@@ -10,7 +10,6 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-import numpy as onp
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike, PyTree
 
@@ -18,8 +17,11 @@ from immrax.inclusion import Interval, interval, icentpert
 import jax.tree_util
 
 from immrax.taylor.base import (
+    MultiIndex,
+    MultiIndexArray,
     PyTreeShape,
     leaf_total_degree_exponents,
+    leaf_slice,
     check_leaf_bounds,
     _merge_taylor_terms,
     pack_pytree,
@@ -30,6 +32,20 @@ from immrax.taylor.base import (
 # TaylorModel imported here for to_taylor_model; the property TaylorModel.polynomial
 # lazily imports TaylorPolynomial to avoid a circular eager import.
 from immrax.taylor.taylor_model import TaylorModel
+
+
+def _multiindex_in_leaf_bounds(
+    mi: MultiIndex,
+    leaf_shapes: "tuple[tuple[int, ...], ...]",
+    leaf_order: "tuple[int, ...]",
+) -> bool:
+    """Pure-Python per-leaf bounds check for a single MultiIndex."""
+    for leaf_idx in range(len(leaf_shapes)):
+        slc = leaf_slice(leaf_shapes, leaf_idx)
+        leaf_total = sum(mi[j] for j in range(slc.start, slc.stop))
+        if leaf_total > leaf_order[leaf_idx]:
+            return False
+    return True
 
 
 @register_pytree_node_class
@@ -43,20 +59,20 @@ class TaylorPolynomial:
     ----------
     coeffs : ArrayLike
         Polynomial coefficients, shape ``(*output_shape, num_monomials)``.
-    exponents : ArrayLike
-        Exponent matrix, shape ``(d, num_monomials)``.
+    multiindices : MultiIndexArray
+        Tuple of MultiIndex objects, one per monomial.
     flat_center : ArrayLike
         Expansion point, shape ``(d,)``.
     """
 
     coeffs: Array
-    exponents: Array
+    multiindices: MultiIndexArray
     flat_center: Array
 
     def __init__(
         self,
         coeffs,
-        exponents,
+        multiindices,
         flat_center,
         *,
         input_pytree: "PyTreeShape | None" = None,
@@ -71,7 +87,11 @@ class TaylorPolynomial:
         for user-facing construction with full input validation.
         """
         self.coeffs = jnp.asarray(coeffs)
-        self.exponents = onp.asarray(exponents, dtype=onp.int32)
+        self.multiindices = (
+            multiindices
+            if isinstance(multiindices, MultiIndexArray)
+            else MultiIndexArray(multiindices)
+        )
         self.flat_center = jnp.asarray(flat_center)
         self.input_pytree = input_pytree
         self.output_pytree = output_pytree
@@ -113,7 +133,7 @@ class TaylorPolynomial:
     def tree_flatten(self) -> Tuple[Tuple[Array, Array], tuple]:
         return (
             (self.coeffs, self.flat_center),
-            (self.exponents, self.input_pytree, self.output_pytree, self.leaf_order),
+            (self.multiindices, self.input_pytree, self.output_pytree, self.leaf_order),
         )
 
     @classmethod
@@ -121,10 +141,10 @@ class TaylorPolynomial:
         # Bypass __init__ to avoid jnp.asarray — JAX/equinox may pass
         # non-array sentinels (e.g. booleans) through tree operations.
         coeffs, flat_center = children
-        exponents, input_pytree, output_pytree, leaf_order = aux_data
+        multiindices, input_pytree, output_pytree, leaf_order = aux_data
         obj = object.__new__(cls)
         obj.coeffs = coeffs
-        obj.exponents = onp.asarray(exponents, dtype=onp.int32)
+        obj.multiindices = multiindices  # already a MultiIndexArray from aux_data
         obj.flat_center = flat_center
         obj.input_pytree = input_pytree
         obj.output_pytree = output_pytree
@@ -141,7 +161,7 @@ class TaylorPolynomial:
 
     @property
     def d(self) -> int:
-        return self.exponents.shape[0]
+        return self.multiindices.d
 
     @property
     def num_monomials(self) -> int:
@@ -181,13 +201,14 @@ class TaylorPolynomial:
     @property
     def constant_term(self) -> Array:
         """Constant (order-0) term, shape ``(*output_shape,)``."""
-        is_constant = jnp.all(self.exponents == 0, axis=0)
+        exponents = self.multiindices.to_jnp()  # (d, m)
+        is_constant = jnp.all(exponents == 0, axis=0)
         return jnp.sum(jnp.where(is_constant, self.coeffs, 0.0), axis=-1)
 
     # --- Evaluation ---
 
     def evaluate(self, x: ArrayLike) -> Array:
-        """Evaluate the polynomial at a point.
+        """Evaluate the polynomial at a point using cumprod for monomial computation.
 
         Parameters
         ----------
@@ -202,35 +223,30 @@ class TaylorPolynomial:
         x = jnp.asarray(x)
         dx = x - self.flat_center
         monomials = self.evaluate_monomials(dx)
-        # Coefficients are Taylor coefficients a_alpha: p(x) = sum_alpha a_alpha (x-c)^alpha
         return jnp.sum(self.coeffs * monomials, axis=-1)
 
     def evaluate_monomials(self, dx: ArrayLike) -> Array:
         """Evaluate each monomial (x-center)^alpha at dx = x - center.
 
-        Uses ``lax.integer_pow`` with static Python exponents so that when
-        traced through ``pjet``, only ``integer_pow_p`` primitives appear
-        (which has a correct TP handler via repeated multiplication).
-        The naive ``dx ** exponents`` traces to ``lax.pow_p``, which fails
-        for zero-constant-term TPs.
-
-        # TODO: Make sure this is efficient for large number of monomials
+        Uses ``jnp.cumprod`` to compute all powers of each variable up to
+        its maximum exponent, then gathers the required power per monomial
+        using static Python indices derived from the MultiIndexArray.
         """
-        from jax import lax as _lax
-
         dx = jnp.asarray(dx)
         m = self.num_monomials
-        ones = jnp.ones((), dtype=dx.dtype)
         monomials = jnp.ones(m, dtype=dx.dtype)
         for i in range(self.d):
-            exps_i = self.exponents[i]  # numpy (m,) — static Python values
-            max_k = int(exps_i.max())
+            # Static list of exponents for variable i across all monomials
+            exps_i = [int(mi[i]) for mi in self.multiindices]
+            max_k = max(exps_i)
             if max_k == 0:
                 continue
-            # Precompute dx[i]^k for k=1..max_k via integer_pow (static k)
-            pows = [ones] + [_lax.integer_pow(dx[i], k) for k in range(1, max_k + 1)]
-            # Assemble per-monomial factor using Python list indexing (no JAX gather)
-            var_pow = jnp.stack([pows[int(exps_i[j])] for j in range(m)])
+            # cumprod of [dx[i], dx[i], ..., dx[i]] (length max_k) gives
+            # [dx[i]^1, dx[i]^2, ..., dx[i]^max_k]; prepend 1 for exponent 0.
+            pows_pos = jnp.cumprod(jnp.full(max_k, dx[i]))
+            pows = jnp.concatenate([jnp.ones(1, dtype=dx.dtype), pows_pos])
+            # Gather per-monomial power using static Python integer indices
+            var_pow = jnp.stack([pows[e] for e in exps_i])
             monomials = monomials * var_pow
         return monomials
 
@@ -253,13 +269,19 @@ class TaylorPolynomial:
             order, self._domain_treedef, self._leaf_shapes
         )
         prev_leaf_order = tuple(o - 1 for o in leaf_order)
-        keep_mask = jnp.logical_and(
-            check_leaf_bounds(self.exponents, self._leaf_shapes, leaf_order),
-            ~check_leaf_bounds(self.exponents, self._leaf_shapes, prev_leaf_order),
+        # Compute static boolean list for filtering multiindices
+        keep_list = [
+            _multiindex_in_leaf_bounds(mi, self._leaf_shapes, leaf_order)
+            and not _multiindex_in_leaf_bounds(mi, self._leaf_shapes, prev_leaf_order)
+            for mi in self.multiindices
+        ]
+        keep_mask = jnp.array(keep_list)
+        new_multiindices = MultiIndexArray(
+            mi for mi, k in zip(self.multiindices, keep_list) if k
         )
         return TaylorPolynomial(
             self.coeffs[..., keep_mask],
-            self.exponents[:, keep_mask],
+            new_multiindices,
             self.flat_center,
             input_pytree=self.input_pytree,
             output_pytree=self.output_pytree,
@@ -285,17 +307,17 @@ class TaylorPolynomial:
             Half-width of the bounding box, shape ``(d,)``.
         """
         domain_radius = jnp.asarray(domain_radius)
+        exponents = self.multiindices.to_jnp()  # (d, m)
 
         # Scale coefficients: a_alpha * r^alpha
-        # r^alpha for each monomial: prod_j r_j^{exp_j}
         log_r = jnp.log(jnp.abs(domain_radius) + 1e-30)
-        log_scale = self.exponents.T @ log_r  # (num_monomials,)
+        log_scale = exponents.T @ log_r  # (num_monomials,)
         scale = jnp.exp(log_scale)
 
         scaled_coeffs = self.coeffs * scale  # (*output_shape, m)
 
-        has_odd = jnp.any(self.exponents % 2 == 1, axis=0)
-        is_constant = jnp.all(self.exponents == 0, axis=0)
+        has_odd = jnp.any(exponents % 2 == 1, axis=0)
+        is_constant = jnp.all(exponents == 0, axis=0)
 
         mono_lower = jnp.where(is_constant, 1.0, jnp.where(has_odd, -1.0, 0.0))
         mono_upper = jnp.ones(self.num_monomials)
@@ -335,18 +357,21 @@ class TaylorPolynomial:
 
         leaf_order = tuple(leaf_order)
 
-        canonical_exp = leaf_total_degree_exponents(leaf_shapes, leaf_order)
-        num_canonical = canonical_exp.shape[1]
+        canonical_mia = leaf_total_degree_exponents(leaf_shapes, leaf_order)
+        num_canonical = canonical_mia.num_monomials
 
         # Max order approximation for hashing: take max over all leaves
         max_order_val = max(leaf_order)
         base = max_order_val + 2
         powers = base ** jnp.arange(self.d)
 
-        current_hash = jnp.sum(self.exponents * powers[:, None], axis=0)
+        current_exp = self.multiindices.to_jnp()   # (d, m)
+        canonical_exp = canonical_mia.to_jnp()     # (d, num_canonical)
+
+        current_hash = jnp.sum(current_exp * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
 
-        has_match = check_leaf_bounds(self.exponents, leaf_shapes, leaf_order)
+        has_match = check_leaf_bounds(self.multiindices, leaf_shapes, leaf_order)
 
         if num_canonical > 50:
             sort_perm = jnp.argsort(canonical_hash)
@@ -366,7 +391,7 @@ class TaylorPolynomial:
 
         return TaylorPolynomial(
             new_coeffs,
-            canonical_exp,
+            canonical_mia,
             self.flat_center,
             input_pytree=PyTreeShape(self._domain_treedef, leaf_shapes),
             output_pytree=self.output_pytree,
@@ -382,12 +407,12 @@ class TaylorPolynomial:
             target_order = tuple(target_order)
 
         # Check against per-leaf bounds
-        keep_mask = check_leaf_bounds(self.exponents, self._leaf_shapes, target_order)
+        keep_mask = check_leaf_bounds(self.multiindices, self._leaf_shapes, target_order)
         new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorPolynomial(
             new_coeffs,
-            self.exponents,
+            self.multiindices,
             self.flat_center,
             input_pytree=self.input_pytree,
             output_pytree=self.output_pytree,
@@ -423,7 +448,7 @@ class TaylorPolynomial:
 
         return TaylorModel(
             self.coeffs,
-            self.exponents,
+            self.multiindices,
             remainder,
             domain,
             self.flat_center,
@@ -440,7 +465,7 @@ class TaylorPolynomial:
             raise ValueError("Cannot index into monomial dimension directly")
         return TaylorPolynomial(
             c,
-            self.exponents,
+            self.multiindices,
             self.flat_center,
             input_pytree=self.input_pytree,
             output_pytree=PyTreeShape.flat(c.shape[:-1]),
@@ -491,7 +516,7 @@ class TaylorPolynomial:
 
     def __repr__(self) -> str:
         return (
-            f"TaylorPolynomial(coeffs={self.coeffs!r}, exponents={self.exponents!r}, "
+            f"TaylorPolynomial(coeffs={self.coeffs!r}, multiindices={self.multiindices!r}, "
             f"flat_center={self.flat_center!r})"
         )
 
@@ -508,11 +533,11 @@ def _taylor_polynomial_constant_impl(
     output_shape = val.shape
     _leaf_shapes = input_pytree.leaf_shapes
 
-    # Generate exponents with per-leaf total degree bounds
-    exponents = leaf_total_degree_exponents(_leaf_shapes, leaf_order)
+    # Generate multiindices with per-leaf total degree bounds
+    multiindices = leaf_total_degree_exponents(_leaf_shapes, leaf_order)
 
     # Coeffs: constant term is val, all others zero
-    coeffs = jnp.zeros((*output_shape, exponents.shape[1]), dtype=val.dtype)
+    coeffs = jnp.zeros((*output_shape, multiindices.num_monomials), dtype=val.dtype)
     coeffs = coeffs.at[..., 0].set(val)
 
     if output_pytree is None:
@@ -520,7 +545,7 @@ def _taylor_polynomial_constant_impl(
 
     return TaylorPolynomial(
         coeffs,
-        exponents,
+        multiindices,
         flat_center,
         input_pytree=input_pytree,
         output_pytree=output_pytree,
@@ -598,12 +623,14 @@ def taylor_polynomial_identity(
     TaylorPolynomial
         Identity polynomial satisfying ``p(center) == center``.
     """
+    center = jnp.asarray(center)
     treedef, leaf_shapes, flat_center = pack_pytree(center)
     leaf_order = normalize_leaf_order(order, treedef, leaf_shapes)
     total_dim = flat_center.shape[0]
 
-    # Generate exponents with per-leaf total degree bounds
-    exponents = leaf_total_degree_exponents(leaf_shapes, leaf_order)
+    # Generate multiindices with per-leaf total degree bounds
+    multiindices = leaf_total_degree_exponents(leaf_shapes, leaf_order)
+    exponents = multiindices.to_jnp()  # (d, m)
 
     # Identify constant monomial (all exponents zero)
     is_constant = jnp.sum(exponents, axis=0) == 0  # (m,)
@@ -622,7 +649,7 @@ def taylor_polynomial_identity(
 
     return TaylorPolynomial(
         coeffs,
-        exponents,
+        multiindices,
         flat_center,
         input_pytree=input_pytree,
         output_pytree=output_pytree,
@@ -636,7 +663,7 @@ def taylor_polynomial_concatenate(
     """Concatenate multiple TaylorPolynomials along an output dimension.
 
     Mirrors :func:`taylor_model_concatenate` for TaylorPolynomials.
-    All input TaylorPolynomials must share the same domain (exponents, center).
+    All input TaylorPolynomials must share the same domain (multiindices, center).
 
     Parameters
     ----------
@@ -679,7 +706,7 @@ def taylor_polynomial_concatenate(
 
     return TaylorPolynomial(
         coeffs,
-        ref.exponents,
+        ref.multiindices,
         ref.flat_center,
         input_pytree=ref.input_pytree,
         output_pytree=output_pytree,

@@ -7,6 +7,7 @@ from .interval import Interval, interval, isinterval
 from .jacobian import Permutation, standard_permutation
 from .nif import natif
 from ..taylor import TaylorPolynomial, pjet
+from ..taylor.base import MultiIndex
 
 
 def get_multiindices(n, p):
@@ -16,91 +17,6 @@ def get_multiindices(n, p):
         for i in idx:
             counts[i] += 1
         yield MultiIndex(*counts)
-
-
-class MultiIndex(tuple):
-    """Multi-index α = (α₁, ..., αₙ) with αᵢ ∈ ℕ₀.
-
-    Stores the count vector so that standard multi-index notation applies:
-      |α| = Σαᵢ,  α! = Π(αᵢ!),  x^α = Πxᵢ^αᵢ, etc.
-    """
-
-    def __new__(cls, *args):
-        return super().__new__(cls, args)
-
-    def __repr__(self):
-        return f"MultiIndex{super().__repr__()}"
-
-    # --- Component-wise arithmetic ---
-
-    def __add__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return MultiIndex(*(a + b for a, b in zip(self, other)))
-
-    def __sub__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return MultiIndex(*(a - b for a, b in zip(self, other)))
-
-    # --- Component-wise ordering (overrides tuple's lexicographic order) ---
-
-    def __le__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return all(a <= b for a, b in zip(self, other))
-
-    def __lt__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return all(a < b for a, b in zip(self, other))
-
-    def __ge__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return all(a >= b for a, b in zip(self, other))
-
-    def __gt__(self, other):
-        if not isinstance(other, tuple):
-            return NotImplemented
-        return all(a > b for a, b in zip(self, other))
-
-    # --- Multi-index operations ---
-
-    def __abs__(self):
-        """Order of the multi-index: |α| = Σαᵢ."""
-        return sum(self)
-
-    def factorial(self):
-        """α! = α₁! · α₂! · ... · αₙ!"""
-        result = 1
-        for a in self:
-            result *= math.factorial(a)
-        return result
-
-    def inv_factorial(self):
-        """1/α! = exp(-Σᵢ lgamma(αᵢ + 1)), numerically stable via log-gamma."""
-        return math.exp(-sum(math.lgamma(a + 1) for a in self))
-
-    def binomial(self, other):
-        """Binomial coefficient C(α, β) = α! / (β! · (α−β)!), requires β ≤ α."""
-        if not (other <= self):
-            raise ValueError(f"β={other} must be ≤ α={self} component-wise")
-        diff = self - other
-        return self.factorial() // (other.factorial() * diff.factorial())
-
-    def multinomial(self):
-        """Multinomial coefficient: |α|! / α!"""
-        return math.factorial(abs(self)) // self.factorial()
-
-    def power(self, x):
-        """x^α = x₁^α₁ · x₂^α₂ · ... · xₙ^αₙ, requires len(x) == len(α)."""
-        if len(x) != len(self):
-            raise ValueError(f"len(x)={len(x)} must equal len(α)={len(self)}")
-        result = 1
-        for xi, ai in zip(x, self):
-            result = result * xi**ai
-        return result
 
 
 @register_pytree_node_class
