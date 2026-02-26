@@ -10,6 +10,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as onp
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike, PyTree
 
@@ -70,7 +71,7 @@ class TaylorPolynomial:
         for user-facing construction with full input validation.
         """
         self.coeffs = jnp.asarray(coeffs)
-        self.exponents = jnp.asarray(exponents, dtype=jnp.int32)
+        self.exponents = onp.asarray(exponents, dtype=onp.int32)
         self.flat_center = jnp.asarray(flat_center)
         self.input_pytree = input_pytree
         self.output_pytree = output_pytree
@@ -109,28 +110,25 @@ class TaylorPolynomial:
 
     # --- Pytree methods ---
 
-    def tree_flatten(self) -> Tuple[Tuple[Array, Array, Array], dict]:
+    def tree_flatten(self) -> Tuple[Tuple[Array, Array], tuple]:
         return (
-            (self.coeffs, self.exponents, self.flat_center),
-            {
-                "input_pytree": self.input_pytree,
-                "output_pytree": self.output_pytree,
-                "leaf_order": self.leaf_order,
-            },
+            (self.coeffs, self.flat_center),
+            (self.exponents, self.input_pytree, self.output_pytree, self.leaf_order),
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children) -> "TaylorPolynomial":
         # Bypass __init__ to avoid jnp.asarray — JAX/equinox may pass
         # non-array sentinels (e.g. booleans) through tree operations.
-        coeffs, exponents, flat_center = children
+        coeffs, flat_center = children
+        exponents, input_pytree, output_pytree, leaf_order = aux_data
         obj = object.__new__(cls)
         obj.coeffs = coeffs
-        obj.exponents = exponents
+        obj.exponents = onp.asarray(exponents, dtype=onp.int32)
         obj.flat_center = flat_center
-        obj.input_pytree = aux_data.get("input_pytree") if aux_data else None
-        obj.output_pytree = aux_data.get("output_pytree") if aux_data else None
-        obj.leaf_order = aux_data.get("leaf_order") if aux_data else None
+        obj.input_pytree = input_pytree
+        obj.output_pytree = output_pytree
+        obj.leaf_order = leaf_order
         return obj
 
     # --- Properties ---
@@ -203,18 +201,37 @@ class TaylorPolynomial:
         """
         x = jnp.asarray(x)
         dx = x - self.flat_center
-
-        # Evaluate each monomial: monomial_i = prod_j dx[j]^exponents[j, i]
-        monomials = jnp.prod(dx[:, None] ** self.exponents, axis=0)  # (m,)
-
+        monomials = self.evaluate_monomials(dx)
         # Coefficients are Taylor coefficients a_alpha: p(x) = sum_alpha a_alpha (x-c)^alpha
         return jnp.sum(self.coeffs * monomials, axis=-1)
 
-    def evaluate_monomials(self, x: ArrayLike) -> Array:
-        x = jnp.asarray(x)
-        dx = x - self.flat_center
-        # Evaluate each monomial: monomial_i = prod_j dx[j]^exponents[j, i]
-        monomials = jnp.prod(dx[:, None] ** self.exponents, axis=0)  # (m,)
+    def evaluate_monomials(self, dx: ArrayLike) -> Array:
+        """Evaluate each monomial (x-center)^alpha at dx = x - center.
+
+        Uses ``lax.integer_pow`` with static Python exponents so that when
+        traced through ``pjet``, only ``integer_pow_p`` primitives appear
+        (which has a correct TP handler via repeated multiplication).
+        The naive ``dx ** exponents`` traces to ``lax.pow_p``, which fails
+        for zero-constant-term TPs.
+
+        # TODO: Make sure this is efficient for large number of monomials
+        """
+        from jax import lax as _lax
+
+        dx = jnp.asarray(dx)
+        m = self.num_monomials
+        ones = jnp.ones((), dtype=dx.dtype)
+        monomials = jnp.ones(m, dtype=dx.dtype)
+        for i in range(self.d):
+            exps_i = self.exponents[i]  # numpy (m,) — static Python values
+            max_k = int(exps_i.max())
+            if max_k == 0:
+                continue
+            # Precompute dx[i]^k for k=1..max_k via integer_pow (static k)
+            pows = [ones] + [_lax.integer_pow(dx[i], k) for k in range(1, max_k + 1)]
+            # Assemble per-monomial factor using Python list indexing (no JAX gather)
+            var_pow = jnp.stack([pows[int(exps_i[j])] for j in range(m)])
+            monomials = monomials * var_pow
         return monomials
 
     def evaluate_structured(self, *args):
@@ -451,10 +468,22 @@ class TaylorPolynomial:
     # --- String representation ---
 
     def __str__(self) -> str:
-        in_shapes = self.input_pytree.leaf_shapes if self.input_pytree is not None else None
-        out_shapes = self.output_pytree.leaf_shapes if self.output_pytree is not None else (self._output_shape,)
-        in_str = in_shapes[0] if in_shapes is not None and len(in_shapes) == 1 else in_shapes
-        out_str = out_shapes[0] if out_shapes is not None and len(out_shapes) == 1 else out_shapes
+        in_shapes = (
+            self.input_pytree.leaf_shapes if self.input_pytree is not None else None
+        )
+        out_shapes = (
+            self.output_pytree.leaf_shapes
+            if self.output_pytree is not None
+            else (self._output_shape,)
+        )
+        in_str = (
+            in_shapes[0] if in_shapes is not None and len(in_shapes) == 1 else in_shapes
+        )
+        out_str = (
+            out_shapes[0]
+            if out_shapes is not None and len(out_shapes) == 1
+            else out_shapes
+        )
         return (
             f"TaylorPolynomial(input_shape={in_str}, output_shape={out_str}, "
             f"order={self.order}, monomials={self.num_monomials})"

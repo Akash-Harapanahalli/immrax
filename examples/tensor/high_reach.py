@@ -14,13 +14,13 @@ def f(x):
 
 
 # alpha = irx.identijet(jnp.zeros(2), 2)
-alpha = irx.pjet(lambda x: x.T @ x)(irx.identijet(jnp.zeros(2), 2))
+alpha = irx.pjet(lambda x: x.T @ x)(irx.identijet(jnp.zeros(2), 3))
 print(alpha)
 print(alpha.coeffs)
 print(alpha.exponents)
 
-ox = jnp.array([1.0, 1.0])
-jet_x = irx.identijet(ox, 2)
+ox = jnp.array([1.0, 0.0])
+jet_x = irx.identijet(ox, 5)
 
 
 def inner(x):
