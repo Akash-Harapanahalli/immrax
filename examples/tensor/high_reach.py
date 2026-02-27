@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 # %%
 
-p = 3
+p = 2
 
 
 class VanDerPol(irx.System):
@@ -15,7 +15,8 @@ class VanDerPol(irx.System):
 
     def f(self, t, x):
         x1, x2 = x
-        return jnp.array([x2, -self.mu * (1 - x1**2) * x2 - x1])
+        # return jnp.array([x2, -self.mu * (1 - x1**2) * x2 - x1])
+        return jnp.array([x2, -x1])
 
 
 P = jnp.array([[1.0, 0.0], [0.0, 10.0]])
@@ -68,8 +69,8 @@ class PolyParametope(irx.Parametope):
 
 
 sys = VanDerPol()
-pt0 = PolyParametope(ox, sample_alpha.coeffs, jnp.array(0.1))
-nt0 = irx.L2Normotope(ox, P, 0.1)
+pt0 = PolyParametope(ox, sample_alpha.coeffs, jnp.array(1.0))
+# nt0 = irx.L2Normotope(ox, P, 0.1)
 print(jax.tree_util.tree_flatten(pt0))
 print(jax.tree_util.tree_flatten(nt0))
 
@@ -116,8 +117,8 @@ class PolyParametopeEmbedding(irx.ParametricEmbedding):
         # High order adjoint cancellation
 
         alpha_dot = -res[0].get_to_order(p).coeffs.flatten().at[0].set(0.0)
-        y_dot = irx.natif(eval_R)(ix).upper[0]
-        # y_dot = 0.0
+        # y_dot = irx.natif(eval_R)(ix).upper[0]
+        y_dot = 0.0
 
         return PolyParametope(ox_dot, alpha_dot, y_dot), None
 
@@ -132,11 +133,11 @@ jit_dyn = jax.jit(embsys._dynamics)
 traj = [pt0]
 h = 0.01
 
-for i in range(100):
-    print(i)
+for i in range(1000):
+    print(i, end="\r")
     # traj.append(jit_dyn(0.0, (traj[-1], None))[0])
-    dyn = embsys._dynamics(0.0, (traj[-1], None))[0]
-    # dyn = jit_dyn(0.0, (traj[-1], None))[0]
+    # dyn = embsys._dynamics(0.0, (traj[-1], None))[0]
+    dyn = jit_dyn(0.0, (traj[-1], None))[0]
     ptp1 = PolyParametope(
         traj[-1].ox + h * dyn.ox, traj[-1].alpha + h * dyn.alpha, traj[-1].y + h * dyn.y
     )
@@ -161,7 +162,7 @@ fig, ax = plt.subplots(1, 1, figsize=(6, 6))
 # ax.plot(yy.ox[:, 0], yy.ox[:, 1], "k-", label="center")
 
 # for i in range(0, len(tfinite), 10):
-for i in range(100):
+for i in range(0, 100, 10):
     # ppt = PolyParametope(yy.ox[i], yy.alpha[i], yy.y[i])
     # print(ppt)
     ppt = traj[i]
