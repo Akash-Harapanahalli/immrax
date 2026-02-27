@@ -304,7 +304,9 @@ class PyTreeShape:
     @classmethod
     def from_pytree(cls, pytree) -> "PyTreeShape":
         """Extract PyTreeShape from a pytree, discarding data."""
-        treedef = jax.tree_util.tree_structure(pytree, is_leaf=_is_interval_or_array_leaf)
+        treedef = jax.tree_util.tree_structure(
+            pytree, is_leaf=_is_interval_or_array_leaf
+        )
         leaves = jax.tree_util.tree_leaves(pytree, is_leaf=_is_interval_or_array_leaf)
         leaf_shapes = tuple(leaf.shape for leaf in leaves)
         return cls(treedef, leaf_shapes)
@@ -534,7 +536,8 @@ def _merge_taylor_terms(
     """
     coeffs = jnp.concatenate([coeffs1, coeffs2], axis=-1)
     mia = MultiIndexArray(mia1 + mia2)
-    return _compact_taylor_terms(coeffs, mia)
+    # return _compact_taylor_terms(coeffs, mia)
+    return coeffs, mia
 
 
 def _compact_taylor_terms(
@@ -557,5 +560,3 @@ def _compact_taylor_terms(
     nonzero_mask = norms > 1e-12
     coeffs_compact = jnp.where(nonzero_mask, coeffs, 0.0)
     return coeffs_compact, multiindices
-
-

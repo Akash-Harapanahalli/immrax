@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as onp
 from jax.tree_util import register_pytree_node_class
 from abc import ABC, abstractmethod
 
@@ -53,7 +54,7 @@ def tx_tm_eval(tm: TaylorModel, t: float, t_order: int) -> TaylorModel:
     # t_order = tm.multiindices.to_jnp()[0, -1]
     L = tm.multiindices.num_monomials // (t_order + 1)
 
-    exponents = tm.multiindices.to_jnp()[1:, 0:L]
+    exponents = tm.multiindices.to_numpy()[1:, 0:L]
     coeffs_list = jnp.split(tm.coeffs, t_order + 1, axis=1)
     t_shifted = t - tm.flat_center[0]
     coeffs = jnp.sum(
@@ -113,9 +114,9 @@ def tps_to_tx(
     coeffs = jnp.concatenate(
         [polys[i].coeffs * inv_fact(i) for i in range(t_order + 1)], axis=1
     )
-    exponents_top = jnp.repeat(jnp.arange(t_order + 1), mon_len)
-    exponents_bottom = jnp.concatenate([p.multiindices.to_jnp() for p in polys], axis=1)
-    exponents = jnp.vstack((exponents_top, exponents_bottom))
+    exponents_top = onp.repeat(onp.arange(t_order + 1), mon_len)
+    exponents_bottom = onp.concatenate([p.multiindices.to_numpy() for p in polys], axis=1)
+    exponents = onp.vstack((exponents_top, exponents_bottom))
 
     if leaf_order is not None:
         _domain_treedef, _leaf_shapes, flat_domain = pack_pytree(domain)

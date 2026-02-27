@@ -1,46 +1,168 @@
+# %%
 import jax
 import jax.numpy as jnp
 import immrax as irx
+import matplotlib.pyplot as plt
 
-A = jax.random.normal(jax.random.PRNGKey(0), (2, 2))
-print(A)
+# %%
 
-
-def f(x):
-    # A = jnp.array([[1.0, -1.0], [0.0, 1.0]])
-    # return A @ x
-    # return jnp.array([-2 * x[0], -x[1]])
-    return A @ x
+p = 3
 
 
-# alpha = irx.identijet(jnp.zeros(2), 2)
-alpha = irx.pjet(lambda x: x.T @ x)(irx.identijet(jnp.zeros(2), 3))
-print(alpha)
-print(alpha.coeffs)
-print(alpha.multiindices)
+class VanDerPol(irx.System):
+    def __init__(self):
+        self.mu = 0.5
 
-ox = jnp.array([1.0, 0.0])
-jet_x = irx.identijet(ox, 5)
-
-
-def inner(x):
-    return jax.jvp(alpha.evaluate, (x,), (f(x),))[1]
+    def f(self, t, x):
+        x1, x2 = x
+        return jnp.array([x2, -self.mu * (1 - x1**2) * x2 - x1])
 
 
-outer = irx.pjet(inner)
+P = jnp.array([[1.0, 0.0], [0.0, 10.0]])
+sample_alpha = irx.pjet(lambda x: x.T @ P @ x)(irx.identijet(jnp.zeros(2), p))
+ox = jnp.array([2.0, 0.0])
+# ix = irx.icentpert(ox, 0.5)
 
-print("====")
-print(alpha.evaluate(ox))
-print(inner(ox))
-res = outer(jet_x)
-print(res)
-print(res.coeffs)
-print(res.multiindices)
 
-# print(jet_x.evaluate_monomials(ox))
-# print(z_dot_tensor(ox))
-# print(term(ox))
+@jax.tree_util.register_pytree_node_class
+class PolyParametope(irx.Parametope):
+    def __init__(self, ox, alpha, y):
+        super().__init__(ox, alpha, y)
 
-# print(out)
-# print(out.coeffs)
-# print(out.multiindices)
+    @property
+    def poly(self):
+        return irx.TaylorPolynomial(self.alpha, sample_alpha.multiindices, self.ox)
+
+    def g(self, x):
+        # print('g', self.ox)
+        return self.poly.evaluate(x)
+
+    def plot_projection(self, ax, xi=0, yi=1):
+        aa = jnp.linspace(-3, 3, 101)
+        xx, yy = jnp.meshgrid(aa, aa)
+        # evaluate g on the grid
+        gg = jax.vmap(self.g)(jnp.stack((xx.reshape(-1), yy.reshape(-1)), axis=-1))
+        gg = gg.reshape(xx.shape)
+
+        ax.contour(xx, yy, gg, levels=[self.y], cmap="viridis")
+        return gg
+
+    def iover(self):
+        # sampling based iover for now
+        aa = jnp.linspace(-3, 3, 101)
+        xx, yy = jnp.meshgrid(aa, aa)
+        xx = xx.reshape(-1)
+        yy = yy.reshape(-1)
+        # evaluate g on the grid
+        gg = jax.vmap(self.g)(jnp.stack((xx, yy), axis=-1))
+        mask = gg <= self.y * 1.1
+        xl = jnp.min(jnp.where(mask, xx, jnp.inf))
+        xu = jnp.max(jnp.where(mask, xx, -jnp.inf))
+        yl = jnp.min(jnp.where(mask, yy, jnp.inf))
+        yu = jnp.max(jnp.where(mask, yy, -jnp.inf))
+        return irx.interval(jnp.array([xl, yl]), jnp.array([xu, yu])).scale(1.1)
+
+    @classmethod
+    def from_parametope(cls, pt):
+        return PolyParametope(pt.ox, pt.alpha, pt.y)
+
+
+sys = VanDerPol()
+pt0 = PolyParametope(ox, sample_alpha.coeffs, jnp.array(0.1))
+nt0 = irx.L2Normotope(ox, P, 0.1)
+print(jax.tree_util.tree_flatten(pt0))
+print(jax.tree_util.tree_flatten(nt0))
+
+# plot the initial parametope
+fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+gg = pt0.plot_projection(ax)
+irx.utils.draw_iarray(ax, pt0.iover())
+
+# %%
+
+
+class PolyParametopeEmbedding(irx.ParametricEmbedding):
+    def _initialize(self, pt0):
+        # if not isinstance(pt0, PolyParametope):
+        #     raise ValueError(
+        #         "PolyParametopeEmbedding requires a PolyParametope as the initial set"
+        #     )
+        return None
+
+    def _dynamics(self, t, state):
+        pt, aux = state
+
+        ix = pt.iover()
+
+        def inner(x):
+            prod = jax.jvp(pt.g, (x,), (self.sys.f(t, x),))[1]
+            return jnp.atleast_1d(prod)
+
+        outer = irx.mdit(inner, p)
+        res = outer(ix, pt.ox)
+
+        def eval_pp1(coeffs, x):
+            tp = irx.TaylorPolynomial(
+                coeffs, res[0].get_order(p + 1).multiindices, pt.ox
+            )
+            # print(coeffs)
+            # print(tp.evaluate_monomials(x))
+            return tp.evaluate(x)
+
+        def eval_R(x):
+            return jnp.atleast_1d(irx.natif(eval_pp1)(res[1], x).upper)
+
+        ox_dot = self.sys.f(t, pt.ox)
+        # High order adjoint cancellation
+
+        alpha_dot = -res[0].get_to_order(p).coeffs.flatten().at[0].set(0.0)
+        y_dot = irx.natif(eval_R)(ix).upper[0]
+        # y_dot = 0.0
+
+        return PolyParametope(ox_dot, alpha_dot, y_dot), None
+
+
+embsys = PolyParametopeEmbedding(sys)
+print(embsys._dynamics(0.0, (pt0, None))[0])
+
+# %%
+
+jit_dyn = jax.jit(embsys._dynamics)
+
+traj = [pt0]
+h = 0.01
+
+for i in range(100):
+    print(i)
+    # traj.append(jit_dyn(0.0, (traj[-1], None))[0])
+    dyn = embsys._dynamics(0.0, (traj[-1], None))[0]
+    # dyn = jit_dyn(0.0, (traj[-1], None))[0]
+    ptp1 = PolyParametope(
+        traj[-1].ox + h * dyn.ox, traj[-1].alpha + h * dyn.alpha, traj[-1].y + h * dyn.y
+    )
+    traj.append(ptp1)
+
+# %%
+
+# print(type(pt0))
+# print(embsys._dynamics(0.0, (pt0, None))[0])
+# traj = embsys.compute_reachset(0.0, 1.0, pt0, (), dt=0.01)
+# print(traj)
+
+print(len(traj))
+
+# %%
+
+fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+# tfinite = traj.ts[jnp.isfinite(traj.ts)]
+# yy = traj.ys[0]
+#
+# ax.plot(yy.ox[:, 0], yy.ox[:, 1], "k-", label="center")
+
+# for i in range(0, len(tfinite), 10):
+for i in range(100):
+    # ppt = PolyParametope(yy.ox[i], yy.alpha[i], yy.y[i])
+    # print(ppt)
+    ppt = traj[i]
+    ppt.plot_projection(ax, xi=0, yi=1)

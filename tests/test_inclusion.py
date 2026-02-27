@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import lax
 import pytest
 
 import immrax as irx
@@ -122,6 +123,57 @@ def test_mjacif(jax_fn, eval_point, eval_interval):
 
     # 4. Validate that the interval overapproximates the true Jacobian range
     validate_overapproximation_nd(jax_fn, eval_interval, result)
+
+
+# --- Tests for lax.scan support in natif ---
+
+
+def cumsum(x):
+    """Cumulative sum via lax.scan — exercises carry + y outputs."""
+    _, ys = lax.scan(lambda carry, xi: (carry + xi, carry + xi), jnp.zeros(()), x)
+    return ys
+
+
+def running_max(x):
+    """Running maximum via lax.scan — exercises nonlinear carry."""
+    _, ys = lax.scan(lambda carry, xi: (jnp.maximum(carry, xi), jnp.maximum(carry, xi)), x[0], x)
+    return ys
+
+
+def test_natif_scan_cumsum():
+    """natif correctly propagates intervals through a lax.scan with y outputs."""
+    x = jnp.array([1.0, 2.0, 3.0])
+    iv = irx.icentpert(x, 0.1)
+    result = irx.natif(cumsum)(iv)
+
+    assert isinstance(result, irx.Interval)
+    assert jnp.all(result.lower <= result.upper)
+    ys_at_center = cumsum(x)
+    assert jnp.all(ys_at_center >= result.lower)
+    assert jnp.all(ys_at_center <= result.upper)
+
+
+def test_natif_scan_cumsum_jit():
+    """natif over lax.scan can be jit-compiled."""
+    x = jnp.array([1.0, 2.0, 3.0])
+    iv = irx.icentpert(x, 0.1)
+    result = jax.jit(irx.natif(cumsum))(iv)
+
+    assert isinstance(result, irx.Interval)
+    assert jnp.all(result.lower <= result.upper)
+
+
+def test_natif_scan_running_max():
+    """natif over a nonlinear lax.scan (running max) produces valid bounds."""
+    x = jnp.array([1.0, 3.0, 2.0])
+    iv = irx.icentpert(x, 0.1)
+    result = irx.natif(running_max)(iv)
+
+    assert isinstance(result, irx.Interval)
+    assert jnp.all(result.lower <= result.upper)
+    ys_at_center = running_max(x)
+    assert jnp.all(ys_at_center >= result.lower)
+    assert jnp.all(ys_at_center <= result.upper)
 
 
 # --- Tests for lin_sys ---

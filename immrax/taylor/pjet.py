@@ -34,6 +34,7 @@ from immrax.taylor.taylor_polynomial import (
     _taylor_polynomial_constant_impl,
 )
 from immrax.taylor.base import (
+    MultiIndex,
     MultiIndexArray,
     PyTreeShape,
     check_leaf_bounds,
@@ -371,6 +372,47 @@ _make_tp_structural_p(lax.slice_p, _adapt_slice)
 _make_tp_structural_p(lax.concatenate_p, _adapt_concatenate)
 
 
+# --- Pad (custom: padding_value is a scalar, not array-shaped) ---
+
+
+def _tp_pad_p(operand, padding_value, *, padding_config):
+    if not istaylorpolynomial(operand) and not istaylorpolynomial(padding_value):
+        return lax.pad(operand, padding_value, padding_config)
+
+    ref = operand if istaylorpolynomial(operand) else padding_value
+    m = ref.num_monomials
+
+    if istaylorpolynomial(operand):
+        op_coeffs = operand.coeffs  # (*out_shape, m)
+    else:
+        op_arr = jnp.asarray(operand)
+        op_coeffs = jnp.zeros((*op_arr.shape, m), dtype=op_arr.dtype).at[..., 0].set(op_arr)
+
+    if istaylorpolynomial(padding_value):
+        pv_coeffs = padding_value.coeffs  # (m,) for scalar padding_value
+    else:
+        pv_arr = jnp.asarray(padding_value)
+        pv_coeffs = jnp.zeros(m, dtype=pv_arr.dtype).at[0].set(pv_arr)
+
+    # padding_value must be a scalar for lax.pad; pad each monomial slice separately.
+    new_coeffs = jnp.stack(
+        [lax.pad(op_coeffs[..., k], pv_coeffs[k], padding_config) for k in range(m)],
+        axis=-1,
+    )
+
+    return TaylorPolynomial(
+        new_coeffs,
+        ref.multiindices,
+        ref.flat_center,
+        input_pytree=ref.input_pytree,
+        output_pytree=PyTreeShape.flat(new_coeffs.shape[:-1]),
+        leaf_order=ref.leaf_order,
+    )
+
+
+tp_inclusion_registry[lax.pad_p] = _tp_pad_p
+
+
 # --- Dynamic slice (positional args, can't use structural factory) ---
 
 
@@ -615,7 +657,7 @@ def _tp_add_p(x, y):
     elif istaylorpolynomial(x):
         val = jnp.asarray(y)
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, val.shape)
-        const_mia = MultiIndexArray(jnp.zeros((x.d, 1), dtype=jnp.int32))
+        const_mia = MultiIndexArray([MultiIndex(*([0] * x.d))])
         val_broadcast = jnp.broadcast_to(val, broadcast_shape)
         const_coeff = val_broadcast[..., None]
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, x.num_monomials))
@@ -682,10 +724,9 @@ def _tp_mul_p(x, y, *, max_order: int = None):
         m1 = x.num_monomials
         m2 = y.num_monomials
 
-        exp1 = x.multiindices.to_jnp()[:, :, None]
-        exp2 = y.multiindices.to_jnp()[:, None, :]
-        all_exp = (exp1 + exp2).reshape(d, m1 * m2)
-        all_mia = MultiIndexArray(all_exp)
+        exp1 = x.multiindices.to_numpy()[:, :, None]
+        exp2 = y.multiindices.to_numpy()[:, None, :]
+        all_mia = MultiIndexArray((exp1 + exp2).reshape(d, m1 * m2))
 
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, m1))
         y_coeffs = jnp.broadcast_to(y.coeffs, (*broadcast_shape, m2))
@@ -837,10 +878,10 @@ def _tp_dot_general_p(A, B, *, max_order: int = None, **kwargs):
         m1 = A.num_monomials
         m2 = B.num_monomials
 
-        product_exp = (
-            A.multiindices.to_jnp()[:, :, None] + B.multiindices.to_jnp()[:, None, :]
-        ).reshape(d, m1 * m2)
-        product_mia = MultiIndexArray(product_exp)
+        product_mia = MultiIndexArray(
+            (A.multiindices.to_numpy()[:, :, None] + B.multiindices.to_numpy()[:, None, :])
+            .reshape(d, m1 * m2)
+        )
 
         contract_over_m2 = jax.vmap(
             lambda a, b: lax.dot_general(a, b, dimension_numbers=dimension_numbers),

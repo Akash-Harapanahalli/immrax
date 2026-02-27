@@ -231,6 +231,7 @@ _add_passthrough_to_registry(lax.reduce_min_p)
 _add_passthrough_to_registry(lax.max_p)
 _add_passthrough_to_registry(lax.min_p)
 _add_passthrough_to_registry(lax.exp_p, n_ulps=1)
+_add_passthrough_to_registry(lax.rev_p)
 
 
 def _inclusion_reduce_sum_p(x: Interval, **kwargs) -> Interval:
@@ -339,7 +340,9 @@ def _inclusion_custom_jvp_call_p(primal_fn, jvp_fn, *args, **bind_params) -> Any
     """
     call_jaxpr = primal_fn.f.args[0]
     if isinstance(call_jaxpr, jax.extend.core.ClosedJaxpr):
-        return natif_jaxpr(call_jaxpr.jaxpr, call_jaxpr.consts, *args, rigorous=_get_rigorous())
+        return natif_jaxpr(
+            call_jaxpr.jaxpr, call_jaxpr.consts, *args, rigorous=_get_rigorous()
+        )
     return natif_jaxpr(call_jaxpr, [], *args, rigorous=_get_rigorous())
 
 
@@ -350,33 +353,62 @@ if _custom_jvp_call_primitive is not None:
     inclusion_registry[_custom_jvp_call_primitive] = _inclusion_custom_jvp_call_p
 
 
-def _inclusion_scan_p(*args, **bind_params) -> Interval:
-    # print('in scan')
-    # print(args)
+def _inclusion_scan_p(*args, **bind_params):
+    bind_jaxpr = bind_params["jaxpr"]
+    num_consts = bind_params["num_consts"]
+    num_carry = bind_params["num_carry"]
 
-    # bind_jaxpr = bind_params.pop('jaxpr')
-    # if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr) :
-    #     bind_jaxpr = bind_jaxpr.jaxpr
+    if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
+        body_jaxpr = bind_jaxpr.jaxpr
+        body_consts = bind_jaxpr.consts
+    else:
+        body_jaxpr = bind_jaxpr
+        body_consts = []
 
-    # isinterval = lambda x : isinstance(x, Interval)
-    # getlower = lambda x : x.lower if isinstance(x, Interval) else x
-    # getupper = lambda x : x.upper if isinstance(x, Interval) else x
-    # # carry_l = jax.tree_util.tree_map(getlower, carry, is_leaf=isinterval)
-    # # carry_u = jax.tree_util.tree_map(getupper, carry, is_leaf=isinterval)
-    # # init_l = jax.tree_util.tree_map(getlower, init, is_leaf=isinterval)
-    # # init_u = jax.tree_util.tree_map(getupper, init, is_leaf=isinterval)
-    # args_l = jax.tree.tree_map(getlower, args, is_leaf=isinterval)
-    # args_u = jax.tree.tree_map(getupper, args, is_leaf=isinterval)
+    consts_vals = args[:num_consts]
+    carry_init = args[num_consts : num_consts + num_carry]
+    xs_vals = args[num_consts + num_carry :]
 
-    # def _natif_bind_jaxpr (scan_args_l, scan_args_u, **kwargs) :
-    #     scan_args = jax.tree.tree_map(lambda l, u : interval(l, u), scan_args_l, scan_args_u)
-    #     return natif_jaxpr(bind_jaxpr, [], *scan_args)
+    # Flatten carry and xs pytrees (Intervals → (lower, upper) leaf pairs) so
+    # lax.scan traces body_fn with plain abstract arrays.  Inside body_fn we
+    # unflatten back to the original structure, so natif_jaxpr sees real
+    # Interval objects (isinstance returns True even for abstract-valued ones).
+    carry_flat, carry_treedef = jax.tree_util.tree_flatten(carry_init)
+    xs_flat, xs_treedef = jax.tree_util.tree_flatten(xs_vals)
 
-    # def _f (carry, init) :
+    y_treedef_ref = [None]
 
-    #     return natif_jaxpr(bind_jaxpr, [], carry, init)
+    def body_fn(carry_f, xs_f):
+        carry_in = jax.tree_util.tree_unflatten(carry_treedef, carry_f)
+        xs_in = jax.tree_util.tree_unflatten(xs_treedef, xs_f)
+        out = natif_jaxpr(
+            body_jaxpr,
+            body_consts,
+            *consts_vals,
+            *carry_in,
+            *xs_in,
+            rigorous=_get_rigorous(),
+        )
+        carry_out = out[:num_carry]
+        y_out = out[num_carry:]
+        carry_out_flat, _ = jax.tree_util.tree_flatten(carry_out)
+        y_out_flat, y_treedef = jax.tree_util.tree_flatten(y_out)
+        y_treedef_ref[0] = y_treedef
+        return carry_out_flat, y_out_flat
 
-    raise NotImplementedError("scan not implemented")
+    final_carry_flat, ys_flat = lax.scan(
+        body_fn,
+        carry_flat,
+        xs_flat,
+        length=bind_params.get("length"),
+        reverse=bind_params.get("reverse", False),
+        unroll=bind_params.get("unroll", 1),
+    )
+
+    final_carry = jax.tree_util.tree_unflatten(carry_treedef, final_carry_flat)
+    y_treedef = y_treedef_ref[0]
+    ys = jax.tree_util.tree_unflatten(y_treedef, ys_flat) if y_treedef else []
+    return [*final_carry, *ys]
 
 
 inclusion_registry[lax.scan_p] = _inclusion_scan_p
@@ -822,6 +854,46 @@ inclusion_registry[lax.log1p_p] = _inclusion_log1p_p
 
 Interval.__matmul__ = natif(jnp.matmul)
 Interval.__rmatmul__ = lambda self, other: natif(jnp.matmul)(other, self)
+
+
+def _inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
+    # Basic O(n) implementation of cumprod: scan over the axis, multiplying as we go
+
+    def _cumprod_scan(carry, x):
+        ic = interval(*carry)
+        ix = interval(*x)
+
+        new_ic = ic * ix
+        new_carry = jnp.stack([new_ic.lower, new_ic.upper])
+        return new_carry, new_carry
+
+    # init = (jnp.ones_like(x.lower), jnp.ones_like(x.upper))
+    # Move axis to the front for scanning, then move back at the end
+
+    # print(x, axis)
+
+    xl = jnp.moveaxis(x.lower, axis, 0)
+    xu = jnp.moveaxis(x.upper, axis, 0)
+    xs = jnp.stack([xl, xu], axis=1)  # shape (length, 2, ...)
+
+    init = jnp.ones_like(xs[0])  # shape (2, ...)
+
+    # print(init.shape)
+    # print(xs)
+    # print(xs.shape)
+
+    _, result = lax.scan(_cumprod_scan, init, xs, reverse=reverse)
+
+    # print(result)
+
+    ret = interval(jnp.moveaxis(result[0], 0, axis), jnp.moveaxis(result[1], 0, axis))
+
+    return ret
+
+
+# TODO:: correct this
+_inclusion_cumprod_p.n_ulps = 0
+inclusion_registry[lax.cumprod_p] = _inclusion_cumprod_p
 
 # Some linear algebra routines
 

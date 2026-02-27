@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike, PyTree
+import numpy as onp
 
 from immrax.inclusion import Interval, interval, icentpert
 import jax.tree_util
@@ -246,6 +247,7 @@ class TaylorPolynomial:
             pows_pos = jnp.cumprod(jnp.full(max_k, dx[i]))
             pows = jnp.concatenate([jnp.ones(1, dtype=dx.dtype), pows_pos])
             # Gather per-monomial power using static Python integer indices
+            # print(pows, exps_i)
             var_pow = jnp.stack([pows[e] for e in exps_i])
             monomials = monomials * var_pow
         return monomials
@@ -275,7 +277,7 @@ class TaylorPolynomial:
             and not _multiindex_in_leaf_bounds(mi, self._leaf_shapes, prev_leaf_order)
             for mi in self.multiindices
         ]
-        keep_mask = jnp.array(keep_list)
+        keep_mask = onp.array(keep_list)
         new_multiindices = MultiIndexArray(
             mi for mi, k in zip(self.multiindices, keep_list) if k
         )
@@ -291,6 +293,32 @@ class TaylorPolynomial:
     def evaluate_order(self, order: "int | tuple[int, ...]", x: ArrayLike) -> Array:
         """Evaluate the p-th term of the Taylor expansion at the point x."""
         return self.get_order(order).evaluate(x)
+
+    def get_to_order(self, order: "int | tuple[int, ...]") -> "TaylorPolynomial":
+        leaf_order = normalize_leaf_order(
+            order, self._domain_treedef, self._leaf_shapes
+        )
+        # Compute static boolean list for filtering multiindices
+        keep_list = [
+            _multiindex_in_leaf_bounds(mi, self._leaf_shapes, leaf_order)
+            for mi in self.multiindices
+        ]
+        keep_mask = onp.array(keep_list)
+        new_multiindices = MultiIndexArray(
+            mi for mi, k in zip(self.multiindices, keep_list) if k
+        )
+        return TaylorPolynomial(
+            self.coeffs[..., keep_mask],
+            new_multiindices,
+            self.flat_center,
+            input_pytree=self.input_pytree,
+            output_pytree=self.output_pytree,
+            leaf_order=leaf_order,
+        )
+
+    def evaluate_to_order(self, order: "int | tuple[int, ...]", x: ArrayLike) -> Array:
+        """Evaluate the Taylor expansion up to and including the specified order at the point x."""
+        return self.get_to_order(order).evaluate(x)
 
     # --- Bounding ---
 
@@ -365,8 +393,8 @@ class TaylorPolynomial:
         base = max_order_val + 2
         powers = base ** jnp.arange(self.d)
 
-        current_exp = self.multiindices.to_jnp()   # (d, m)
-        canonical_exp = canonical_mia.to_jnp()     # (d, num_canonical)
+        current_exp = self.multiindices.to_jnp()  # (d, m)
+        canonical_exp = canonical_mia.to_jnp()  # (d, num_canonical)
 
         current_hash = jnp.sum(current_exp * powers[:, None], axis=0)
         canonical_hash = jnp.sum(canonical_exp * powers[:, None], axis=0)
@@ -407,7 +435,9 @@ class TaylorPolynomial:
             target_order = tuple(target_order)
 
         # Check against per-leaf bounds
-        keep_mask = check_leaf_bounds(self.multiindices, self._leaf_shapes, target_order)
+        keep_mask = check_leaf_bounds(
+            self.multiindices, self._leaf_shapes, target_order
+        )
         new_coeffs = jnp.where(keep_mask, self.coeffs, 0.0)
 
         return TaylorPolynomial(

@@ -36,6 +36,7 @@ from immrax.taylor.taylor_model import (
     _bound_monomials_over_domain,
 )
 from immrax.taylor.base import (
+    MultiIndex,
     MultiIndexArray,
     PyTreeShape,
     leaf_total_degree_exponents,
@@ -767,7 +768,7 @@ def _tm_add_p(
         broadcast_shape = jnp.broadcast_shapes(x._output_shape, val.shape)
 
         # Create constant term coefficient
-        const_mia = MultiIndexArray(jnp.zeros((x.d, 1), dtype=jnp.int32))
+        const_mia = MultiIndexArray([MultiIndex(*([0] * x.d))])
 
         # Shape the constant coefficient to match broadcast shape
         val_broadcast = jnp.broadcast_to(val, broadcast_shape)
@@ -929,10 +930,10 @@ def _tm_mul_p(
         m2 = y.num_monomials
 
         # Compute all product exponents: shape (d, m1*m2)
-        exp1 = x.multiindices.to_jnp()[:, :, None]  # (d, m1, 1)
-        exp2 = y.multiindices.to_jnp()[:, None, :]  # (d, 1, m2)
-        all_exp = (exp1 + exp2).reshape(d, m1 * m2)
-        all_mia = MultiIndexArray(all_exp)
+        all_mia = MultiIndexArray(
+            (x.multiindices.to_numpy()[:, :, None] + y.multiindices.to_numpy()[:, None, :])
+            .reshape(d, m1 * m2)
+        )
 
         # Broadcast coefficients to compatible shapes
         x_coeffs = jnp.broadcast_to(x.coeffs, (*broadcast_shape, m1))
@@ -1455,10 +1456,10 @@ def _tm_dot_general_p(
         m2 = B.num_monomials
 
         # Compute product exponents: (d, m1*m2)
-        product_exp = (
-            A.multiindices.to_jnp()[:, :, None] + B.multiindices.to_jnp()[:, None, :]
-        ).reshape(d, m1 * m2)
-        product_mia = MultiIndexArray(product_exp)
+        product_mia = MultiIndexArray(
+            (A.multiindices.to_numpy()[:, :, None] + B.multiindices.to_numpy()[:, None, :])
+            .reshape(d, m1 * m2)
+        )
 
         # Compute product coefficients via double vmap over monomial axes (last axis)
         def contract_mono_pair(a_mono_coeffs, b_mono_coeffs):
