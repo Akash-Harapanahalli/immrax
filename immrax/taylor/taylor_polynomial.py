@@ -208,13 +208,17 @@ class TaylorPolynomial:
 
     # --- Evaluation ---
 
-    def evaluate(self, x: ArrayLike) -> Array:
-        """Evaluate the polynomial at a point using cumprod for monomial computation.
+    def evaluate(self, x: ArrayLike, method: str = 'horner') -> Array:
+        """Evaluate the polynomial at a point.
 
         Parameters
         ----------
         x : ArrayLike
             Point, shape ``(d,)``.
+        method : str, optional
+            Evaluation method.  ``'horner'`` (default) uses a tensor Horner
+            sweep; ``'standard'`` uses cumprod to compute monomials directly.
+            This is a static Python argument — it is not traced by JAX.
 
         Returns
         -------
@@ -223,8 +227,42 @@ class TaylorPolynomial:
         """
         x = jnp.asarray(x)
         dx = x - self.flat_center
-        monomials = self.evaluate_monomials(dx)
-        return jnp.sum(self.coeffs * monomials, axis=-1)
+
+        if method == 'standard':
+            monomials = self.evaluate_monomials(dx)
+            return jnp.sum(self.coeffs * monomials, axis=-1)
+        elif method == 'horner':
+            d = self.d
+            K = self.max_order
+            output_shape = self._output_shape
+            base = K + 1  # degree slots per variable: 0 … K
+
+            # Scatter coefficients into a dense (*output_shape, K+1, …, K+1) tensor.
+            exps_np = self.multiindices.to_numpy()  # (d, m), always concrete
+            if d > 0:
+                strides = onp.array(
+                    [base ** (d - 1 - i) for i in range(d)], dtype=onp.int64
+                )
+                flat_idx = strides @ exps_np  # (m,) flat index into (K+1)^d cube
+            else:
+                flat_idx = onp.zeros(self.num_monomials, dtype=onp.int64)
+
+            T_flat = jnp.zeros((*output_shape, base**d), dtype=self.dtype)
+            T_flat = T_flat.at[..., flat_idx].add(self.coeffs)
+            T = T_flat.reshape(*output_shape, *([base] * d))
+
+            # One 1-D Horner sweep per variable, last to first.
+            # Each sweep collapses the trailing axis.
+            current = T
+            for i in range(d - 1, -1, -1):
+                result = current[..., K]
+                for k in range(K - 1, -1, -1):
+                    result = current[..., k] + dx[i] * result
+                current = result
+
+            return current
+        else:
+            raise ValueError(f"Unknown evaluation method {method!r}; expected 'horner' or 'standard'")
 
     def evaluate_monomials(self, dx: ArrayLike) -> Array:
         """Evaluate each monomial (x-center)^alpha at dx = x - center.
@@ -251,6 +289,31 @@ class TaylorPolynomial:
             var_pow = jnp.stack([pows[e] for e in exps_i])
             monomials = monomials * var_pow
         return monomials
+
+    def interval_evaluate(self, ix: Interval, method: str = 'horner') -> Interval:
+        """Bound the polynomial over the interval ``ix``.
+
+        Delegates to ``natif(partial(self.evaluate, method=method))``, so the
+        same evaluation graph used for real inputs is lifted to interval
+        arithmetic.  The default ``'horner'`` method organises coefficients
+        into a d-way tensor and applies one 1-D Horner sweep per variable,
+        capturing cross-variable interactions that termwise bounds would miss.
+
+        Parameters
+        ----------
+        ix : Interval
+            Input box, shape ``(d,)``.
+        method : str, optional
+            Evaluation method passed to :meth:`evaluate` (default ``'horner'``).
+
+        Returns
+        -------
+        Interval
+            Overapproximation of polynomial range, shape ``(*output_shape,)``.
+        """
+        from functools import partial
+        from immrax.inclusion.nif import natif as _natif
+        return _natif(partial(self.evaluate, method=method))(ix)
 
     def evaluate_structured(self, *args):
         treedef, leaf_shapes, flat_x = pack_pytree(args)

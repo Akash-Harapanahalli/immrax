@@ -856,7 +856,7 @@ Interval.__matmul__ = natif(jnp.matmul)
 Interval.__rmatmul__ = lambda self, other: natif(jnp.matmul)(other, self)
 
 
-def __inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
+def _inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
     # Basic O(n) implementation of cumprod: scan over the axis, multiplying as we go
 
     def _cumprod_scan(carry, x):
@@ -886,12 +886,12 @@ def __inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
 
     # print(result)
 
-    ret = interval(jnp.moveaxis(result[0], 0, axis), jnp.moveaxis(result[1], 0, axis))
+    ret = interval(jnp.moveaxis(result[:, 0], 0, axis), jnp.moveaxis(result[:, 1], 0, axis))
 
     return ret
 
 
-def _inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
+def _fake_inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
     # TODO: fix this
     # return interval(
     #     lax.cumprod(x.lower, axis=axis, reverse=reverse),
