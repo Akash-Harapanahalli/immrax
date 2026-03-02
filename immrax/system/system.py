@@ -81,7 +81,9 @@ class System(abc.ABC):
         return self.f(*args, **kwargs)
 
     @partial(
-        jax.jit, static_argnums=(0, 4), static_argnames=("solver", "f_kwargs", "inputs")
+        jax.jit,
+        static_argnums=(0, 4),
+        static_argnames=("solver", "f_kwargs", "inputs", "dense", "max_steps"),
     )
     def compute_trajectory(
         self,
@@ -93,6 +95,8 @@ class System(abc.ABC):
         *,
         solver: Union[Literal["euler", "rk45", "tsit5"], AbstractSolver] = "tsit5",
         f_kwargs: immutabledict = immutabledict({}),
+        dense: bool = False,
+        max_steps: int = 4096,
         **kwargs,
     ) -> RawTrajectory:
         """Computes the trajectory of the system from time t0 to tf with initial condition x0.
@@ -113,6 +117,8 @@ class System(abc.ABC):
             Solver to use for diffrax, by default 'tsit5'
         f_kwargs : immutabledict, optional
             An immutabledict to pass as keyword arguments to the dynamics f, by default {}
+        dense : bool, optional
+            Whether to save the trajectory at all time steps (dense) or only at t0, tf, and steps of size dt (sparse), by default False
         **kwargs :
             Additional kwargs to pass to the solver from diffrax
 
@@ -139,9 +145,33 @@ class System(abc.ABC):
             else:
                 raise Exception(f"{solver=} is not a valid solver")
 
-            saveat = SaveAt(t0=True, t1=True, steps=True)
-            sol = diffeqsolve(term, solver, t0, tf, dt, x0, saveat=saveat, **kwargs)
-            return RawContinuousTrajectory(sol)
+            if not dense:
+                saveat = kwargs.pop("saveat", SaveAt(t0=True, t1=True, steps=True))
+                sol = diffeqsolve(
+                    term,
+                    solver,
+                    t0,
+                    tf,
+                    dt,
+                    x0,
+                    saveat=saveat,
+                    max_steps=max_steps,
+                    **kwargs,
+                )
+                return RawContinuousTrajectory(sol)
+            else:
+                saveat = SaveAt(dense=True)
+                return diffeqsolve(
+                    term,
+                    solver,
+                    t0,
+                    tf,
+                    dt,
+                    x0,
+                    saveat=saveat,
+                    max_steps=max_steps,
+                    **kwargs,
+                )
 
         elif self.evolution == "discrete":
             if not (

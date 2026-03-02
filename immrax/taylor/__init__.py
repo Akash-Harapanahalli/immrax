@@ -32,6 +32,7 @@ from .base import (
 
 from .taylor_polynomial import (
     TaylorPolynomial,
+    taylor_polynomial,
     taylor_polynomial_concatenate,
     taylor_polynomial_constant,
     taylor_polynomial_identity,
@@ -73,6 +74,7 @@ __all__ = [
     "integrate_variable",
     # Taylor Polynomial class and constructors
     "TaylorPolynomial",
+    "taylor_polynomial",
     "taylor_polynomial_concatenate",
     "taylor_polynomial_constant",
     "taylor_polynomial_identity",

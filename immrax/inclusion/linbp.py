@@ -372,78 +372,163 @@ def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
 linbp_registry[lax.dot_general_p] = _linbp_dot_general_p
 
 
-def _linbp_broadcast_in_dim_p(x, *, relu_mode, shape, broadcast_dimensions, **kwargs):
-    n_in = x.n_in
-    new_shape = (*shape, n_in)
-    new_broadcast_dims = tuple(list(broadcast_dimensions) + [len(shape)])
-    lA = lax.broadcast_in_dim(x.lA, new_shape, new_broadcast_dims)
-    uA = lax.broadcast_in_dim(x.uA, new_shape, new_broadcast_dims)
-    lb = lax.broadcast_in_dim(x.lb, shape, broadcast_dimensions)
-    ub = lax.broadcast_in_dim(x.ub, shape, broadcast_dimensions)
-    l = lax.broadcast_in_dim(x.l, shape, broadcast_dimensions)
-    u = lax.broadcast_in_dim(x.u, shape, broadcast_dimensions)
-    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
+def _make_linbp_structural_p(primitive):
+    """Factory for pure structural (shape/index) linbp handlers.
+
+    Mirrors :func:`_make_inclusion_passthrough_p` in nif.py.  Data arrays
+    (l, u, lb, ub) are processed by applying the primitive directly.
+    A-matrix arrays (lA, uA, shape ``(*S, n_in)``) are processed by vmapping
+    over the trailing ``n_in`` axis so the primitive always sees shape ``S`` —
+    no per-primitive kwarg adjustment is needed.
+
+    For plain-array arguments the linear contribution is implicitly zero
+    (their A-matrix slot is filled with zeros before vmapping).
+
+    Works for both single-result and multiple-result primitives (e.g.
+    ``split_p``); in the latter case a list of :class:`LinearBound` is
+    returned.
+    """
+    is_multi = primitive.multiple_results
+
+    def handler(*args, relu_mode, **kwargs):
+        n_in = next(a.n_in for a in args if isinstance(a, LinearBound))
+
+        def _data(a, f):
+            return getattr(a, f) if isinstance(a, LinearBound) else a
+
+        def _A(a, f):
+            if isinstance(a, LinearBound):
+                return getattr(a, f)
+            arr = jnp.asarray(a)
+            return jnp.zeros((*arr.shape, n_in), dtype=arr.dtype)
+
+        l  = primitive.bind(*[_data(a, "l")  for a in args], **kwargs)
+        u  = primitive.bind(*[_data(a, "u")  for a in args], **kwargs)
+        lb = primitive.bind(*[_data(a, "lb") for a in args], **kwargs)
+        ub = primitive.bind(*[_data(a, "ub") for a in args], **kwargs)
+
+        _fn = lambda *xs: primitive.bind(*xs, **kwargs)
+
+        def _apply_A(f):
+            As = [_A(a, f) for a in args]
+            return jax.vmap(_fn, in_axes=[-1] * len(As), out_axes=-1)(*As)
+
+        if is_multi:
+            lA_parts = _apply_A("lA")
+            uA_parts = _apply_A("uA")
+            return [
+                LinearBound(lA=lAi, lb=lbi, uA=uAi, ub=ubi, l=li, u=ui)
+                for lAi, lbi, uAi, ubi, li, ui
+                in zip(lA_parts, lb, uA_parts, ub, l, u)
+            ]
+        return LinearBound(lA=_apply_A("lA"), lb=lb, uA=_apply_A("uA"), ub=ub, l=l, u=u)
+
+    return handler
 
 
-linbp_registry[lax.broadcast_in_dim_p] = _linbp_broadcast_in_dim_p
+def _add_structural_to_linbp_registry(primitive):
+    """Register a structural primitive using the unified vmap-based factory."""
+    linbp_registry[primitive] = _make_linbp_structural_p(primitive)
 
 
-def _linbp_reshape_p(x, *, relu_mode, new_sizes, dimensions=None, **kwargs):
-    n_in = x.n_in
-    lA = x.lA.reshape(*new_sizes, n_in)
-    uA = x.uA.reshape(*new_sizes, n_in)
-    lb = x.lb.reshape(new_sizes)
-    ub = x.ub.reshape(new_sizes)
-    l = x.l.reshape(new_sizes)
-    u = x.u.reshape(new_sizes)
-    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
+for _p in [
+    lax.reshape_p,
+    lax.slice_p,
+    lax.broadcast_in_dim_p,
+    lax.transpose_p,
+    lax.squeeze_p,
+    lax.concatenate_p,
+    lax.convert_element_type_p,
+]:
+    _add_structural_to_linbp_registry(_p)
+
+if hasattr(lax, "split_p"):
+    _add_structural_to_linbp_registry(lax.split_p)
+if hasattr(lax, "dynamic_slice_p"):
+    _add_structural_to_linbp_registry(lax.dynamic_slice_p)
+if hasattr(lax, "gather_p"):
+    _add_structural_to_linbp_registry(lax.gather_p)
 
 
-linbp_registry[lax.reshape_p] = _linbp_reshape_p
+def _make_linbp_scatter_p(primitive):
+    """Factory for scatter-family linbp handlers.
+
+    scatter_indices is always a plain integer array (never a LinearBound), so
+    it is captured as a constant and not vmapped.  Only the A-matrices of
+    operand and updates are vmapped over the trailing n_in axis.
+    """
+    def handler(operand, scatter_indices, updates, *, relu_mode, **kwargs):
+        n_in = next(a.n_in for a in [operand, updates] if isinstance(a, LinearBound))
+
+        def _d(a, f):
+            return getattr(a, f) if isinstance(a, LinearBound) else a
+
+        def _A(a, f):
+            if isinstance(a, LinearBound):
+                return getattr(a, f)
+            arr = jnp.asarray(a)
+            return jnp.zeros((*arr.shape, n_in), dtype=arr.dtype)
+
+        _scat = lambda op, upd: primitive.bind(op, scatter_indices, upd, **kwargs)
+
+        l  = _scat(_d(operand, "l"),  _d(updates, "l"))
+        u  = _scat(_d(operand, "u"),  _d(updates, "u"))
+        lb = _scat(_d(operand, "lb"), _d(updates, "lb"))
+        ub = _scat(_d(operand, "ub"), _d(updates, "ub"))
+
+        def _apply_A(f):
+            return jax.vmap(
+                lambda op_k, upd_k: primitive.bind(op_k, scatter_indices, upd_k, **kwargs),
+                in_axes=(-1, -1), out_axes=-1,
+            )(_A(operand, f), _A(updates, f))
+
+        return LinearBound(lA=_apply_A("lA"), lb=lb, uA=_apply_A("uA"), ub=ub, l=l, u=u)
+
+    return handler
 
 
-def _linbp_transpose_p(x, *, relu_mode, permutation, **kwargs):
-    perm = list(permutation)
-    n_in_axis = len(perm)
-    lA = jnp.transpose(x.lA, perm + [n_in_axis])
-    uA = jnp.transpose(x.uA, perm + [n_in_axis])
-    lb = jnp.transpose(x.lb, perm)
-    ub = jnp.transpose(x.ub, perm)
-    l = jnp.transpose(x.l, perm)
-    u = jnp.transpose(x.u, perm)
-    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
+for _p_name in ["scatter_p", "scatter_add_p", "scatter_mul_p"]:
+    if hasattr(lax, _p_name):
+        linbp_registry[getattr(lax, _p_name)] = _make_linbp_scatter_p(getattr(lax, _p_name))
 
 
-linbp_registry[lax.transpose_p] = _linbp_transpose_p
+def _linbp_select_n_p(which, *cases, relu_mode, **kwargs):
+    """select_n_p (lax.select_n) handler.
+
+    which is always a plain integer array (never a LinearBound), so it is
+    captured as a constant and not vmapped.  A-matrices for each case are
+    vmapped over the trailing n_in axis with which held fixed.
+    """
+    n_in = next(a.n_in for a in cases if isinstance(a, LinearBound))
+
+    def _d(a, f):
+        return getattr(a, f) if isinstance(a, LinearBound) else a
+
+    def _A(a, f):
+        if isinstance(a, LinearBound):
+            return getattr(a, f)
+        arr = jnp.asarray(a)
+        return jnp.zeros((*arr.shape, n_in), dtype=arr.dtype)
+
+    _sel = lambda *cs: lax.select_n_p.bind(which, *cs, **kwargs)
+
+    l  = _sel(*[_d(c, "l")  for c in cases])
+    u  = _sel(*[_d(c, "u")  for c in cases])
+    lb = _sel(*[_d(c, "lb") for c in cases])
+    ub = _sel(*[_d(c, "ub") for c in cases])
+
+    def _apply_A(f):
+        cases_A = [_A(c, f) for c in cases]
+        return jax.vmap(
+            lambda *cs_k: lax.select_n_p.bind(which, *cs_k, **kwargs),
+            in_axes=(-1,) * len(cases), out_axes=-1,
+        )(*cases_A)
+
+    return LinearBound(lA=_apply_A("lA"), lb=lb, uA=_apply_A("uA"), ub=ub, l=l, u=u)
 
 
-def _linbp_squeeze_p(x, *, relu_mode, dimensions, **kwargs):
-    n_in = x.n_in
-    # Axes to squeeze in the data array; don't squeeze the n_in axis
-    data_ndim = x.lA.ndim - 1  # ndim of shape S
-    lA = jnp.squeeze(x.lA, axis=tuple(dimensions))
-    uA = jnp.squeeze(x.uA, axis=tuple(dimensions))
-    lb = jnp.squeeze(x.lb, axis=tuple(dimensions))
-    ub = jnp.squeeze(x.ub, axis=tuple(dimensions))
-    l = jnp.squeeze(x.l, axis=tuple(dimensions))
-    u = jnp.squeeze(x.u, axis=tuple(dimensions))
-    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
-
-
-linbp_registry[lax.squeeze_p] = _linbp_squeeze_p
-
-
-def _linbp_convert_element_type_p(x, *, relu_mode, new_dtype, **kwargs):
-    lA = x.lA.astype(new_dtype)
-    uA = x.uA.astype(new_dtype)
-    lb = x.lb.astype(new_dtype)
-    ub = x.ub.astype(new_dtype)
-    l = x.l.astype(new_dtype)
-    u = x.u.astype(new_dtype)
-    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
-
-
-linbp_registry[lax.convert_element_type_p] = _linbp_convert_element_type_p
+if hasattr(lax, "select_n_p"):
+    linbp_registry[lax.select_n_p] = _linbp_select_n_p
 
 
 def _linbp_max_p(x, y, *, relu_mode, **kwargs):
@@ -661,6 +746,313 @@ def _linbp_logistic_p(x, *, relu_mode, **kwargs):
 
 
 linbp_registry[lax.logistic_p] = _linbp_logistic_p
+
+
+def _linbp_tanh_p(x, *, relu_mode, **kwargs):
+    """Tanh handler using chord slope and critical-point tangent intercepts.
+
+    tanh is S-shaped (convex x < 0, concave x > 0) with tanh'(x) = 1 − tanh²(x).
+    Uses the same chord-slope strategy as _linbp_logistic_p:
+      α = (tanh(u) − tanh(l)) / (u − l)   (chord slope, ∈ (0, 1])
+
+    Critical points where tanh'(x*) = α  →  tanh(x*) = ±√(1−α):
+      x*_upper = atanh(√(1−α))  (concave region, x ≥ 0, gives max of tanh − α·x)
+      x*_lower = −x*_upper       (convex region,  x ≤ 0, gives min of tanh − α·x)
+
+    β_u = tanh(x*_upper) − α·x*_upper  (upper intercept, used if x*_upper ≤ u)
+    β_l = tanh(x*_lower) − α·x*_lower  (lower intercept, used if x*_lower ≥ l)
+
+    Since α ≥ 0, upper bound uses uA and lower uses lA.
+    """
+    l, u = x.l, x.u
+    tanh_l, tanh_u = jnp.tanh(l), jnp.tanh(u)
+
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, 1.0 - tanh_l ** 2, (tanh_u - tanh_l) / safe_denom)
+
+    chord_beta = tanh_l - alpha * l
+
+    # Critical sigmoid value: tanh(x*) = sqrt(1 - alpha), clamped for numerics
+    tanh_xu = jnp.sqrt(jnp.clip(1.0 - alpha, 0.0))
+    x_upper = jnp.arctanh(jnp.clip(tanh_xu, 0.0, 1.0 - 1e-7))
+    beta_u_crit = tanh_xu - alpha * x_upper
+
+    # x*_lower = -x*_upper, tanh(x*_lower) = -tanh_xu
+    x_lower = -x_upper
+    beta_l_crit = -tanh_xu - alpha * x_lower  # = -tanh_xu + alpha * x_upper
+
+    beta_u = jnp.where(x_upper <= u, beta_u_crit, chord_beta)
+    beta_l = jnp.where(x_lower >= l, beta_l_crit, chord_beta)
+
+    uA = alpha[..., None] * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha[..., None] * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=tanh_l, u=tanh_u)
+
+
+linbp_registry[lax.tanh_p] = _linbp_tanh_p
+
+
+
+def _sin_concrete(l, u):
+    """Tight concrete bounds for sin on [l, u]."""
+    sin_l, sin_u = jnp.sin(l), jnp.sin(u)
+    # Check if a maximum (π/2 + 2kπ) or minimum (-π/2 + 2kπ) lies in [l, u]
+    has_max = jnp.floor((u - jnp.pi / 2) / (2 * jnp.pi)) > jnp.floor((l - jnp.pi / 2) / (2 * jnp.pi))
+    has_min = jnp.floor((u + jnp.pi / 2) / (2 * jnp.pi)) > jnp.floor((l + jnp.pi / 2) / (2 * jnp.pi))
+    lo = jnp.where(has_min, -1.0, jnp.minimum(sin_l, sin_u))
+    hi = jnp.where(has_max,  1.0, jnp.maximum(sin_l, sin_u))
+    return lo, hi
+
+
+
+def _linbp_sin_p(x, *, relu_mode, **kwargs):
+    """sin handler: chord slope with parallel-tangent upper/lower corrections.
+
+    α = (sin(u) − sin(l)) / (u − l)  (chord slope; may be negative)
+
+    Upper bound correction at x_+ = arccos(α) + 2kπ  (where sin−α·x is max):
+      f(x_+) = √(1−α²),  β_u_crit = √(1−α²) − α·x_+
+
+    Lower bound correction at x_- = −arccos(α) + 2kπ (where sin−α·x is min):
+      f(x_-) = −√(1−α²), β_l_crit = −√(1−α²) − α·x_-
+
+    k is chosen so x_± is nearest the interval midpoint.
+    Wide intervals (≥ 2π) fall back to α = 0, β = ±1.
+    Since α can be negative, A-matrices split into positive/negative parts.
+    """
+    l, u = x.l, x.u
+
+    wide = (u - l) >= 2 * jnp.pi
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
+    alpha = jnp.where(
+        wide, 0.0,
+        jnp.where(degenerate, jnp.cos(l), (jnp.sin(u) - jnp.sin(l)) / safe_denom)
+    )
+
+    beta_chord = jnp.sin(l) - alpha * l
+    mid = (l + u) / 2
+    alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
+    sin_sq = jnp.sqrt(jnp.clip(1.0 - alpha ** 2, 0.0))
+    x_base = jnp.arccos(alpha_c)                            # ∈ (0, π)
+
+    # Upper: x_+ = arccos(α) + 2kπ
+    x_plus = x_base + jnp.round((mid - x_base) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_plus = (x_plus >= l) & (x_plus <= u)
+    beta_u = jnp.where(
+        wide, 1.0,
+        jnp.where(in_plus,
+                  jnp.maximum(beta_chord, sin_sq - alpha * x_plus),
+                  beta_chord)
+    )
+
+    # Lower: x_- = −arccos(α) + 2kπ
+    x_minus = -x_base + jnp.round((mid + x_base) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_minus = (x_minus >= l) & (x_minus <= u)
+    beta_l = jnp.where(
+        wide, -1.0,
+        jnp.where(in_minus,
+                  jnp.minimum(beta_chord, -sin_sq - alpha * x_minus),
+                  beta_chord)
+    )
+
+    # Concrete bounds
+    lo, hi = _sin_concrete(l, u)
+
+    # A-matrices: split α into positive/negative (α can be negative for sin)
+    ap = jnp.clip(alpha, 0.0, None)
+    an = jnp.clip(alpha, None, 0.0)
+    uA = ap[..., None] * x.uA + an[..., None] * x.lA
+    ub = ap * x.ub + an * x.lb + beta_u
+    lA = ap[..., None] * x.lA + an[..., None] * x.uA
+    lb = ap * x.lb + an * x.ub + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=lo, u=hi)
+
+
+linbp_registry[lax.sin_p] = _linbp_sin_p
+
+
+def _linbp_cos_p(x, *, relu_mode, **kwargs):
+    """cos handler: chord slope with parallel-tangent corrections.
+
+    Mirrors _linbp_sin_p with cos'(x) = −sin(x):
+      α = (cos(u) − cos(l)) / (u − l)
+
+    Upper bound correction at x_+ = arcsin(−α) + 2kπ  (f(x_+) = √(1−α²))
+    Lower bound correction at x_- = π − arcsin(−α) + 2kπ (f(x_-) = −√(1−α²))
+    """
+    l, u = x.l, x.u
+
+    wide = (u - l) >= 2 * jnp.pi
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
+    alpha = jnp.where(
+        wide, 0.0,
+        jnp.where(degenerate, -jnp.sin(l), (jnp.cos(u) - jnp.cos(l)) / safe_denom)
+    )
+
+    beta_chord = jnp.cos(l) - alpha * l
+    mid = (l + u) / 2
+    alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
+    cos_sq = jnp.sqrt(jnp.clip(1.0 - alpha ** 2, 0.0))
+    x_base_p = jnp.arcsin(-alpha_c)                         # ∈ (−π/2, π/2)
+    x_base_n = jnp.pi - x_base_p                            # ∈ (π/2, 3π/2)
+
+    # Upper: x_+ = arcsin(−α) + 2kπ  (cos(x_+) = √(1−α²) > 0)
+    x_plus = x_base_p + jnp.round((mid - x_base_p) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_plus = (x_plus >= l) & (x_plus <= u)
+    beta_u = jnp.where(
+        wide, 1.0,
+        jnp.where(in_plus,
+                  jnp.maximum(beta_chord, cos_sq - alpha * x_plus),
+                  beta_chord)
+    )
+
+    # Lower: x_- = π − arcsin(−α) + 2kπ  (cos(x_-) = −√(1−α²) < 0)
+    x_minus = x_base_n + jnp.round((mid - x_base_n) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_minus = (x_minus >= l) & (x_minus <= u)
+    beta_l = jnp.where(
+        wide, -1.0,
+        jnp.where(in_minus,
+                  jnp.minimum(beta_chord, -cos_sq - alpha * x_minus),
+                  beta_chord)
+    )
+
+    # Concrete bounds: cos(x) = sin(x + π/2)
+    lo, hi = _sin_concrete(l + jnp.pi / 2, u + jnp.pi / 2)
+
+    ap = jnp.clip(alpha, 0.0, None)
+    an = jnp.clip(alpha, None, 0.0)
+    uA = ap[..., None] * x.uA + an[..., None] * x.lA
+    ub = ap * x.ub + an * x.lb + beta_u
+    lA = ap[..., None] * x.lA + an[..., None] * x.uA
+    lb = ap * x.lb + an * x.ub + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=lo, u=hi)
+
+
+linbp_registry[lax.cos_p] = _linbp_cos_p
+
+
+def _linbp_exp_p(x, *, relu_mode, **kwargs):
+    """Exponential handler using chord upper bound and parallel tangent lower bound.
+
+    exp is globally convex, so:
+      - Upper bound: chord from (l, eˡ) to (u, eᵘ) — lies above exp on [l, u].
+      - Lower bound: tangent at x₀ = log(α_u) where α_u is the chord slope.
+        This is the unique tangent parallel to the chord and gives the tightest
+        lower affine bound of that slope (CROWN same-slope approach).
+
+    For degenerate intervals (|u − l| < 1e-8) both bounds collapse to the
+    tangent at l: α = eˡ, β = eˡ·(1 − l).
+
+    Since α_u = α_l ≥ 0, the upper bound uses uA and the lower uses lA.
+    """
+    l, u = x.l, x.u
+    exp_l, exp_u = jnp.exp(l), jnp.exp(u)
+
+    # Chord slope α_u = (eᵘ − eˡ) / (u − l); falls back to eˡ = exp'(l).
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, exp_l, (exp_u - exp_l) / safe_denom)
+
+    # Upper bound intercept: β_u = eˡ − α·l  (chord through (l, eˡ) and (u, eᵘ))
+    beta_u = exp_l - alpha * l
+
+    # Lower bound: tangent at x₀ = log(α) (same slope as chord).
+    # β_l = exp(x₀) − α·x₀ = α − α·log(α) = α·(1 − log(α))
+    log_alpha = jnp.where(degenerate, l, jnp.log(jnp.clip(alpha, 1e-30)))
+    beta_l = alpha * (1.0 - log_alpha)
+
+    uA = alpha[..., None] * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha[..., None] * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=exp_l, u=exp_u)
+
+
+linbp_registry[lax.exp_p] = _linbp_exp_p
+
+
+def _linbp_log1p_p(x, *, relu_mode, **kwargs):
+    """log1p(x) = log(1+x) handler using chord lower bound and parallel tangent upper bound.
+
+    log1p is globally concave (for x > −1), so:
+      - Lower bound: chord from (l, log1p(l)) to (u, log1p(u)) — lies below.
+      - Upper bound: tangent at x₀ = 1/α − 1 where α is the chord slope,
+        i.e. where log1p'(x₀) = α.  Since log1p is concave, every tangent
+        is a global upper bound, so this is always valid regardless of whether
+        x₀ ∈ [l, u].
+
+    For degenerate intervals (|u − l| < 1e-8) both bounds collapse to the
+    tangent at l: α = 1/(1+l), β = log1p(l) − α·l.
+
+    Since α ≥ 0 (log1p is increasing), the lower bound uses lA and the upper
+    bound uses uA, matching the convention in the rest of the file.
+    """
+    l, u = x.l, x.u
+    log1p_l = jnp.log1p(l)
+    log1p_u = jnp.log1p(u)
+
+    # Chord slope α = (log1p(u) − log1p(l)) / (u − l); falls back to 1/(1+l).
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, 1.0 / (1.0 + l), (log1p_u - log1p_l) / safe_denom)
+
+    # Lower bound: chord  β_l = log1p(l) − α·l
+    beta_l = log1p_l - alpha * l
+
+    # Upper bound: tangent at x₀ = 1/α − 1  (log1p'(x₀) = α)
+    #   log1p(x₀) = log(1/α) = −log(α)
+    #   β_u = log1p(x₀) − α·x₀ = −log(α) − α·(1/α − 1) = α − 1 − log(α)
+    log_alpha = jnp.log(jnp.clip(alpha, 1e-30))
+    beta_u = jnp.where(degenerate, log1p_l - alpha * l, alpha - 1.0 - log_alpha)
+
+    uA = alpha[..., None] * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha[..., None] * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=log1p_l, u=log1p_u)
+
+
+linbp_registry[lax.log1p_p] = _linbp_log1p_p
+
+
+
+
+def _linbp_div_p(x, y, *, relu_mode, **kwargs):
+    """Division handler.
+
+    x / c (LinearBound / constant): delegates to mul with 1/c.
+    c / y (constant / LinearBound): IBP fallback (nonlinear in y).
+    Both LinearBound: IBP fallback.
+    """
+    if isinstance(x, LinearBound) and not isinstance(y, LinearBound):
+        return _linbp_mul_p(x, jnp.reciprocal(y), relu_mode=relu_mode)
+    elif not isinstance(x, LinearBound) and isinstance(y, LinearBound):
+        n_in = y.n_in
+        corners = [x / y.l, x / y.u]
+        l = jnp.minimum(corners[0], corners[1])
+        u = jnp.maximum(corners[0], corners[1])
+        S = l.shape
+        return LinearBound(lA=jnp.zeros((*S, n_in)), lb=l, uA=jnp.zeros((*S, n_in)), ub=u, l=l, u=u)
+    else:
+        n_in = x.n_in
+        corners = [x.l / y.l, x.l / y.u, x.u / y.l, x.u / y.u]
+        l = jnp.minimum(jnp.minimum(corners[0], corners[1]), jnp.minimum(corners[2], corners[3]))
+        u = jnp.maximum(jnp.maximum(corners[0], corners[1]), jnp.maximum(corners[2], corners[3]))
+        S = l.shape
+        return LinearBound(lA=jnp.zeros((*S, n_in)), lb=l, uA=jnp.zeros((*S, n_in)), ub=u, l=l, u=u)
+
+
+linbp_registry[lax.div_p] = _linbp_div_p
 
 
 def _linbp_jit_p(*args, relu_mode, tighten_bounds=True, x_lb=None, x_ub=None, **bind_params):

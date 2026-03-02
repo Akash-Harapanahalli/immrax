@@ -4,9 +4,20 @@ import jax.numpy as jnp
 import immrax as irx
 import matplotlib.pyplot as plt
 
+print(jax.devices())
+
 # %%
 
 p = 2
+
+# A = jax.random.normal(jax.random.PRNGKey(0), (2, 2))
+# Generate a random stable matrix
+
+# stable eigs
+L = jnp.diag(jax.random.uniform(jax.random.PRNGKey(0), (2,), minval=-10.0, maxval=-1.0))
+# random matrix
+U = jax.random.normal(jax.random.PRNGKey(1), (2, 2))
+A = U @ L @ jnp.linalg.inv(U)
 
 
 class VanDerPol(irx.System):
@@ -15,9 +26,10 @@ class VanDerPol(irx.System):
         self.mu = 1.0
 
     def f(self, t, x):
-        x1, x2 = x
-        return jnp.array([x2, self.mu * (1 - x1**2) * x2 - x1])
+        # x1, x2 = x
+        # return jnp.array([x2, self.mu * (1 - x1**2) * x2 - x1])
         # return jnp.array([x2, -x1])
+        return A @ x
 
 
 P = jnp.array([[1.0, 0.0], [0.0, 10.0]])
@@ -86,7 +98,7 @@ class PolyParametope(irx.Parametope):
 
 
 sys = VanDerPol()
-pt0 = PolyParametope(ox, sample_alpha.coeffs, jnp.array(0.01))
+pt0 = PolyParametope(ox, sample_alpha.coeffs, jnp.array(0.1))
 # nt0 = irx.L2Normotope(ox, P, 0.1)
 print(jax.tree_util.tree_flatten(pt0))
 
@@ -145,31 +157,11 @@ class PolyParametopeEmbedding(irx.ParametricEmbedding):
 
 
 embsys = PolyParametopeEmbedding(sys)
-# print(embsys._dynamics(0.0, (pt0, None))[0])
-
 jit_dyn = jax.jit(embsys._dynamics)
-
-# %%
-#
-# traj = [pt0]
-# h = 0.01
-#
-# for i in range(600):
-#     print(i, end="\r")
-#     # traj.append(jit_dyn(0.0, (traj[-1], None))[0])
-#     # dyn = embsys._dynamics(0.0, (traj[-1], None))[0]
-#     dyn = jit_dyn(0.0, (traj[-1], None))[0]
-#     ptp1 = PolyParametope(
-#         traj[-1].ox + h * dyn.ox, traj[-1].alpha + h * dyn.alpha, traj[-1].y + h * dyn.y
-#     )
-#     traj.append(ptp1)
-
-# print(len(traj))
+print(jit_dyn(0.0, (pt0, None)))
 
 # %%
 
-# print(type(pt0))
-# print(embsys._dynamics(0.0, (pt0, None))[0])
 traj = embsys.compute_reachset(0.0, 6.0, pt0, (), dt=0.01)
 # print(traj)
 

@@ -38,7 +38,7 @@ def assert_contains_samples(p, ix, n_samples=200, atol=1e-5, method='horner'):
 # 1-D polynomials
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_1d_identity(method):
     """p(x) = x, centered at 1, evaluated over [0.5, 1.5]."""
     center = jnp.array([1.0])
@@ -47,7 +47,7 @@ def test_1d_identity(method):
     assert_contains_samples(p, ix, method=method)
 
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_1d_quadratic(method):
     """p(x) = x^2, centered at 0, evaluated over [-0.5, 0.5]."""
     center = jnp.array([0.0])
@@ -57,7 +57,7 @@ def test_1d_quadratic(method):
     assert_contains_samples(p, ix, method=method)
 
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_1d_cubic(method):
     """p(x) = x^3 - x, centered at 0, evaluated over [-0.7, 0.7]."""
     center = jnp.array([0.0])
@@ -67,7 +67,7 @@ def test_1d_cubic(method):
     assert_contains_samples(p, ix, method=method)
 
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_1d_off_center(method):
     """p(x) = (x-2)^2 + 1, centered at 2, evaluated over [1.5, 2.5]."""
     center = jnp.array([2.0])
@@ -81,7 +81,7 @@ def test_1d_off_center(method):
 # 2-D polynomials
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_2d_linear(method):
     """p(x, y) = x + y, centered at (0, 0), evaluated over [-0.5, 0.5]^2."""
     center = jnp.array([0.0, 0.0])
@@ -91,7 +91,7 @@ def test_2d_linear(method):
     assert_contains_samples(p, ix, method=method)
 
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_2d_quadratic(method):
     """p(x, y) = x^2 + xy + y^2, centered at (0, 0), evaluated over [-0.5, 0.5]^2."""
     center = jnp.array([0.0, 0.0])
@@ -101,7 +101,7 @@ def test_2d_quadratic(method):
     assert_contains_samples(p, ix, method=method)
 
 
-@pytest.mark.parametrize("method", ["horner", "standard"])
+@pytest.mark.parametrize("method", ["horner", "vmap", "cumprod"])
 def test_2d_off_center(method):
     """p(x, y) = x*y, centered at (1, 1), evaluated over [0.7, 1.3]^2."""
     center = jnp.array([1.0, 1.0])
@@ -130,11 +130,11 @@ def test_invalid_method_raises():
     p = taylor_polynomial_identity(center, order=1)
     ix = irx.icentpert(center, 0.5)
     with pytest.raises(ValueError, match="Unknown evaluation method"):
-        p.interval_evaluate(ix, method='bad_method')
+        p.interval_evaluate(ix, method='bad')
 
 
 # ---------------------------------------------------------------------------
-# Horner vs standard agreement
+# Agreement across methods
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("center,radius", [
@@ -142,11 +142,11 @@ def test_invalid_method_raises():
     (jnp.array([1.0, 2.0]), 0.3),
 ])
 def test_horner_standard_agree(center, radius):
-    """Both methods should produce valid overapproximations that overlap."""
+    """All methods should produce valid overapproximations that overlap."""
     p = taylor_polynomial_identity(center, order=2)
     ix = irx.icentpert(center, radius)
     h = p.interval_evaluate(ix, method='horner')
-    s = p.interval_evaluate(ix, method='standard')
+    s = p.interval_evaluate(ix, method='cumprod')
     # Both must be valid intervals
     assert jnp.all(h.upper >= h.lower)
     assert jnp.all(s.upper >= s.lower)

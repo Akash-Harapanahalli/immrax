@@ -886,7 +886,9 @@ def _inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
 
     # print(result)
 
-    ret = interval(jnp.moveaxis(result[:, 0], 0, axis), jnp.moveaxis(result[:, 1], 0, axis))
+    ret = interval(
+        jnp.moveaxis(result[:, 0], 0, axis), jnp.moveaxis(result[:, 1], 0, axis)
+    )
 
     return ret
 

@@ -208,7 +208,7 @@ class TaylorPolynomial:
 
     # --- Evaluation ---
 
-    def evaluate(self, x: ArrayLike, method: str = 'horner') -> Array:
+    def evaluate(self, x: ArrayLike, method: str = "vmap") -> Array:
         """Evaluate the polynomial at a point.
 
         Parameters
@@ -216,9 +216,24 @@ class TaylorPolynomial:
         x : ArrayLike
             Point, shape ``(d,)``.
         method : str, optional
-            Evaluation method.  ``'horner'`` (default) uses a tensor Horner
-            sweep; ``'standard'`` uses cumprod to compute monomials directly.
-            This is a static Python argument — it is not traced by JAX.
+            Evaluation method (static Python argument, not traced by JAX):
+
+            ``'horner'`` (default)
+                Tensor Horner sweep — scatters coefficients into a dense
+                ``(K+1)^d`` tensor then applies one 1-D Horner pass per
+                variable.  Tighter on non-centered domains.
+
+            ``'vmap'``
+                Builds a ``(d, K+1)`` power table via ``lax.integer_pow``
+                with static exponents, then vmaps over monomials.
+                ``integer_pow_p`` ends up in the jaxpr so ``natif`` benefits
+                from the even-exponent lower-bound optimisation in
+                ``_inclusion_integer_pow_p``.
+
+            ``'cumprod'``
+                Uses ``jnp.cumprod`` to compute powers per variable.
+                Simpler but conservative: the cumprod handler does not exploit
+                the non-negativity of even powers.
 
         Returns
         -------
@@ -228,10 +243,7 @@ class TaylorPolynomial:
         x = jnp.asarray(x)
         dx = x - self.flat_center
 
-        if method == 'standard':
-            monomials = self.evaluate_monomials(dx)
-            return jnp.sum(self.coeffs * monomials, axis=-1)
-        elif method == 'horner':
+        if method == "horner":
             d = self.d
             K = self.max_order
             output_shape = self._output_shape
@@ -261,36 +273,71 @@ class TaylorPolynomial:
                 current = result
 
             return current
+        elif method in ("vmap", "cumprod"):
+            monomials = self.evaluate_monomials(dx, method=method)
+            return jnp.sum(self.coeffs * monomials, axis=-1)
         else:
-            raise ValueError(f"Unknown evaluation method {method!r}; expected 'horner' or 'standard'")
+            raise ValueError(
+                f"Unknown evaluation method {method!r}; "
+                "expected 'horner', 'vmap', or 'cumprod'"
+            )
 
-    def evaluate_monomials(self, dx: ArrayLike) -> Array:
-        """Evaluate each monomial (x-center)^alpha at dx = x - center.
+    def evaluate_monomials(self, dx: ArrayLike, method: str = "vmap") -> Array:
+        """Evaluate each monomial ``(x - center)^alpha`` at ``dx = x - center``.
 
-        Uses ``jnp.cumprod`` to compute all powers of each variable up to
-        its maximum exponent, then gathers the required power per monomial
-        using static Python indices derived from the MultiIndexArray.
+        Parameters
+        ----------
+        dx : ArrayLike
+            Offset from expansion center, shape ``(d,)``.
+        method : str, optional
+            ``'vmap'`` (default) builds a ``(d, K+1)`` power table using
+            ``lax.integer_pow`` with static exponents then vmaps over monomials;
+            ``integer_pow_p`` ends up in the jaxpr so ``natif`` applies the
+            tighter even-power handler.  ``'cumprod'`` uses ``jnp.cumprod``
+            per variable — simpler but loses the even-power non-negativity.
         """
         dx = jnp.asarray(dx)
-        m = self.num_monomials
-        monomials = jnp.ones(m, dtype=dx.dtype)
-        for i in range(self.d):
-            # Static list of exponents for variable i across all monomials
-            exps_i = [int(mi[i]) for mi in self.multiindices]
-            max_k = max(exps_i)
-            if max_k == 0:
-                continue
-            # cumprod of [dx[i], dx[i], ..., dx[i]] (length max_k) gives
-            # [dx[i]^1, dx[i]^2, ..., dx[i]^max_k]; prepend 1 for exponent 0.
-            pows_pos = jnp.cumprod(jnp.full(max_k, dx[i]))
-            pows = jnp.concatenate([jnp.ones(1, dtype=dx.dtype), pows_pos])
-            # Gather per-monomial power using static Python integer indices
-            # print(pows, exps_i)
-            var_pow = jnp.stack([pows[e] for e in exps_i])
-            monomials = monomials * var_pow
-        return monomials
+        if method == "vmap":
+            d = self.d
+            K = self.max_order
+            exps = self.multiindices.to_jnp()  # (d, m), always concrete int32
 
-    def interval_evaluate(self, ix: Interval, method: str = 'horner') -> Interval:
+            if d == 0:
+                return jnp.ones(self.num_monomials, dtype=dx.dtype)
+
+            # Build power_table[i, k] = lax.integer_pow(dx[i], k) for k = 0..K.
+            # k is a static Python int so integer_pow_p ends up in the jaxpr.
+            power_table = jnp.stack(
+                [
+                    jnp.stack([jax.lax.integer_pow(dx[i], k) for k in range(K + 1)])
+                    for i in range(d)
+                ]
+            )  # (d, K+1)
+
+            # vmap over monomials: gather the per-variable power and multiply.
+            def eval_monomial(exp_col):  # (d,) traced int32
+                return jnp.prod(power_table[jnp.arange(d), exp_col])
+
+            return jax.vmap(eval_monomial, in_axes=1)(exps)  # (m,)
+        elif method == "cumprod":
+            m = self.num_monomials
+            monomials = jnp.ones(m, dtype=dx.dtype)
+            for i in range(self.d):
+                exps_i = [int(mi[i]) for mi in self.multiindices]
+                max_k = max(exps_i)
+                if max_k == 0:
+                    continue
+                pows_pos = jnp.cumprod(jnp.full(max_k, dx[i]))
+                pows = jnp.concatenate([jnp.ones(1, dtype=dx.dtype), pows_pos])
+                monomials = monomials * jnp.stack([pows[e] for e in exps_i])
+            return monomials
+        else:
+            raise ValueError(
+                f"Unknown evaluate_monomials method {method!r}; "
+                "expected 'vmap' or 'cumprod'"
+            )
+
+    def interval_evaluate(self, ix: Interval, method: str = "vmap") -> Interval:
         """Bound the polynomial over the interval ``ix``.
 
         Delegates to ``natif(partial(self.evaluate, method=method))``, so the
@@ -304,7 +351,8 @@ class TaylorPolynomial:
         ix : Interval
             Input box, shape ``(d,)``.
         method : str, optional
-            Evaluation method passed to :meth:`evaluate` (default ``'horner'``).
+            Passed to :meth:`evaluate`: ``'horner'``, ``'vmap'``, or
+            ``'cumprod'`` (default ``'horner'``).
 
         Returns
         -------
@@ -313,6 +361,7 @@ class TaylorPolynomial:
         """
         from functools import partial
         from immrax.inclusion.nif import natif as _natif
+
         return _natif(partial(self.evaluate, method=method))(ix)
 
     def evaluate_structured(self, *args):
@@ -612,6 +661,86 @@ class TaylorPolynomial:
             f"TaylorPolynomial(coeffs={self.coeffs!r}, multiindices={self.multiindices!r}, "
             f"flat_center={self.flat_center!r})"
         )
+
+
+def taylor_polynomial(
+    coeffs: ArrayLike,
+    multiindices: "MultiIndexArray | ArrayLike",
+    center: "ArrayLike | PyTree[ArrayLike]",
+) -> TaylorPolynomial:
+    """Create a TaylorPolynomial from explicit coefficients, multiindices, and a center.
+
+    Infers the domain pytree structure from ``center`` and derives ``leaf_order``
+    as the maximum per-leaf total degree present in ``multiindices``.
+
+    Parameters
+    ----------
+    coeffs : ArrayLike
+        Polynomial coefficients, shape ``(*output_shape, num_monomials)``.
+    multiindices : MultiIndexArray or ArrayLike
+        Monomial exponent table.  If a plain array, shape must be
+        ``(d, num_monomials)`` and it will be wrapped in a
+        :class:`MultiIndexArray`.
+    center : ArrayLike or PyTree[ArrayLike]
+        Expansion point.  Its pytree structure and leaf shapes determine the
+        domain layout.  A plain 1-D array is treated as a single leaf.
+
+    Returns
+    -------
+    TaylorPolynomial
+
+    Raises
+    ------
+    ValueError
+        If the domain dimension implied by ``center`` does not match
+        ``multiindices.d``, or if ``coeffs.shape[-1]`` does not match
+        ``multiindices.num_monomials``.
+    """
+    coeffs = jnp.asarray(coeffs)
+
+    if not isinstance(multiindices, MultiIndexArray):
+        multiindices = MultiIndexArray(multiindices)
+
+    treedef, leaf_shapes, flat_center = pack_pytree(center)
+    flat_center = jnp.asarray(flat_center)
+    d = flat_center.shape[0]
+
+    if multiindices.d != d:
+        raise ValueError(
+            f"Domain dimension mismatch: center has d={d} variables but "
+            f"multiindices.d={multiindices.d}."
+        )
+
+    num_monomials = multiindices.num_monomials
+    if coeffs.shape[-1] != num_monomials:
+        raise ValueError(
+            f"coeffs.shape[-1]={coeffs.shape[-1]} does not match "
+            f"num_monomials={num_monomials}."
+        )
+
+    # Infer per-leaf order: max total degree within each leaf's variable slice.
+    leaf_order_list = []
+    for leaf_idx in range(len(leaf_shapes)):
+        slc = leaf_slice(leaf_shapes, leaf_idx)
+        max_deg = 0
+        for mi in multiindices:
+            deg = sum(int(mi[j]) for j in range(slc.start, slc.stop))
+            if deg > max_deg:
+                max_deg = deg
+        leaf_order_list.append(max_deg)
+    leaf_order = tuple(leaf_order_list)
+
+    input_pytree = PyTreeShape(treedef, leaf_shapes)
+    output_pytree = PyTreeShape.flat(coeffs.shape[:-1])
+
+    return TaylorPolynomial(
+        coeffs,
+        multiindices,
+        flat_center,
+        input_pytree=input_pytree,
+        output_pytree=output_pytree,
+        leaf_order=leaf_order,
+    )
 
 
 def _taylor_polynomial_constant_impl(
