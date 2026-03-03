@@ -162,11 +162,7 @@ class NeuralNetwork(eqx.Module, Control):
                 seq = eqx.tree_at(
                     lambda seq: seq[i].bias, seq, jnp.zeros_like(seq[i].bias)
                 )
-        savepath = self.dir.joinpath("model.eqx")
-        eqx.tree_serialise_leaves(savepath, seq)
-        # self.seq = eqx.tree_deserialise_leaves(savepath, self.seq)
-        # self = NeuralNetwork(self.dir, load=True)
-        # print(f'Successfully zero initialized model and saved to {savepath}')
+        return eqx.tree_at(lambda m: m.seq, self, seq)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         return self.seq(x)
