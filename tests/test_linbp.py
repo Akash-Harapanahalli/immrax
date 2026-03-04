@@ -770,6 +770,67 @@ def test_cos_concrete_bounds_valid(lu):
 
 
 # ---------------------------------------------------------------------------
+# Tests: tan linear relaxation
+# ---------------------------------------------------------------------------
+
+_TAN_INTERVALS = [
+    pytest.param((-0.3, 0.3),        id="small-sym"),          # straddles inflection at 0
+    pytest.param((0.1, 1.0),         id="fully-convex"),        # x > 0, convex region
+    pytest.param((-1.0, -0.1),       id="fully-concave"),       # x < 0, concave region
+    pytest.param((-0.5, 0.0),        id="neg-to-zero"),         # ends at inflection
+    pytest.param((0.0, 0.5),         id="zero-to-pos"),         # starts at inflection
+    pytest.param((-1.2, 1.2),        id="wide-sym"),            # wider symmetric
+    pytest.param((0.5, 0.5 + 1e-6), id="degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu", _TAN_INTERVALS)
+def test_tan_upper_bound_valid(lu):
+    """tan upper affine bound alpha_u*x + beta_u >= tan(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.tan)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(jnp.tan(xs) - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"tan upper bound violated on [{l_val}, {u_val}]: "
+        f"alpha_u={alpha_u:.6f}, beta_u={beta_u:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _TAN_INTERVALS)
+def test_tan_lower_bound_valid(lu):
+    """tan lower affine bound alpha_l*x + beta_l <= tan(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.tan)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - jnp.tan(xs))
+    assert float(violation) <= 1e-5, (
+        f"tan lower bound violated on [{l_val}, {u_val}]: "
+        f"alpha_l={alpha_l:.6f}, beta_l={beta_l:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _TAN_INTERVALS)
+def test_tan_concrete_bounds_valid(lu):
+    """Concrete l, u from tan handler contain tan([l, u]) (tan is monotone within a period)."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.tan)(ix)
+    tol = 1e-6
+    # tan is monotone on (-π/2, π/2), so min=tan(l), max=tan(u)
+    assert float(lb.l[0]) <= float(jnp.tan(l_val)) + tol, (
+        f"tan concrete lower {lb.l[0]:.6f} > tan(l)={float(jnp.tan(l_val)):.6f}"
+    )
+    assert float(lb.u[0]) >= float(jnp.tan(u_val)) - tol, (
+        f"tan concrete upper {lb.u[0]:.6f} < tan(u)={float(jnp.tan(u_val)):.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tests: exp linear relaxation
 # ---------------------------------------------------------------------------
 
@@ -920,3 +981,88 @@ def test_structural_contains_output(fn, ix):
     tol = 1e-5
     assert jnp.all(result.lower - tol <= outputs.min(axis=0))
     assert jnp.all(outputs.max(axis=0) <= result.upper + tol)
+
+
+# ---------------------------------------------------------------------------
+# Tests: integer_pow linear relaxation
+# ---------------------------------------------------------------------------
+
+_INTEGER_POW_CASES = [
+    # (interval, exponent)
+    pytest.param((-1.0, 1.0),  2, id="sq-sym"),            # straddles 0, even
+    pytest.param((0.5, 1.5),   2, id="sq-pos"),             # fully positive, even
+    pytest.param((-1.5, -0.5), 2, id="sq-neg"),             # fully negative, even
+    pytest.param((-2.0, 1.0),  2, id="sq-asym"),            # asymmetric straddle
+    pytest.param((-0.5, 0.5),  3, id="cube-sym"),           # straddles 0, odd
+    pytest.param((0.2, 1.2),   3, id="cube-pos"),           # fully positive, odd
+    pytest.param((-1.2, -0.2), 3, id="cube-neg"),           # fully negative, odd
+    pytest.param((-1.0, 1.0),  4, id="pow4-sym"),           # even, higher order
+    pytest.param((0.5, 1.5),   4, id="pow4-pos"),
+    pytest.param((-0.5, 0.5),  5, id="pow5-sym"),           # odd, higher order
+    pytest.param((0.0, 1e-6),  2, id="sq-degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu,n", _INTEGER_POW_CASES)
+def test_integer_pow_upper_bound_valid(lu, n):
+    """x^n upper affine bound >= x^n for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(lambda x: x ** n)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(xs ** n - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"x^{n} upper bound violated on [{l_val}, {u_val}]: "
+        f"alpha_u={alpha_u:.6f}, beta_u={beta_u:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu,n", _INTEGER_POW_CASES)
+def test_integer_pow_lower_bound_valid(lu, n):
+    """x^n lower affine bound <= x^n for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(lambda x: x ** n)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - xs ** n)
+    assert float(violation) <= 1e-5, (
+        f"x^{n} lower bound violated on [{l_val}, {u_val}]: "
+        f"alpha_l={alpha_l:.6f}, beta_l={beta_l:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu,n", _INTEGER_POW_CASES)
+def test_integer_pow_concrete_bounds_valid(lu, n):
+    """Concrete l, u from integer_pow handler contain x^n([l, u])."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(lambda x: x ** n)(ix)
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    vals = xs ** n
+    tol = 1e-5
+    assert float(lb.l[0]) <= float(jnp.min(vals)) + tol, (
+        f"x^{n} concrete lower {lb.l[0]:.6f} > min={float(jnp.min(vals)):.6f} on [{l_val}, {u_val}]"
+    )
+    assert float(lb.u[0]) >= float(jnp.max(vals)) - tol, (
+        f"x^{n} concrete upper {lb.u[0]:.6f} < max={float(jnp.max(vals)):.6f} on [{l_val}, {u_val}]"
+    )
+
+
+def test_integer_pow_zero():
+    """x^0 = 1 everywhere: zero A-matrices, constant 1 bounds."""
+    ix = irx.interval(jnp.array([-2.0, -1.0]), jnp.array([1.0, 3.0]))
+    lb = linbp(lambda x: x ** 0)(ix)
+    assert jnp.allclose(lb.lA, jnp.zeros_like(lb.lA))
+    assert jnp.allclose(lb.uA, jnp.zeros_like(lb.uA))
+    assert jnp.allclose(lb.lb, jnp.ones(2))
+    assert jnp.allclose(lb.ub, jnp.ones(2))
+
+
+def test_integer_pow_one():
+    """x^1 = x: identity pass-through."""
+    ix = irx.interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5]))
+    lb = linbp(lambda x: x ** 1)(ix)
+    assert jnp.allclose(lb.l, ix.lower)
+    assert jnp.allclose(lb.u, ix.upper)

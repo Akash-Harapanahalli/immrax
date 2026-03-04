@@ -939,6 +939,144 @@ def _linbp_cos_p(x, *, relu_mode, **kwargs):
 linbp_registry[lax.cos_p] = _linbp_cos_p
 
 
+def _linbp_tan_p(x, *, relu_mode, **kwargs):
+    """tan handler: chord slope with tangent-line corrections.
+
+    tan'(x) = sec²(x) ≥ 1, convex for x > 0, concave for x < 0 (within each
+    period), inflection at 0 — same shape as tanh but unbounded.
+
+    α = (tan(u) − tan(l)) / (u − l)   (chord slope, ≥ 1 within a period)
+
+    Critical points where tan'(x*) = α → sec²(x*) = α → tan(x*) = ±√(α−1):
+      x*_upper = arctan(√(α−1))   (convex region x > 0, max of tan − α·x)
+      x*_lower = −x*_upper         (concave region x < 0, min of tan − α·x)
+
+    β_u = tan(x*_upper) − α·x*_upper = √(α−1) − α·arctan(√(α−1))
+    β_l = tan(x*_lower) − α·x*_lower = −√(α−1) + α·arctan(√(α−1))
+    """
+    l, u = x.l, x.u
+    tan_l, tan_u = jnp.tan(l), jnp.tan(u)
+
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, 1.0 + tan_l ** 2, (tan_u - tan_l) / safe_denom)
+
+    chord_beta = tan_l - alpha * l
+
+    # Critical tan value: tan(x*) = sqrt(alpha - 1)
+    tan_crit = jnp.sqrt(jnp.clip(alpha - 1.0, 0.0))
+    x_upper = jnp.arctan(tan_crit)
+    beta_u_crit = tan_crit - alpha * x_upper
+
+    x_lower = -x_upper
+    beta_l_crit = -tan_crit - alpha * x_lower  # = -tan_crit + alpha * x_upper
+
+    # h(x) = tan(x) - α·x has a LOCAL MAX at x*_lower (concave region, x<0)
+    # and a LOCAL MIN at x*_upper (convex region, x>0).
+    # Upper bound needs β_u = max h = h(x*_lower) when x*_lower ∈ [l, u].
+    # Lower bound needs β_l = min h = h(x*_upper) when x*_upper ∈ [l, u].
+    beta_u = jnp.where(x_lower >= l, beta_l_crit, chord_beta)
+    beta_l = jnp.where(x_upper <= u, beta_u_crit, chord_beta)
+
+    uA = alpha * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=tan_l, u=tan_u)
+
+
+linbp_registry[lax.tan_p] = _linbp_tan_p
+
+
+def _linbp_integer_pow_p(x, *, y, relu_mode, **kwargs):
+    """x^n handler for static integer exponent n.
+
+    n = 0: constant 1
+    n = 1: identity (pass-through)
+    n >= 2, even: globally convex — chord upper bound, tangent-at-critical lower bound
+    n >= 3, odd: convex x>0 / concave x<0 (like tan) — chord slope with
+                 critical-point intercept corrections
+    n < 0: IBP fallback (zero-slope constant bounds from endpoints)
+    """
+    n = y
+    l, u = x.l, x.u
+
+    if n == 0:
+        ones = jnp.ones_like(l)
+        zero_A = jnp.zeros_like(x.lA)
+        return LinearBound(lA=zero_A, lb=ones, uA=zero_A, ub=ones, l=ones, u=ones)
+
+    if n == 1:
+        return LinearBound(lA=x.lA, lb=x.lb, uA=x.uA, ub=x.ub, l=l, u=u)
+
+    pow_l = l ** n
+    pow_u = u ** n
+
+    if n < 0:
+        # IBP fallback: just use concrete endpoint bounds with zero slopes
+        f_l = jnp.minimum(pow_l, pow_u)
+        f_u = jnp.maximum(pow_l, pow_u)
+        zero_A = jnp.zeros_like(x.lA)
+        return LinearBound(lA=zero_A, lb=f_l, uA=zero_A, ub=f_u, l=f_l, u=f_u)
+
+    # n >= 2: compute concrete bounds
+    if n % 2 == 0:
+        # Even n: globally convex, minimum at x=0 if 0 in [l, u]
+        f_concrete_l = jnp.where(
+            (l <= 0) & (0 <= u), jnp.zeros_like(l), jnp.minimum(pow_l, pow_u)
+        )
+        f_concrete_u = jnp.maximum(pow_l, pow_u)
+    else:
+        # Odd n >= 3: monotone increasing
+        f_concrete_l = pow_l
+        f_concrete_u = pow_u
+
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(
+        degenerate,
+        jnp.array(n, dtype=l.dtype) * l ** (n - 1),
+        (pow_u - pow_l) / safe_denom,
+    )
+    chord_beta = pow_l - alpha * l
+
+    if n % 2 == 0:
+        # Globally convex: upper = chord, lower = tangent parallel to chord.
+        # f'(x0) = alpha  =>  n*x0^(n-1) = alpha  =>  x0 = sign(alpha/n)*|alpha/n|^(1/(n-1))
+        # n-1 is odd for even n, so real root is always defined.
+        safe_alpha_n = alpha / n
+        x0 = jnp.sign(safe_alpha_n) * jnp.abs(safe_alpha_n) ** (1.0 / (n - 1))
+        beta_l_crit = x0 ** n - alpha * x0
+        in_range = (l <= x0) & (x0 <= u)
+        beta_u = chord_beta
+        beta_l = jnp.where(in_range, beta_l_crit, chord_beta)
+    else:
+        # Odd n >= 3: same critical-point structure as tan.
+        # h(x) = x^n - alpha*x has local MAX at x_lower = -x_upper, local MIN at x_upper.
+        # n-1 is even, so x^(n-1) = |x|^(n-1), and alpha/n >= 0 by MVT.
+        safe_alpha_n = jnp.maximum(alpha / n, 0.0)
+        x_upper = safe_alpha_n ** (1.0 / (n - 1))
+        x_lower = -x_upper
+        f_x_upper = x_upper ** n
+        # h at x_lower (local MAX) -> beta_u; h at x_upper (local MIN) -> beta_l
+        beta_at_x_lower = -f_x_upper + alpha * x_upper
+        beta_at_x_upper = f_x_upper - alpha * x_upper
+        beta_u = jnp.where(x_lower >= l, beta_at_x_lower, chord_beta)
+        beta_l = jnp.where(x_upper <= u, beta_at_x_upper, chord_beta)
+
+    uA = alpha * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=f_concrete_l, u=f_concrete_u)
+
+
+linbp_registry[lax.integer_pow_p] = _linbp_integer_pow_p
+linbp_registry[lax.square_p] = lambda x, **kw: _linbp_integer_pow_p(x, y=2, **kw)
+
+
 def _linbp_exp_p(x, *, relu_mode, **kwargs):
     """Exponential handler using chord upper bound and parallel tangent lower bound.
 
