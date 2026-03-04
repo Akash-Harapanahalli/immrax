@@ -360,20 +360,17 @@ def get_rohn_corners(A: Interval, sign: Literal["+", "-"] = "+"):
     Ac = A.center
     Ap = A.pert
 
+    # All 2^n sign vectors via bit extraction: bit j of i gives sign j.
+    # 2**n is a compile-time constant (n = A.shape[0] is static).
+    indices = jnp.arange(2**n)                                    # (2^n,)
+    signs = 2 * ((indices[:, None] >> jnp.arange(n)) & 1) - 1    # (2^n, n)
+    # Outer product: diag(s) @ M @ diag(s) = (s[:,None]*s[None,:])*M
+    sign_matrices = signs[:, :, None] * signs[:, None, :]         # (2^n, n, n)
+
     if sign == "+":
-        return jnp.asarray(
-            [
-                Ac + jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s))
-                for s in product(*[[-1, +1] for i in range(n)])
-            ]
-        )
+        return Ac + sign_matrices * Ap
     elif sign == "-":
-        return jnp.asarray(
-            [
-                Ac - jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s))
-                for s in product(*[[-1, +1] for i in range(n)])
-            ]
-        )
+        return Ac - sign_matrices * Ap
     else:
         raise Exception("pm should be '+' or '-'.")
 

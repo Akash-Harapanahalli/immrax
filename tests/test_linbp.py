@@ -561,3 +561,362 @@ def test_resolve_linbp_input_type_error():
     import pytest
     with pytest.raises(TypeError, match="Interval or LinearBound"):
         _resolve_linbp_input(jnp.array([1.0, 2.0]))
+
+
+# ---------------------------------------------------------------------------
+# Tests: neg / sub / mul / div arithmetic primitives
+# ---------------------------------------------------------------------------
+
+_ARITH_FUNCTIONS = [
+    pytest.param(
+        lambda x: -x,
+        interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5])),
+        id="neg",
+    ),
+    pytest.param(
+        lambda x: x - 1.0,
+        interval(jnp.array([-2.0, -1.0]), jnp.array([1.0, 2.0])),
+        id="sub-constant",
+    ),
+    pytest.param(
+        lambda x: 1.0 - x,
+        interval(jnp.array([-0.5, -0.5]), jnp.array([2.0, 2.0])),
+        id="sub-constant-reverse",
+    ),
+    pytest.param(
+        lambda x: 3.0 * x,
+        interval(jnp.array([-1.0, -1.0]), jnp.array([1.0, 1.0])),
+        id="mul-pos-scalar",
+    ),
+    pytest.param(
+        lambda x: -2.0 * x,
+        interval(jnp.array([-1.0, 0.0]), jnp.array([0.5, 1.0])),
+        id="mul-neg-scalar",
+    ),
+    pytest.param(
+        lambda x: x / 4.0,
+        interval(jnp.array([-2.0, -1.0]), jnp.array([1.0, 2.0])),
+        id="div-pos-scalar",
+    ),
+    pytest.param(
+        lambda x: x / -3.0,
+        interval(jnp.array([-1.0, -1.0]), jnp.array([1.0, 1.0])),
+        id="div-neg-scalar",
+    ),
+]
+
+
+@pytest.mark.parametrize("fn,ix", _ARITH_FUNCTIONS)
+def test_arith_bounds_valid(fn, ix):
+    """Concrete bounds l <= u hold for arithmetic primitives."""
+    lb = linbp(fn)(ix)
+    assert jnp.all(lb.l <= lb.u)
+
+
+@pytest.mark.parametrize("fn,ix", _ARITH_FUNCTIONS)
+def test_arith_contains_output(fn, ix):
+    """Arithmetic op linear bounds contain f(x) for all x in ix."""
+    from immrax.inclusion.linbp import _concretize
+    lb = linbp(fn)(ix)
+    result = _concretize(lb, ix.lower, ix.upper)
+    samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(42))
+    outputs = jax.vmap(fn)(samples)
+    tol = 1e-5
+    assert jnp.all(result.lower - tol <= outputs.min(axis=0))
+    assert jnp.all(outputs.max(axis=0) <= result.upper + tol)
+
+
+def test_neg_flips_concrete_bounds():
+    """Negation exactly flips concrete bounds: l_out = -u_in, u_out = -l_in."""
+    ix = interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5]))
+    lb = linbp(lambda x: -x)(ix)
+    assert jnp.allclose(lb.l, -ix.upper, atol=1e-6)
+    assert jnp.allclose(lb.u, -ix.lower, atol=1e-6)
+
+
+def test_mul_positive_scalar_exact():
+    """Scaling by a positive constant exactly scales the concrete bounds."""
+    c = 3.0
+    ix = interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5]))
+    lb = linbp(lambda x: c * x)(ix)
+    assert jnp.allclose(lb.l, c * ix.lower, atol=1e-6)
+    assert jnp.allclose(lb.u, c * ix.upper, atol=1e-6)
+
+
+def test_mul_negative_scalar_flips():
+    """Scaling by a negative constant flips the concrete bounds."""
+    c = -2.0
+    ix = interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5]))
+    lb = linbp(lambda x: c * x)(ix)
+    assert jnp.allclose(lb.l, c * ix.upper, atol=1e-6)
+    assert jnp.allclose(lb.u, c * ix.lower, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Tests: sin linear relaxation
+# ---------------------------------------------------------------------------
+
+_SIN_INTERVALS = [
+    pytest.param((-0.5, 0.5),           id="small-sym"),
+    pytest.param((0.0, 1.0),            id="monotone-inc"),
+    pytest.param((1.0, 2.5),            id="straddles-max"),    # contains π/2 ≈ 1.57
+    pytest.param((-2.5, -1.0),          id="straddles-min"),    # contains -π/2 ≈ -1.57
+    pytest.param((-2.0, 2.0),           id="both-extrema"),     # contains both ±π/2
+    pytest.param((0.0, 7.0),            id="wide-over-2pi"),    # > 2π: fallback α=0
+    pytest.param((1.0, 1.0 + 1e-6),    id="degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu", _SIN_INTERVALS)
+def test_sin_upper_bound_valid(lu):
+    """sin upper affine bound alpha_u*x + beta_u >= sin(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.sin)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(jnp.sin(xs) - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"sin upper bound violated on [{l_val}, {u_val}]: "
+        f"alpha_u={alpha_u:.6f}, beta_u={beta_u:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _SIN_INTERVALS)
+def test_sin_lower_bound_valid(lu):
+    """sin lower affine bound alpha_l*x + beta_l <= sin(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.sin)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - jnp.sin(xs))
+    assert float(violation) <= 1e-5, (
+        f"sin lower bound violated on [{l_val}, {u_val}]: "
+        f"alpha_l={alpha_l:.6f}, beta_l={beta_l:.6f}, max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _SIN_INTERVALS)
+def test_sin_concrete_bounds_valid(lu):
+    """Concrete l, u from sin handler contain sin([l, u])."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.sin)(ix)
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    vals = jnp.sin(xs)
+    tol = 1e-6
+    assert float(lb.l[0]) <= float(jnp.min(vals)) + tol, (
+        f"sin concrete lower {lb.l[0]:.6f} > min sin={float(jnp.min(vals)):.6f} on [{l_val}, {u_val}]"
+    )
+    assert float(lb.u[0]) >= float(jnp.max(vals)) - tol, (
+        f"sin concrete upper {lb.u[0]:.6f} < max sin={float(jnp.max(vals)):.6f} on [{l_val}, {u_val}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: cos linear relaxation
+# ---------------------------------------------------------------------------
+
+_COS_INTERVALS = [
+    pytest.param((-0.5, 0.5),           id="small-sym"),         # near max at 0
+    pytest.param((0.5, 2.0),            id="crossing-zero"),     # cos goes pos→neg
+    pytest.param((2.5, 4.0),            id="straddles-cos-min"), # contains π ≈ 3.14
+    pytest.param((-2.0, 2.0),           id="both-sides"),
+    pytest.param((0.0, 7.0),            id="wide-over-2pi"),
+    pytest.param((0.5, 0.5 + 1e-6),    id="degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu", _COS_INTERVALS)
+def test_cos_upper_bound_valid(lu):
+    """cos upper affine bound alpha_u*x + beta_u >= cos(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.cos)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(jnp.cos(xs) - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"cos upper bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _COS_INTERVALS)
+def test_cos_lower_bound_valid(lu):
+    """cos lower affine bound alpha_l*x + beta_l <= cos(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.cos)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - jnp.cos(xs))
+    assert float(violation) <= 1e-5, (
+        f"cos lower bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _COS_INTERVALS)
+def test_cos_concrete_bounds_valid(lu):
+    """Concrete l, u from cos handler contain cos([l, u])."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.cos)(ix)
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    vals = jnp.cos(xs)
+    tol = 1e-6
+    assert float(lb.l[0]) <= float(jnp.min(vals)) + tol
+    assert float(lb.u[0]) >= float(jnp.max(vals)) - tol
+
+
+# ---------------------------------------------------------------------------
+# Tests: exp linear relaxation
+# ---------------------------------------------------------------------------
+
+_EXP_INTERVALS = [
+    pytest.param((-1.0, 1.0),    id="sym"),
+    pytest.param((-2.0, 0.0),    id="neg-to-zero"),
+    pytest.param((0.0, 2.0),     id="zero-to-pos"),
+    pytest.param((-3.0, -1.0),   id="fully-neg"),
+    pytest.param((1.0, 3.0),     id="pos-large"),
+    pytest.param((0.0, 1e-6),    id="degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu", _EXP_INTERVALS)
+def test_exp_upper_bound_valid(lu):
+    """exp upper bound (chord): alpha*x + beta_u >= exp(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.exp)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(jnp.exp(xs) - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"exp upper bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _EXP_INTERVALS)
+def test_exp_lower_bound_valid(lu):
+    """exp lower bound (parallel tangent): alpha*x + beta_l <= exp(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.exp)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - jnp.exp(xs))
+    assert float(violation) <= 1e-5, (
+        f"exp lower bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _EXP_INTERVALS)
+def test_exp_concrete_bounds_exact(lu):
+    """Concrete bounds from exp handler are exp(l_val) and exp(u_val)."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.exp)(ix)
+    tol = 1e-6
+    assert abs(float(lb.l[0]) - float(jnp.exp(l_val))) <= tol
+    assert abs(float(lb.u[0]) - float(jnp.exp(u_val))) <= tol
+
+
+# ---------------------------------------------------------------------------
+# Tests: log1p linear relaxation
+# ---------------------------------------------------------------------------
+
+_LOG1P_INTERVALS = [
+    pytest.param((-0.5, 0.5),   id="sym"),
+    pytest.param((0.0, 2.0),    id="pos"),
+    pytest.param((-0.8, -0.1),  id="near-neg1"),  # valid domain l > -1
+    pytest.param((1.0, 5.0),    id="pos-large"),
+    pytest.param((0.0, 1e-6),   id="degenerate"),
+]
+
+
+@pytest.mark.parametrize("lu", _LOG1P_INTERVALS)
+def test_log1p_upper_bound_valid(lu):
+    """log1p upper bound (tangent): alpha*x + beta_u >= log1p(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.log1p)(ix)
+    alpha_u, beta_u = float(lb.uA[0, 0]), float(lb.ub[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max(jnp.log1p(xs) - (alpha_u * xs + beta_u))
+    assert float(violation) <= 1e-5, (
+        f"log1p upper bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _LOG1P_INTERVALS)
+def test_log1p_lower_bound_valid(lu):
+    """log1p lower bound (chord): alpha*x + beta_l <= log1p(x) for all x in [l, u]."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.log1p)(ix)
+    alpha_l, beta_l = float(lb.lA[0, 0]), float(lb.lb[0])
+    xs = jnp.linspace(l_val, u_val, N_DENSE)
+    violation = jnp.max((alpha_l * xs + beta_l) - jnp.log1p(xs))
+    assert float(violation) <= 1e-5, (
+        f"log1p lower bound violated on [{l_val}, {u_val}]: max violation={float(violation):.2e}"
+    )
+
+
+@pytest.mark.parametrize("lu", _LOG1P_INTERVALS)
+def test_log1p_concrete_bounds_exact(lu):
+    """Concrete bounds from log1p handler are log1p(l_val) and log1p(u_val)."""
+    l_val, u_val = lu
+    ix = irx.interval(jnp.array([l_val]), jnp.array([u_val]))
+    lb = linbp(jnp.log1p)(ix)
+    tol = 1e-6
+    assert abs(float(lb.l[0]) - float(jnp.log1p(l_val))) <= tol
+    assert abs(float(lb.u[0]) - float(jnp.log1p(u_val))) <= tol
+
+
+# ---------------------------------------------------------------------------
+# Tests: structural primitives (reshape, concatenate, slice)
+# ---------------------------------------------------------------------------
+
+_STRUCTURAL_FUNCTIONS = [
+    pytest.param(
+        lambda x: x.reshape(2, 2),
+        interval(jnp.zeros(4), jnp.ones(4)),
+        id="reshape-4-to-2x2",
+    ),
+    pytest.param(
+        lambda x: jnp.concatenate([x, x]),
+        interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5])),
+        id="concatenate-self",
+    ),
+    pytest.param(
+        lambda x: jnp.concatenate([x[:1], jnp.zeros(1), x[1:]]),
+        interval(jnp.array([-1.0, 0.5]), jnp.array([0.5, 1.5])),
+        id="concatenate-with-zeros",
+    ),
+    pytest.param(
+        lambda x: x[1:],
+        interval(jnp.array([-1.0, 0.5, 0.3]), jnp.array([0.5, 1.5, 1.0])),
+        id="slice",
+    ),
+]
+
+
+@pytest.mark.parametrize("fn,ix", _STRUCTURAL_FUNCTIONS)
+def test_structural_bounds_valid(fn, ix):
+    """Concrete bounds l <= u hold for structural ops."""
+    lb = linbp(fn)(ix)
+    assert jnp.all(lb.l <= lb.u)
+
+
+@pytest.mark.parametrize("fn,ix", _STRUCTURAL_FUNCTIONS)
+def test_structural_contains_output(fn, ix):
+    """Structural op bounds contain f(x) for all x in ix."""
+    from immrax.inclusion.linbp import _concretize
+    lb = linbp(fn)(ix)
+    result = _concretize(lb, ix.lower, ix.upper)
+    samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(42))
+    outputs = jax.vmap(fn)(samples)
+    tol = 1e-5
+    assert jnp.all(result.lower - tol <= outputs.min(axis=0))
+    assert jnp.all(outputs.max(axis=0) <= result.upper + tol)
