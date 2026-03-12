@@ -1066,3 +1066,36 @@ def test_integer_pow_one():
     lb = linbp(lambda x: x ** 1)(ix)
     assert jnp.allclose(lb.l, ix.lower)
     assert jnp.allclose(lb.u, ix.upper)
+
+
+# ---------------------------------------------------------------------------
+# reduce_sum
+# ---------------------------------------------------------------------------
+
+
+def test_reduce_sum_linear_amatrices():
+    """reduce_sum is linear: A-matrices should sum exactly (no relaxation)."""
+    ix = irx.interval(jnp.array([-1.0, 0.0, 2.0]), jnp.array([1.0, 1.0, 3.0]))
+    lb = linbp(lambda x: jnp.sum(x))(ix)
+    # sum is linear: lA == uA == ones
+    assert jnp.allclose(lb.lA, jnp.ones((1, 3)))
+    assert jnp.allclose(lb.uA, jnp.ones((1, 3)))
+
+
+def test_reduce_sum_concrete_bounds():
+    """reduce_sum concrete bounds: l=sum(l_i), u=sum(u_i)."""
+    ix = irx.interval(jnp.array([-1.0, 0.0, 2.0]), jnp.array([1.0, 1.0, 3.0]))
+    lb = linbp(lambda x: jnp.sum(x))(ix)
+    assert jnp.allclose(lb.l, jnp.array([1.0]))   # -1+0+2
+    assert jnp.allclose(lb.u, jnp.array([5.0]))   # 1+1+3
+
+
+def test_reduce_sum_partial_axis():
+    """reduce_sum over one axis of a 2D input."""
+    ix = irx.interval(
+        jnp.array([[-1.0, 0.0], [1.0, 2.0]]),
+        jnp.array([[0.0, 1.0], [2.0, 3.0]]),
+    )
+    lb = linbp(lambda x: jnp.sum(x, axis=0))(ix)
+    assert jnp.allclose(lb.l, jnp.array([0.0, 2.0]))
+    assert jnp.allclose(lb.u, jnp.array([2.0, 4.0]))

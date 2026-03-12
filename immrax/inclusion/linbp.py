@@ -492,6 +492,22 @@ for _p_name in ["scatter_p", "scatter_add_p", "scatter_mul_p"]:
         linbp_registry[getattr(lax, _p_name)] = _make_linbp_scatter_p(getattr(lax, _p_name))
 
 
+def _linbp_reduce_sum_p(x, *, relu_mode, axes, out_sharding=None, **kwargs):
+    """reduce_sum is linear: A-matrices reduce exactly over the same axes."""
+    _rs = lambda t: lax.reduce_sum_p.bind(t, axes=axes, out_sharding=out_sharding)
+    if not isinstance(x, LinearBound):
+        return _rs(x)
+    # axes refers to dimensions of the data tensor; n_in is the appended last dim
+    # of lA/uA and is not affected (axes index into the data dims only).
+    return LinearBound(
+        lA=_rs(x.lA), lb=_rs(x.lb), uA=_rs(x.uA), ub=_rs(x.ub),
+        l=_rs(x.l), u=_rs(x.u),
+    )
+
+
+linbp_registry[lax.reduce_sum_p] = _linbp_reduce_sum_p
+
+
 def _linbp_select_n_p(which, *cases, relu_mode, **kwargs):
     """select_n_p (lax.select_n) handler.
 
@@ -718,7 +734,10 @@ def _linbp_logistic_p(x, *, relu_mode, **kwargs):
 
     # Critical sigmoid values where σ'(x*) = α → σ(x*)(1−σ(x*)) = α
     # disc = √(1−4α) ≥ 0 because α ≤ max(σ') = 0.25
-    disc = jnp.sqrt(jnp.clip(1.0 - 4.0 * alpha, 0.0))
+    # Use jnp.where to avoid sqrt(0) gradient NaN when alpha=0.25 (degenerate interval).
+    one_minus_4alpha = jnp.maximum(1.0 - 4.0 * alpha, 0.0)
+    safe_disc = jnp.where(one_minus_4alpha <= 0.0, jnp.ones_like(one_minus_4alpha), one_minus_4alpha)
+    disc = jnp.where(one_minus_4alpha <= 0.0, jnp.zeros_like(one_minus_4alpha), jnp.sqrt(safe_disc))
 
     # Upper critical point in concave region (x*_upper ≥ 0)
     sig_xu = (1.0 + disc) / 2.0
@@ -773,8 +792,11 @@ def _linbp_tanh_p(x, *, relu_mode, **kwargs):
 
     chord_beta = tanh_l - alpha * l
 
-    # Critical sigmoid value: tanh(x*) = sqrt(1 - alpha), clamped for numerics
-    tanh_xu = jnp.sqrt(jnp.clip(1.0 - alpha, 0.0))
+    # Critical sigmoid value: tanh(x*) = sqrt(1 - alpha), clamped for numerics.
+    # Use jnp.where to avoid sqrt(0) gradient NaN when alpha=1 (degenerate interval).
+    one_minus_alpha = jnp.maximum(1.0 - alpha, 0.0)
+    safe_oma = jnp.where(one_minus_alpha <= 0.0, jnp.ones_like(one_minus_alpha), one_minus_alpha)
+    tanh_xu = jnp.where(one_minus_alpha <= 0.0, jnp.zeros_like(one_minus_alpha), jnp.sqrt(safe_oma))
     x_upper = jnp.arctanh(jnp.clip(tanh_xu, 0.0, 1.0 - 1e-7))
     beta_u_crit = tanh_xu - alpha * x_upper
 
