@@ -303,19 +303,51 @@ def _linbp_mul_p(x, y, *, relu_mode, **kwargs):
 linbp_registry[lax.mul_p] = _linbp_mul_p
 
 
+def _fix_nin_last(lA_raw, x_lA_ndim, dim_nums):
+    """Move the n_in axis back to the last position after dot_general.
+
+    When x.lA has shape (*S, n_in) and we apply dot_general(x.lA, W, dim_nums)
+    where dim_nums contracts over some S axes (not n_in), JAX places the result
+    axes in order: batch + free_lhs + free_rhs.  The n_in axis is the *last*
+    free_lhs axis, so it lands at position n_batch + n_free_lhs - 1 instead of
+    the final position.  This helper transposes it back to the end.
+    """
+    (lhs_c, rhs_c), (lhs_b, rhs_b) = dim_nums
+    n_batch = len(lhs_b)
+    # n_free_lhs counts dims of x.lA that are neither contracting nor batch;
+    # one of them is n_in (the last dim of x.lA).
+    n_free_lhs = x_lA_ndim - len(lhs_c) - len(lhs_b)
+    n_free_rhs = lA_raw.ndim - n_batch - n_free_lhs
+    if n_free_rhs == 0:
+        return lA_raw  # n_in is already last
+    nin_pos = n_batch + n_free_lhs - 1
+    total = lA_raw.ndim
+    perm = list(range(total))
+    perm.pop(nin_pos)
+    perm.append(nin_pos)
+    return jnp.transpose(lA_raw, perm)
+
+
 def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
     (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
     dim_nums = dimension_numbers
 
     if isinstance(x, LinearBound) and not isinstance(y, LinearBound):
         # x is LinearBound, y (W) is constant: e.g. x @ W  (equinox linear)
+        # x.lA has shape (*S_x, n_in); dot_general contracts over S_x dims,
+        # leaving n_in as the last free_lhs dim — but JAX places it before
+        # free_rhs dims.  We fix that with _fix_nin_last.
         W = y
         Wp = jnp.clip(W, 0, None)
         Wn = jnp.clip(W, None, 0)
-        # lA_x has shape (*S_x, n_in); dot_general contracts over S_x axes
-        # The n_in axis is free (not in dimension_numbers), so this is correct
-        uA = lax.dot_general(x.uA, Wp, dim_nums) + lax.dot_general(x.lA, Wn, dim_nums)
-        lA = lax.dot_general(x.lA, Wp, dim_nums) + lax.dot_general(x.uA, Wn, dim_nums)
+        x_lA_ndim = x.lA.ndim
+
+        def _dg(a, b):
+            raw = lax.dot_general(a, b, dim_nums)
+            return _fix_nin_last(raw, x_lA_ndim, dim_nums)
+
+        uA = _dg(x.uA, Wp) + _dg(x.lA, Wn)
+        lA = _dg(x.lA, Wp) + _dg(x.uA, Wn)
         ub = lax.dot_general(x.ub, Wp, dim_nums) + lax.dot_general(x.lb, Wn, dim_nums)
         lb = lax.dot_general(x.lb, Wp, dim_nums) + lax.dot_general(x.ub, Wn, dim_nums)
         # Concrete bounds
@@ -1185,6 +1217,53 @@ def _linbp_log1p_p(x, *, relu_mode, **kwargs):
 linbp_registry[lax.log1p_p] = _linbp_log1p_p
 
 
+def _linbp_sqrt_p(x, *, relu_mode, **kwargs):
+    """sqrt handler using chord lower bound and parallel tangent upper bound.
+
+    sqrt is globally concave on [0, ∞), so:
+      - Lower bound: chord from (l, √l) to (u, √u) — lies below sqrt on [l, u].
+      - Upper bound: tangent at x₀ = 1/(4α²) where sqrt'(x₀) = α (chord slope).
+        Since sqrt is concave, every tangent is a global upper bound.
+        β_u = sqrt(x₀) − α·x₀ = 1/(2α) − 1/(4α) = 1/(4α).
+
+    For degenerate intervals (|u − l| < 1e-8) both bounds collapse to the
+    tangent at l: α = 1/(2√l), β = √l/2.
+
+    Inputs are clipped to [0, ∞) since sqrt is only defined there.
+    Since α ≥ 0 (sqrt is increasing), the lower bound uses lA and the upper
+    bound uses uA.
+    """
+    l = jnp.maximum(x.l, 0.0)
+    u = jnp.maximum(x.u, 0.0)
+    sqrt_l = jnp.sqrt(l)
+    sqrt_u = jnp.sqrt(u)
+
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    safe_sqrt_l = jnp.maximum(sqrt_l, 1e-15)
+    # Chord slope α = (√u − √l) / (u − l) = 1 / (√u + √l)
+    alpha = jnp.where(
+        degenerate,
+        1.0 / (2.0 * safe_sqrt_l),
+        (sqrt_u - sqrt_l) / safe_denom,
+    )
+
+    # Lower bound: chord  β_l = √l − α·l
+    beta_l = sqrt_l - alpha * l
+
+    # Upper bound: tangent at x₀ = 1/(4α²),  β_u = 1/(4α)
+    safe_alpha = jnp.maximum(alpha, 1e-30)
+    beta_u = jnp.where(degenerate, sqrt_l - alpha * l, 1.0 / (4.0 * safe_alpha))
+
+    uA = alpha[..., None] * x.uA
+    ub = alpha * x.ub + beta_u
+    lA = alpha[..., None] * x.lA
+    lb = alpha * x.lb + beta_l
+
+    return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=sqrt_l, u=sqrt_u)
+
+
+linbp_registry[lax.sqrt_p] = _linbp_sqrt_p
 
 
 def _linbp_div_p(x, y, *, relu_mode, **kwargs):
