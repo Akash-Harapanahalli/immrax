@@ -2,9 +2,79 @@ from typing import List
 import jax
 from jax.tree_util import register_pytree_node_class
 import jax.numpy as jnp
-from typing import Tuple, Iterable
+from typing import Tuple, Iterable, Union, Optional
 from jaxtyping import ArrayLike
 import numpy as onp
+
+
+# ---------------------------------------------------------------------------
+# Rigorous-mode global state and helpers
+# ---------------------------------------------------------------------------
+
+_rigorous: bool = False  # global default
+_rigorous_forced: Optional[bool] = None  # set by context managers
+
+
+def _resolve_rigorous(kw_rigorous=None):
+    """Resolve rigorous mode: kwarg > context manager > global."""
+    if kw_rigorous is not None:
+        return kw_rigorous
+    if _rigorous_forced is not None:
+        return _rigorous_forced
+    return _rigorous
+
+
+def _get_rigorous():
+    """Return the current global rigorous flag."""
+    return _rigorous
+
+
+def _set_rigorous(val):
+    """Set the global rigorous flag, returning the old value."""
+    global _rigorous
+    old = _rigorous
+    _rigorous = val
+    return old
+
+
+def set_rigorous(val: bool) -> None:
+    """Set the global default for rigorous FP widening.
+
+    Parameters
+    ----------
+    val : bool
+        ``True`` to enable widening (the default), ``False`` to disable.
+    """
+    global _rigorous
+    _rigorous = val
+
+
+class rigorous:
+    """Context manager to force rigorous mode on."""
+
+    def __enter__(self):
+        global _rigorous_forced
+        self._old = _rigorous_forced
+        _rigorous_forced = True
+        return self
+
+    def __exit__(self, *a):
+        global _rigorous_forced
+        _rigorous_forced = self._old
+
+
+class non_rigorous:
+    """Context manager to force rigorous mode off."""
+
+    def __enter__(self):
+        global _rigorous_forced
+        self._old = _rigorous_forced
+        _rigorous_forced = False
+        return self
+
+    def __exit__(self, *a):
+        global _rigorous_forced
+        _rigorous_forced = self._old
 
 
 @register_pytree_node_class
@@ -56,29 +126,38 @@ class Interval:
     def pert(self) -> jax.Array:
         return (self.upper - self.lower) / 2
 
-    def __matmul__(self, _: "Interval") -> "Interval": ...
-    def __truediv__(self, _: "Interval") -> "Interval": ...
+    def __add__(self, other: Union["Interval", ArrayLike]) -> "Interval": ...
+    def __radd__(self, other: ArrayLike) -> "Interval": ...
+    def __sub__(self, other: Union["Interval", ArrayLike]) -> "Interval": ...
+    def __rsub__(self, other: ArrayLike) -> "Interval": ...
     def __neg__(self) -> "Interval": ...
+    def __mul__(self, other: Union["Interval", ArrayLike]) -> "Interval": ...
+    def __rmul__(self, other: ArrayLike) -> "Interval": ...
+    def __truediv__(self, other: Union["Interval", ArrayLike]) -> "Interval": ...
+    def __rtruediv__(self, other: ArrayLike) -> "Interval": ...
+    def __pow__(self, other: Union[int, "Interval"]) -> "Interval": ...
+    def __matmul__(self, other: Union["Interval", ArrayLike]) -> "Interval": ...
+    def __rmatmul__(self, other: ArrayLike) -> "Interval": ...
 
     def __len__(self) -> int:
         return len(self.lower)
 
     def reshape(self, *args, **kwargs):
-        return interval(
+        return Interval(
             self.lower.reshape(*args, **kwargs), self.upper.reshape(*args, **kwargs)
         )
 
     def ravel(self) -> List["Interval"]:
-        return [interval(l, u) for l, u in zip(self.lower.ravel(), self.upper.ravel())]
+        return [Interval(l, u) for l, u in zip(self.lower.ravel(), self.upper.ravel())]
 
     def atleast_1d(self) -> "Interval":
-        return interval(jnp.atleast_1d(self.lower), jnp.atleast_1d(self.upper))
+        return Interval(jnp.atleast_1d(self.lower), jnp.atleast_1d(self.upper))
 
     def atleast_2d(self) -> "Interval":
-        return interval(jnp.atleast_2d(self.lower), jnp.atleast_2d(self.upper))
+        return Interval(jnp.atleast_2d(self.lower), jnp.atleast_2d(self.upper))
 
     def atleast_3d(self) -> "Interval":
-        return interval(jnp.atleast_3d(self.lower), jnp.atleast_3d(self.upper))
+        return Interval(jnp.atleast_3d(self.lower), jnp.atleast_3d(self.upper))
 
     @property
     def ndim(self) -> int:
@@ -87,42 +166,85 @@ class Interval:
     def transpose(self, *args) -> "Interval":
         return Interval(self.lower.transpose(*args), self.upper.transpose(*args))
 
+    def broadcast_to(self, shape) -> "Interval":
+        return Interval(
+            jnp.broadcast_to(self.lower, shape), jnp.broadcast_to(self.upper, shape)
+        )
+
+    def squeeze(self, axis=None) -> "Interval":
+        return Interval(
+            jnp.squeeze(self.lower, axis=axis), jnp.squeeze(self.upper, axis=axis)
+        )
+
+    def sum(self, axis=None, keepdims=False) -> "Interval":
+        return Interval(
+            jnp.sum(self.lower, axis=axis, keepdims=keepdims),
+            jnp.sum(self.upper, axis=axis, keepdims=keepdims),
+        )
+
+    def scale(self, factor: Union[float, ArrayLike]) -> "Interval":
+        return icentpert(self.center, self.pert * factor)
+
     @property
     def T(self) -> "Interval":
         return self.transpose()
 
     def __and__(self, other: "Interval") -> "Interval":
-        return interval(
+        return Interval(
             jnp.maximum(self.lower, other.lower), jnp.minimum(self.upper, other.upper)
         )
 
     def __or__(self, other: "Interval") -> "Interval":
-        return interval(
+        return Interval(
             jnp.minimum(self.lower, other.lower), jnp.maximum(self.upper, other.upper)
         )
 
+    def _format_bounds(self) -> str:
+        """Format interval bounds numpy-style, replacing each scalar with ⟦lo, hi⟧."""
+        try:
+            lo = onp.asarray(self.lower)
+            hi = onp.asarray(self.upper)
+        except Exception:
+            return None
+
+        lc, rc = "⟦", "⟧"
+        SEP = "\x00"  # null byte won't appear in numeric strings
+
+        if lo.ndim == 0:
+            combined = onp.array([lo.item(), hi.item()])
+            s = onp.array2string(combined, max_line_width=10**9, separator=SEP)
+            lo_s, hi_s = (p.strip() for p in s.strip("[]").split(SEP))
+            return f"{lc}{lo_s}, {hi_s}{rc}"
+
+        # Format all lo and hi values together so both bounds share the same
+        # numeric precision/notation that numpy would choose for this data.
+        all_flat = onp.concatenate([lo.ravel(), hi.ravel()])
+        all_s = onp.array2string(all_flat, max_line_width=10**9, separator=SEP)
+        all_strs = [p.strip() for p in all_s.strip("[]").split(SEP)]
+
+        n = lo.size
+        interval_strs = [
+            f"{lc}{l}, {h}{rc}" for l, h in zip(all_strs[:n], all_strs[n:])
+        ]
+
+        # Delegate all layout (brackets, indentation, line-wrapping, alignment)
+        # to numpy via an object-dtype array.  JAX does not support object dtype.
+        obj = onp.array(interval_strs, dtype=object).reshape(lo.shape)
+        return onp.array2string(obj, formatter={"object": lambda s: s})
+
     def __str__(self) -> str:
-        # return (
-        #     onp.array(
-        #         [
-        #             [(l, u)]
-        #             for (l, u) in zip(self.lower.reshape(-1), self.upper.reshape(-1))
-        #         ],
-        #         dtype=onp.dtype([("f1", float), ("f2", float)]),
-        #     )
-        #     .reshape(self.shape + (1,))
-        #     .__str__()
-        # )
-        return self.lower.__str__() + " <= x <= " + self.upper.__str__()
+        s = self._format_bounds()
+        if s is None:
+            return f"Interval(lower={self.lower}, upper={self.upper})"
+        return s
 
     def __repr__(self) -> str:
-        # return onp.array([[(l,u)] for (l,u) in
-        #                 zip(self.lower.reshape(-1),self.upper.reshape(-1))],
-        #                 dtype=onp.dtype([('f1',float), ('f2', float)])).reshape(self.shape + (1,)).__str__()
-        # dtype=np.dtype([('f1',float), ('f2', float)])).reshape(self.shape + (1,)).__repr__()
-        return self.lower.__str__() + " <= x <= " + self.upper.__str__()
+        s = self._format_bounds()
+        if s is None:
+            return f"Interval(lower={self.lower}, upper={self.upper})"
+        return f"Interval({s})"
 
-    def __getitem__(self, i: slice | ArrayLike) -> "Interval":
+    def __getitem__(self, i: Union[slice, ArrayLike]) -> "Interval":
         return Interval(self.lower[i], self.upper[i])
 
     def __iter__(self):
@@ -136,7 +258,9 @@ class Interval:
 # HELPER FUNCTIONS
 
 
-def interval(lower: ArrayLike, upper: ArrayLike | None = None) -> Interval:
+def interval(
+    lower: ArrayLike, upper: Optional[ArrayLike] = None, rigorous: Optional[bool] = None
+) -> Interval:
     """interval: Helper to create a Interval from a lower and upper bound.
 
     Parameters
@@ -145,7 +269,10 @@ def interval(lower: ArrayLike, upper: ArrayLike | None = None) -> Interval:
         Lower bound of the interval.
     upper : ArrayLike
         Upper bound of the interval. Set to lower bound if None. Defaults to None.
-    lower:ArrayLike :
+    rigorous : bool, optional
+        When True, widen the interval by 1 ULP in each direction to account
+        for floating-point representation error.  Resolution order:
+        context manager > kwarg > global default (True).
 
     Returns
     -------
@@ -156,7 +283,11 @@ def interval(lower: ArrayLike, upper: ArrayLike | None = None) -> Interval:
     if isinstance(lower, Interval) and upper is None:
         return lower
     if upper is None:
-        return Interval(jnp.asarray(lower), jnp.asarray(lower))
+        v = jnp.asarray(lower)
+        iv = Interval(v, v)
+        if _resolve_rigorous(rigorous):
+            iv = widen(iv, 1)
+        return iv
     lower = jnp.asarray(lower)
     upper = jnp.asarray(upper)
     if lower.dtype != upper.dtype:
@@ -167,7 +298,10 @@ def interval(lower: ArrayLike, upper: ArrayLike | None = None) -> Interval:
         raise Exception(
             f"lower and upper shape should match, {lower.shape} != {upper.shape}"
         )
-    return Interval(jnp.asarray(lower), jnp.asarray(upper))
+    iv = Interval(lower, upper)
+    if _resolve_rigorous(rigorous):
+        iv = widen(iv, 1)
+    return iv
 
 
 def icopy(i: Interval) -> Interval:
@@ -187,7 +321,9 @@ def icopy(i: Interval) -> Interval:
     return Interval(jnp.copy(i.lower), jnp.copy(i.upper))
 
 
-def icentpert(cent: ArrayLike, pert: ArrayLike) -> Interval:
+def icentpert(
+    cent: ArrayLike, pert: ArrayLike, rigorous: Optional[bool] = None
+) -> Interval:
     """icentpert: Helper to create a Interval from a center of an interval and a perturbation.
 
     Parameters
@@ -196,6 +332,9 @@ def icentpert(cent: ArrayLike, pert: ArrayLike) -> Interval:
         Center of the interval, i.e., (l + u)/2
     pert : ArrayLike
         l-inf perturbation from the center, i.e., (u - l)/2
+    rigorous : bool, optional
+        When True, widen the interval by 1 ULP in each direction.
+        Resolution order: context manager > kwarg > global default (True).
 
     Returns
     -------
@@ -205,7 +344,10 @@ def icentpert(cent: ArrayLike, pert: ArrayLike) -> Interval:
     """
     cent = jnp.asarray(cent)
     pert = jnp.asarray(pert)
-    return interval(cent - pert, cent + pert)
+    iv = Interval(cent - pert, cent + pert)
+    if _resolve_rigorous(rigorous):
+        iv = widen(iv, 1)
+    return iv
 
 
 centpert2i = icentpert
@@ -244,7 +386,7 @@ def interval_intersect(Is: Iterable[Interval]) -> Interval:
     """
     l = jnp.max(jnp.array([i.lower for i in Is]), axis=0)
     u = jnp.min(jnp.array([i.upper for i in Is]), axis=0)
-    return interval(l, u)
+    return Interval(l, u)
 
 
 def interval_union(Is: Iterable[Interval]) -> Interval:
@@ -263,7 +405,7 @@ def interval_union(Is: Iterable[Interval]) -> Interval:
     """
     l = jnp.min(jnp.array([i.lower for i in Is]), axis=0)
     u = jnp.max(jnp.array([i.upper for i in Is]), axis=0)
-    return interval(l, u)
+    return Interval(l, u)
 
 
 def i2lu(i: Interval) -> Tuple[jax.Array, jax.Array]:
@@ -299,7 +441,7 @@ def lu2i(l: jax.Array, u: jax.Array) -> Interval:
         [l, u]
 
     """
-    return interval(l, u)
+    return Interval(l, u)
 
 
 def i2ut(i: Interval) -> jax.Array:
@@ -319,7 +461,7 @@ def i2ut(i: Interval) -> jax.Array:
     return jnp.concatenate((i.lower, i.upper))
 
 
-def ut2i(coordinate: jax.Array, n: int | None = None) -> Interval:
+def ut2i(coordinate: jax.Array, n: Optional[int] = None) -> Interval:
     """ut2i: Helper to convert an upper triangular coordinate in :math:`\\mathbb{R}\\times\\mathbb{R}` to an interval.
 
     Parameters
@@ -337,7 +479,7 @@ def ut2i(coordinate: jax.Array, n: int | None = None) -> Interval:
     """
     if n is None:
         n = len(coordinate) // 2
-    return interval(coordinate[:n], coordinate[n:])
+    return Interval(coordinate[:n], coordinate[n:])
 
 
 def izeros(shape: Tuple[int], dtype: onp.dtype = jnp.float32) -> Interval:
@@ -356,7 +498,7 @@ def izeros(shape: Tuple[int], dtype: onp.dtype = jnp.float32) -> Interval:
         interval of zeros
 
     """
-    return interval(jnp.zeros(shape, dtype), jnp.zeros(shape, dtype))
+    return Interval(jnp.zeros(shape, dtype), jnp.zeros(shape, dtype))
 
 
 def iconcatenate(intervals: Iterable[Interval], axis: int = 0) -> Interval:
@@ -375,7 +517,97 @@ def iconcatenate(intervals: Iterable[Interval], axis: int = 0) -> Interval:
         concatenated interval
 
     """
-    return interval(
+    return Interval(
         jnp.concatenate([i.lower for i in intervals], axis=axis),
         jnp.concatenate([i.upper for i in intervals], axis=axis),
     )
+
+
+def scale(i: Interval, factor: Union[float, ArrayLike]) -> Interval:
+    """Scale an interval by a given factor around its center.
+
+    Parameters
+    ----------
+    i : Interval
+        The interval to scale.
+    factor : float | ArrayLike
+        Scaling factor.
+
+    Returns
+    -------
+    Interval
+        The scaled interval.
+    """
+    return icentpert(i.center, i.pert * factor)
+
+
+def isinterval(x) -> bool:
+    """Check if x is an Interval."""
+    return isinstance(x, Interval)
+
+
+# ---------------------------------------------------------------------------
+# Rigorous widening primitives
+# ---------------------------------------------------------------------------
+
+
+@jax.custom_jvp
+def _widen_lower(x):
+    """Push *x* toward :math:`-\\infty` by one ULP."""
+    return jnp.nextafter(x, jnp.full_like(x, -jnp.inf))
+
+
+@_widen_lower.defjvp
+def _widen_lower_jvp(primals, tangents):
+    (x,) = primals
+    (t,) = tangents
+    return _widen_lower(x), t
+
+
+@jax.custom_jvp
+def _widen_upper(x):
+    """Push *x* toward :math:`+\\infty` by one ULP."""
+    return jnp.nextafter(x, jnp.full_like(x, jnp.inf))
+
+
+@_widen_upper.defjvp
+def _widen_upper_jvp(primals, tangents):
+    (x,) = primals
+    (t,) = tangents
+    return _widen_upper(x), t
+
+
+def widen(iv: Interval, n: int = 1) -> Interval:
+    """Widen an interval by *n* ULPs in each direction.
+
+    Pushes ``iv.lower`` toward :math:`-\\infty` and ``iv.upper`` toward
+    :math:`+\\infty` by *n* units in the last place.  The custom JVP
+    rules treat the widening as the identity so that automatic
+    differentiation passes through unchanged.
+
+    Parameters
+    ----------
+    iv : Interval
+        Interval to widen.
+    n : int
+        Number of ULPs to widen by (default 1).
+
+    Returns
+    -------
+    Interval
+        Widened interval.
+    """
+    if n == 0:
+        return iv
+    lo, hi = iv.lower, iv.upper
+    if n <= 4:
+        for _ in range(n):
+            lo = _widen_lower(lo)
+            hi = _widen_upper(hi)
+    else:
+        # O(1) widening: compute 1-ULP step, scale by n, add 1 ULP margin
+        lo_step = _widen_lower(lo) - lo  # negative
+        hi_step = _widen_upper(hi) - hi  # positive
+        lo = _widen_lower(lo + n * lo_step)
+        hi = _widen_upper(hi + n * hi_step)
+    return Interval(lo, hi)

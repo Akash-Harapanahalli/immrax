@@ -1,5 +1,5 @@
 from functools import wraps
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import equinox as eqx
 import jax
@@ -21,7 +21,14 @@ from jax.extend.core import Primitive
 from jax._src.lax import linalg as LA
 
 # TODO: import only necessary things
-from immrax.inclusion.interval import Interval, interval
+from immrax.inclusion.interval import (
+    Interval,
+    interval,
+    isinterval,
+    widen,
+    _get_rigorous,
+    _set_rigorous,
+)
 from functools import partial
 
 """
@@ -32,44 +39,83 @@ inclusion_registry = {}
 
 
 def natif(
-    f: Callable[..., jax.Array], *, fixed_argnums: int | Sequence[int] = None
+    f: Callable[..., jax.Array],
+    rigorous: bool = True,
 ) -> Callable[..., Interval]:
     """Creates a Natural Inclusion Function of f.
 
-    All (non-fixed) positional arguments are assumed to be replaced with interval arguments for the inclusion function.
+    Non-Interval positional arguments are automatically closed over
+    (treated as constants during tracing).  All keyword arguments are
+    also closed over.
 
     Parameters
     ----------
     f : Callable[..., jax.Array]
-        Function to construct Natural Inclusion Function from
-    fixed_argnums : int|Sequence[int]
-        Positional arguments to be treated as jax.Array instead of Interval
+        Function to construct Natural Inclusion Function from.
+    rigorous : bool
+        When ``True`` (default), every inclusion-registry handler whose
+        ``.n_ulps`` attribute is > 0 will have its output widened by
+        that many ULPs, ensuring that computed interval bounds
+        rigorously enclose the true mathematical result despite
+        floating-point rounding.
 
     Returns
     -------
     Callable[..., Interval]
         Natural Inclusion Function of f
 
+    Examples
+    --------
+    All arguments as intervals::
+
+        natif(f)(iv_x, iv_y)
+
+    First argument fixed (e.g. a matrix), second is an interval::
+
+        natif(f)(M, iv_x)
+
+    Mixed arguments::
+
+        natif(f)(M, iv_x, dims)
     """
 
-    @jit
     @wraps(f)
     def wrapped(*args, **kwargs):
-        """Natural inclusion function.
-        """
-        # Traverse the args and kwargs, replacing intervals with lower bounds.
-        # Convert args to at least jax.Array when they are not interval
-        getlower = lambda x: x.lower if isinstance(x, Interval) else jnp.asarray(x)
-        isinterval = lambda x: isinstance(x, Interval)
-        buildargs = jax.tree_util.tree_map(getlower, args, is_leaf=isinterval)
-        # kwargs stay not jax.Array
-        getlower = lambda x: x.lower if isinstance(x, Interval) else x
-        buildkwargs = jax.tree_util.tree_map(getlower, kwargs, is_leaf=isinterval)
-        # Build a jaxpr via evaluation on the lower bounds only. TODO: Do we need eqx.filter_make_jaxpr?
-        # closed_jaxpr = jax.make_jaxpr(f)(*buildargs, **buildkwargs)
-        closed_jaxpr = eqx.filter_make_jaxpr(f)(*buildargs, **buildkwargs)[0]
-        # Evaluate the jaxpr on the interval arguments using natif_jaxpr.
-        out = natif_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.literals, *args)
+        # Separate interval args from non-interval (fixed) args
+        interval_args = [arg for arg in args if isinterval(arg)]
+
+        if not interval_args:
+            return f(*args, **kwargs)
+
+        # Build a closure that receives only interval args and
+        # reconstructs the full argument list
+        def f_interval(*iv_args):
+            full_args = []
+            iv_idx = 0
+            for arg in args:
+                if isinterval(arg):
+                    full_args.append(iv_args[iv_idx])
+                    iv_idx += 1
+                else:
+                    full_args.append(arg)
+            return f(*full_args, **kwargs)
+
+        # Representative values for tracing (lower bounds of intervals)
+        getlower = lambda x: x.lower if isinterval(x) else jnp.asarray(x)
+        build_iv_args = jax.tree_util.tree_map(
+            getlower, interval_args, is_leaf=isinterval
+        )
+
+        # Build jaxpr from the closure — fixed args and kwargs become constants
+        closed_jaxpr = eqx.filter_make_jaxpr(f_interval)(*build_iv_args)[0]
+
+        # Evaluate the jaxpr with interval arguments
+        out = natif_jaxpr(
+            closed_jaxpr.jaxpr,
+            closed_jaxpr.literals,
+            *interval_args,
+            rigorous=rigorous,
+        )
         if len(out) == 1:
             return out[0]
         return out
@@ -77,7 +123,15 @@ def natif(
     return wrapped
 
 
-def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[Any]:
+def natif_jaxpr(
+    jaxpr: Jaxpr,
+    consts,
+    *args,
+    rigorous: bool = True,
+    propagate_source_info: bool = True,
+) -> list[Any]:
+    old_rigorous = _set_rigorous(rigorous)
+
     def read(v: Atom) -> Any:
         return v.val if isinstance(v, Literal) else env[v]
 
@@ -86,36 +140,47 @@ def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list
             assert typecheck(v.aval, val), (v.aval, val)
         env[v] = val
 
-    env: dict[Var, Any] = {}
-    safe_map(write, jaxpr.constvars, consts)
-    safe_map(write, jaxpr.invars, args)
-    lu = last_used(jaxpr)
-    for eqn in jaxpr.eqns:
-        subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
-        name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
-        traceback = eqn.source_info.traceback if propagate_source_info else None
-        with source_info_util.user_context(traceback, name_stack=name_stack):
-            invars = safe_map(read, eqn.invars)
-            if any([isinstance(read(iv), Interval) for iv in eqn.invars]):
-                try:
-                    ans = inclusion_registry[eqn.primitive](
-                        *subfuns, *invars, **bind_params
-                    )
-                except KeyError:
-                    raise NotImplementedError(
-                        f"{eqn.primitive} not in inclusion_registry"
-                    )
+    try:
+        env: dict[Var, Any] = {}
+        safe_map(write, jaxpr.constvars, consts)
+        safe_map(write, jaxpr.invars, args)
+        lu = last_used(jaxpr)
+        for eqn in jaxpr.eqns:
+            subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+            name_stack = (
+                source_info_util.current_name_stack() + eqn.source_info.name_stack
+            )
+            traceback = eqn.source_info.traceback if propagate_source_info else None
+            with source_info_util.user_context(traceback, name_stack=name_stack):
+                invars = safe_map(read, eqn.invars)
+                if any([isinstance(read(iv), Interval) for iv in eqn.invars]):
+                    try:
+                        handler = inclusion_registry[eqn.primitive]
+                        ans = handler(*subfuns, *invars, **bind_params)
+                    except KeyError:
+                        raise NotImplementedError(
+                            f"{eqn.primitive} not in inclusion_registry"
+                        )
+                    # Rigorous widening
+                    if _get_rigorous() and isinstance(ans, Interval):
+                        n = getattr(handler, "n_ulps", 0)
+                        if n > 0:
+                            ans = widen(ans, n)
+                else:
+                    ans = eqn.primitive.bind(*subfuns, *invars, **bind_params)
+            if eqn.primitive.multiple_results:
+                safe_map(write, eqn.outvars, ans)
             else:
-                ans = eqn.primitive.bind(*subfuns, *invars, **bind_params)
-        if eqn.primitive.multiple_results:
-            safe_map(write, eqn.outvars, ans)
-        else:
-            write(eqn.outvars[0], ans)
-        clean_up_dead_vars(eqn, env, lu)
-    return safe_map(read, jaxpr.outvars)
+                write(eqn.outvars[0], ans)
+            clean_up_dead_vars(eqn, env, lu)
+        return safe_map(read, jaxpr.outvars)
+    finally:
+        _set_rigorous(old_rigorous)
 
 
-def _make_inclusion_passthrough_p(primitive: Primitive) -> Callable[..., Interval]:
+def _make_inclusion_passthrough_p(
+    primitive: Primitive, n_ulps: int = 0
+) -> Callable[..., Interval]:
     """Creates an inclusion function that applies to the lower and upper bounds individually."""
 
     def _inclusion_p(*args, **kwargs) -> Interval:
@@ -129,19 +194,21 @@ def _make_inclusion_passthrough_p(primitive: Primitive) -> Callable[..., Interva
             primitive.bind(*args_l, **kwargs), primitive.bind(*args_u, **kwargs)
         )
 
+    _inclusion_p.n_ulps = n_ulps
     return _inclusion_p
 
 
-def _add_passthrough_to_registry(primitive: Primitive) -> None:
+def _add_passthrough_to_registry(primitive: Primitive, n_ulps: int = 0) -> None:
     """Helper to add a passthrough primitive to the inclusion registry."""
-    inclusion_registry[primitive] = _make_inclusion_passthrough_p(primitive)
+    inclusion_registry[primitive] = _make_inclusion_passthrough_p(primitive, n_ulps)
 
 
 # We would like to passthrough array operations like reshaping, slicing, etc.
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
 _add_passthrough_to_registry(lax.slice_p)
-_add_passthrough_to_registry(lax.split_p)
+if hasattr(lax, "split_p"):
+    _add_passthrough_to_registry(lax.split_p)
 _add_passthrough_to_registry(lax.dynamic_slice_p)
 _add_passthrough_to_registry(lax.squeeze_p)
 _add_passthrough_to_registry(lax.transpose_p)
@@ -149,7 +216,7 @@ _add_passthrough_to_registry(lax.broadcast_in_dim_p)
 _add_passthrough_to_registry(lax.concatenate_p)
 _add_passthrough_to_registry(lax.gather_p)
 _add_passthrough_to_registry(lax.scatter_p)
-_add_passthrough_to_registry(lax.scatter_add_p)
+_add_passthrough_to_registry(lax.scatter_add_p, n_ulps=1)
 _add_passthrough_to_registry(lax.scatter_max_p)
 _add_passthrough_to_registry(lax.scatter_min_p)
 if hasattr(lax, "select_p"):
@@ -163,13 +230,62 @@ _add_passthrough_to_registry(lax.reduce_max_p)
 _add_passthrough_to_registry(lax.reduce_min_p)
 _add_passthrough_to_registry(lax.max_p)
 _add_passthrough_to_registry(lax.min_p)
-_add_passthrough_to_registry(lax.exp_p)
-_add_passthrough_to_registry(lax.reduce_sum_p)
+_add_passthrough_to_registry(lax.exp_p, n_ulps=1)
+_add_passthrough_to_registry(lax.rev_p)
+
+
+def _inclusion_reduce_sum_p(x: Interval, **kwargs) -> Interval:
+    """Interval reduce_sum with rigorous widening scaled by reduction size."""
+    axes = kwargs["axes"]
+    lo = lax.reduce_sum_p.bind(x.lower, **kwargs)
+    hi = lax.reduce_sum_p.bind(x.upper, **kwargs)
+    result = Interval(lo, hi)
+    if _get_rigorous():
+        n = 1
+        for ax in axes:
+            n *= x.lower.shape[ax]
+        if n > 1:
+            result = widen(result, n - 1)
+    return result
+
+
+_inclusion_reduce_sum_p.n_ulps = 0
+inclusion_registry[lax.reduce_sum_p] = _inclusion_reduce_sum_p
+
+
+def _inclusion_reduce_prod_p(x: Interval, *, axes) -> Interval:
+    """Interval reduce_prod: multiply intervals along specified axes.
+
+    Uses sequential interval multiplication (handles signs correctly).
+    """
+    for axis in sorted(axes, reverse=True):
+        n = x.lower.shape[axis]
+        # Start with the first slice
+        result = interval(
+            jnp.take(x.lower, 0, axis=axis),
+            jnp.take(x.upper, 0, axis=axis),
+        )
+        # Multiply remaining slices using interval arithmetic
+        for i in range(1, n):
+            next_iv = interval(
+                jnp.take(x.lower, i, axis=axis),
+                jnp.take(x.upper, i, axis=axis),
+            )
+            result = result * next_iv
+        x = result
+    return x
+
+
+_inclusion_reduce_prod_p.n_ulps = 2
+inclusion_registry[lax.reduce_prod_p] = _inclusion_reduce_prod_p
 _add_passthrough_to_registry(lax.pad_p)
 _add_passthrough_to_registry(lax.ne_p)
 _add_passthrough_to_registry(lax.lt_p)
-_add_passthrough_to_registry(lax.lt_to_p)
+if hasattr(lax, "lt_to_p"):
+    _add_passthrough_to_registry(lax.lt_to_p)
 _add_passthrough_to_registry(debug_callback_p)
+if hasattr(lax, "nextafter_p"):
+    _add_passthrough_to_registry(lax.nextafter_p)
 
 """
 TODO: Handle higher order primitives
@@ -198,44 +314,101 @@ Natively, we cannot pass in pytrees like we are trying here.
 
 
 def _inclusion_pjit_p(*args, **bind_params) -> Interval:
-    """For now, this ignores a pjit_p and returns the evaluation of the jaxpr."""
-    # TODO: Do we need to implement consts here?
+    """Handles jit_p (jax >= 0.9) / pjit_p (jax < 0.9) by recursing into the inner jaxpr.
+
+    Constants are always inlined by JAX as literal values in the inner jaxpr, so
+    consts is always [] here.
+    """
     bind_jaxpr = bind_params.pop("jaxpr")
     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
         bind_jaxpr = bind_jaxpr.jaxpr
-    return natif_jaxpr(bind_jaxpr, [], *args)
+    return natif_jaxpr(bind_jaxpr, [], *args, rigorous=_get_rigorous())
 
 
-inclusion_registry[jax._src.pjit.pjit_p] = _inclusion_pjit_p
+# jax >= 0.9 renamed pjit_p to jit_p
+_jit_primitive = getattr(jax._src.pjit, "jit_p", getattr(jax._src.pjit, "pjit_p", None))
+if _jit_primitive is not None:
+    inclusion_registry[_jit_primitive] = _inclusion_pjit_p
 
 
-def _inclusion_scan_p(*args, **bind_params) -> Interval:
-    # print('in scan')
-    # print(args)
+def _inclusion_custom_jvp_call_p(primal_fn, jvp_fn, *args, **bind_params) -> Any:
+    """Handle custom_jvp_call by natif-ing the primal, ignoring the JVP rule.
 
-    # bind_jaxpr = bind_params.pop('jaxpr')
-    # if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr) :
-    #     bind_jaxpr = bind_jaxpr.jaxpr
+    The JVP rule exists for AD transforms and is irrelevant for interval
+    arithmetic. primal_fn wraps jaxpr_as_fun(call_jaxpr); we extract the
+    ClosedJaxpr directly and recurse with natif_jaxpr, mirroring pjit_p.
+    """
+    call_jaxpr = primal_fn.f.args[0]
+    if isinstance(call_jaxpr, jax.extend.core.ClosedJaxpr):
+        return natif_jaxpr(
+            call_jaxpr.jaxpr, call_jaxpr.consts, *args, rigorous=_get_rigorous()
+        )
+    return natif_jaxpr(call_jaxpr, [], *args, rigorous=_get_rigorous())
 
-    # isinterval = lambda x : isinstance(x, Interval)
-    # getlower = lambda x : x.lower if isinstance(x, Interval) else x
-    # getupper = lambda x : x.upper if isinstance(x, Interval) else x
-    # # carry_l = jax.tree_util.tree_map(getlower, carry, is_leaf=isinterval)
-    # # carry_u = jax.tree_util.tree_map(getupper, carry, is_leaf=isinterval)
-    # # init_l = jax.tree_util.tree_map(getlower, init, is_leaf=isinterval)
-    # # init_u = jax.tree_util.tree_map(getupper, init, is_leaf=isinterval)
-    # args_l = jax.tree.tree_map(getlower, args, is_leaf=isinterval)
-    # args_u = jax.tree.tree_map(getupper, args, is_leaf=isinterval)
 
-    # def _natif_bind_jaxpr (scan_args_l, scan_args_u, **kwargs) :
-    #     scan_args = jax.tree.tree_map(lambda l, u : interval(l, u), scan_args_l, scan_args_u)
-    #     return natif_jaxpr(bind_jaxpr, [], *scan_args)
+_custom_jvp_call_primitive = getattr(
+    jax._src.custom_derivatives, "custom_jvp_call_p", None
+)
+if _custom_jvp_call_primitive is not None:
+    inclusion_registry[_custom_jvp_call_primitive] = _inclusion_custom_jvp_call_p
 
-    # def _f (carry, init) :
 
-    #     return natif_jaxpr(bind_jaxpr, [], carry, init)
+def _inclusion_scan_p(*args, **bind_params):
+    bind_jaxpr = bind_params["jaxpr"]
+    num_consts = bind_params["num_consts"]
+    num_carry = bind_params["num_carry"]
 
-    raise NotImplementedError("scan not implemented")
+    if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
+        body_jaxpr = bind_jaxpr.jaxpr
+        body_consts = bind_jaxpr.consts
+    else:
+        body_jaxpr = bind_jaxpr
+        body_consts = []
+
+    consts_vals = args[:num_consts]
+    carry_init = args[num_consts : num_consts + num_carry]
+    xs_vals = args[num_consts + num_carry :]
+
+    # Flatten carry and xs pytrees (Intervals → (lower, upper) leaf pairs) so
+    # lax.scan traces body_fn with plain abstract arrays.  Inside body_fn we
+    # unflatten back to the original structure, so natif_jaxpr sees real
+    # Interval objects (isinstance returns True even for abstract-valued ones).
+    carry_flat, carry_treedef = jax.tree_util.tree_flatten(carry_init)
+    xs_flat, xs_treedef = jax.tree_util.tree_flatten(xs_vals)
+
+    y_treedef_ref = [None]
+
+    def body_fn(carry_f, xs_f):
+        carry_in = jax.tree_util.tree_unflatten(carry_treedef, carry_f)
+        xs_in = jax.tree_util.tree_unflatten(xs_treedef, xs_f)
+        out = natif_jaxpr(
+            body_jaxpr,
+            body_consts,
+            *consts_vals,
+            *carry_in,
+            *xs_in,
+            rigorous=_get_rigorous(),
+        )
+        carry_out = out[:num_carry]
+        y_out = out[num_carry:]
+        carry_out_flat, _ = jax.tree_util.tree_flatten(carry_out)
+        y_out_flat, y_treedef = jax.tree_util.tree_flatten(y_out)
+        y_treedef_ref[0] = y_treedef
+        return carry_out_flat, y_out_flat
+
+    final_carry_flat, ys_flat = lax.scan(
+        body_fn,
+        carry_flat,
+        xs_flat,
+        length=bind_params.get("length"),
+        reverse=bind_params.get("reverse", False),
+        unroll=bind_params.get("unroll", 1),
+    )
+
+    final_carry = jax.tree_util.tree_unflatten(carry_treedef, final_carry_flat)
+    y_treedef = y_treedef_ref[0]
+    ys = jax.tree_util.tree_unflatten(y_treedef, ys_flat) if y_treedef else []
+    return [*final_carry, *ys]
 
 
 inclusion_registry[lax.scan_p] = _inclusion_scan_p
@@ -252,9 +425,11 @@ def _inclusion_add_p(x: Interval, y: Interval) -> Interval:
         return x + y
 
 
+_inclusion_add_p.n_ulps = 1
 inclusion_registry[lax.add_p] = _inclusion_add_p
 inclusion_registry[ad_util.add_any_p] = _inclusion_add_p
 Interval.__add__ = _inclusion_add_p
+Interval.__radd__ = _inclusion_add_p
 
 
 def _inclusion_sub_p(x: Interval, y: Interval) -> Interval:
@@ -268,14 +443,17 @@ def _inclusion_sub_p(x: Interval, y: Interval) -> Interval:
         return x - y
 
 
+_inclusion_sub_p.n_ulps = 1
 inclusion_registry[lax.sub_p] = _inclusion_sub_p
 Interval.__sub__ = _inclusion_sub_p
+Interval.__rsub__ = _inclusion_sub_p
 
 
 def _inclusion_neg_p(x: Interval) -> Interval:
     return Interval(-x.upper, -x.lower)
 
 
+_inclusion_neg_p.n_ulps = 0
 inclusion_registry[lax.neg_p] = _inclusion_neg_p
 Interval.__neg__ = _inclusion_neg_p
 
@@ -302,8 +480,10 @@ def _inclusion_mul_p(x: Interval, y: Interval) -> Interval:
         return x * y
 
 
+_inclusion_mul_p.n_ulps = 1
 inclusion_registry[lax.mul_p] = _inclusion_mul_p
 Interval.__mul__ = _inclusion_mul_p
+Interval.__rmul__ = _inclusion_mul_p
 
 
 def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
@@ -317,8 +497,10 @@ def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
         return x / y
 
 
+_inclusion_div_p.n_ulps = 2
 inclusion_registry[lax.div_p] = _inclusion_div_p
 Interval.__truediv__ = _inclusion_div_p
+Interval.__rtruediv__ = lambda x, y: _inclusion_div_p(y, x)
 
 
 def _inclusion_reciprocal_p(x: Interval) -> Interval:
@@ -336,6 +518,10 @@ def _inclusion_reciprocal_p(x: Interval) -> Interval:
 def _inclusion_integer_pow_p(x: Interval, y: int) -> Interval:
     if not isinstance(x, Interval):
         return x**y
+
+    # x^0 = 1 for all x
+    if isinstance(y, int) and y == 0:
+        return Interval(jnp.ones_like(x.lower), jnp.ones_like(x.upper))
 
     def _inclusion_integer_pow_impl(x: Interval, y: int) -> Interval:
         l_pow = lax.integer_pow(x.lower, y)
@@ -365,6 +551,7 @@ def _inclusion_integer_pow_p(x: Interval, y: int) -> Interval:
     return Interval(ol, ou)
 
 
+_inclusion_integer_pow_p.n_ulps = 2
 inclusion_registry[lax.integer_pow_p] = _inclusion_integer_pow_p
 Interval.__pow__ = _inclusion_integer_pow_p
 
@@ -374,7 +561,9 @@ def _inclusion_square_p(x: Interval) -> Interval:
     return _inclusion_integer_pow_p(x, 2)
 
 
-inclusion_registry[lax.square_p] = _inclusion_square_p
+_inclusion_square_p.n_ulps = 1
+if hasattr(lax, "square_p"):
+    inclusion_registry[lax.square_p] = _inclusion_square_p
 
 
 def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
@@ -406,17 +595,24 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
             _2 = a.lower * b.upper
             _3 = a.upper * b.lower
             _4 = a.upper * b.upper
-            return Interval(
+            result = Interval(
                 jnp.minimum(jnp.minimum(_1, _2), jnp.minimum(_3, _4)),
                 jnp.maximum(jnp.maximum(_1, _2), jnp.maximum(_3, _4)),
             )
+            if _get_rigorous():
+                result = widen(result, 1)
+            return result
 
-        isum = lambda x: Interval(jnp.sum(x.lower), jnp.sum(x.upper))
+        def isum(x):
+            result = Interval(jnp.sum(x.lower), jnp.sum(x.upper))
+            if _get_rigorous():
+                k = x.lower.size
+                if k > 1:
+                    result = widen(result, k - 1)
+            return result
 
         # Two vectors -> scalar
         def f(a, b):
-            # _mulres = jax.vmap(_mul)(a, b)
-            # return Interval(jnp.sum(_mulres.lower), jnp.sum(_mulres.upper))
             _r = jax.vmap(_mul)
             return isum(_r(a, b))
 
@@ -441,6 +637,7 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
     return f(A, B)
 
 
+_inclusion_dot_general_p.n_ulps = 0
 inclusion_registry[lax.dot_general_p] = _inclusion_dot_general_p
 
 
@@ -494,6 +691,7 @@ def _inclusion_sin_p(x: Interval, accuracy=None) -> Interval:
     return Interval(_x.reshape(x.shape), x_.reshape(x.shape))
 
 
+_inclusion_sin_p.n_ulps = 2
 inclusion_registry[lax.sin_p] = _inclusion_sin_p
 
 
@@ -503,6 +701,7 @@ def _inclusion_cos_p(x: Interval, accuracy=None) -> Interval:
     )
 
 
+_inclusion_cos_p.n_ulps = 2
 inclusion_registry[lax.cos_p] = _inclusion_cos_p
 
 
@@ -517,30 +716,64 @@ def _inclusion_tan_p(x: Interval, accuracy=None) -> Interval:
     return Interval(ol, ou)
 
 
+_inclusion_tan_p.n_ulps = 2
 inclusion_registry[lax.tan_p] = _inclusion_tan_p
 
 # def _inclusion_atan_p (x:Interval, accuracy=None) -> Interval :
 #     return Interval(lax.atan(x.lower), lax.atan(x.upper))
 # inclusion_registry[lax.atan_p] = _inclusion_atan_p
-_add_passthrough_to_registry(lax.atan_p)
+_add_passthrough_to_registry(lax.atan_p, n_ulps=1)
 
 
 def _inclusion_asin_p(x: Interval, accuracy=None) -> Interval:
-    return Interval(
-        lax.arcsin(x.lower, accuracy=accuracy), lax.arcsin(x.upper, accuracy=accuracy)
-    )
+    return Interval(lax.asin(x.lower), lax.asin(x.upper))
 
 
+_inclusion_asin_p.n_ulps = 1
 inclusion_registry[lax.asin_p] = _inclusion_asin_p
 
 
 def _inclusion_sqrt_p(x: Interval, accuracy=None) -> Interval:
     ol = jnp.where((x.lower < 0), -jnp.inf, jnp.sqrt(x.lower))
-    ou = jnp.where((x.lower < 0), jnp.inf, jnp.sqrt(x.upper))
+    ou = jnp.where((x.lower < 0), -jnp.inf, jnp.sqrt(x.upper))
     return Interval(ol, ou)
 
 
+_inclusion_sqrt_p.n_ulps = 1
 inclusion_registry[lax.sqrt_p] = _inclusion_sqrt_p
+
+
+def _inclusion_rsqrt_p(x: Interval, accuracy=None) -> Interval:
+    # rsqrt = 1/sqrt(x) is monotonically decreasing
+    # Map [a, b] -> [rsqrt(b), rsqrt(a)]
+    # Handle domain x > 0.
+    ol = jnp.where(
+        (x.upper <= 0), -jnp.inf, lax.rsqrt(x.upper)
+    )  # if upper <= 0, invalid. if lower <= 0, rsqrt(lower) inv.
+    # Actually, interval semantics: if input contains invalid points, result is usually entire real line or restricted.
+    # Existing sqrt uses -inf for invalid.
+    # rsqrt(0) -> inf.
+    # if x.lower <= 0, rsqrt(x.lower) is usually nan/inf.
+    # Let's match JAX behavior but swap bounds.
+
+    # Simple swap:
+    lower_r = lax.rsqrt(x.upper)
+    upper_r = lax.rsqrt(x.lower)
+
+    # Handle negative inputs:
+    # If upper < 0, result is invalid.
+    ol = jnp.where(x.upper < 0, -jnp.inf, lower_r)
+    ou = jnp.where(x.lower < 0, jnp.inf, upper_r)
+
+    return Interval(ol, ou)
+
+
+_inclusion_rsqrt_p.n_ulps = 1
+if hasattr(lax, "rsqrt_p"):
+    inclusion_registry[lax.rsqrt_p] = _inclusion_rsqrt_p
+else:
+    # Fallback if rsqrt_p is not directly exposed (it usually is)
+    pass
 
 
 def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
@@ -575,17 +808,111 @@ def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
     return Interval(resl.reshape(xsh), resu.reshape(xsh))
 
 
+_inclusion_pow_p.n_ulps = 2
 inclusion_registry[lax.pow_p] = _inclusion_pow_p
 
 
-def _inclusion_tanh_p(x: Interval) -> Interval:
-    return Interval(jnp.tanh(x.lower), jnp.tanh(x.upper))
+def _inclusion_abs_p(x: Interval) -> Interval:
+    ol = jnp.where(
+        jnp.logical_and(x.lower <= 0, x.upper >= 0),
+        0.0,
+        jnp.minimum(lax.abs(x.lower), lax.abs(x.upper)),
+    )
+    ou = jnp.maximum(lax.abs(x.lower), lax.abs(x.upper))
+    return Interval(ol, ou)
 
 
-inclusion_registry[lax.tanh_p] = _inclusion_tanh_p
+_inclusion_abs_p.n_ulps = 0
+inclusion_registry[lax.abs_p] = _inclusion_abs_p
+
+# def _inclusion_tanh_p(x: Interval, accuracy=None) -> Interval:
+#     return Interval(lax.tanh(x.lower, accuracy=accuracy), lax.tanh(x.upper, accuracy=accuracy))
+
+# inclusion_registry[lax.tanh_p] = _inclusion_tanh_p
+_add_passthrough_to_registry(lax.tanh_p, n_ulps=1)
+_add_passthrough_to_registry(lax.logistic_p, n_ulps=1)
 
 
-Interval.__matmul__ = jit(natif(jnp.matmul))
+def _inclusion_log_p(x: Interval, accuracy=None) -> Interval:
+    ol = jnp.where((x.lower < 0), -jnp.inf, jnp.log(x.lower))
+    ou = jnp.where((x.lower < 0), -jnp.inf, jnp.log(x.upper))
+    return Interval(ol, ou)
+
+
+_inclusion_log_p.n_ulps = 1
+inclusion_registry[lax.log_p] = _inclusion_log_p
+
+
+def _inclusion_log1p_p(x: Interval, accuracy=None) -> Interval:
+    ol = jnp.where((x.lower < -1), -jnp.inf, jnp.log1p(x.lower))
+    ou = jnp.where((x.lower < -1), -jnp.inf, jnp.log1p(x.upper))
+    return Interval(ol, ou)
+
+
+_inclusion_log1p_p.n_ulps = 1
+inclusion_registry[lax.log1p_p] = _inclusion_log1p_p
+
+Interval.__matmul__ = natif(jnp.matmul)
+Interval.__rmatmul__ = lambda self, other: natif(jnp.matmul)(other, self)
+
+
+def _inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
+    # Basic O(n) implementation of cumprod: scan over the axis, multiplying as we go
+
+    def _cumprod_scan(carry, x):
+        ic = interval(*carry)
+        ix = interval(*x)
+
+        new_ic = ic * ix
+        new_carry = jnp.stack([new_ic.lower, new_ic.upper])
+        return new_carry, new_carry
+
+    # init = (jnp.ones_like(x.lower), jnp.ones_like(x.upper))
+    # Move axis to the front for scanning, then move back at the end
+
+    # print(x, axis)
+
+    xl = jnp.moveaxis(x.lower, axis, 0)
+    xu = jnp.moveaxis(x.upper, axis, 0)
+    xs = jnp.stack([xl, xu], axis=1)  # shape (length, 2, ...)
+
+    init = jnp.ones_like(xs[0])  # shape (2, ...)
+
+    # print(init.shape)
+    # print(xs)
+    # print(xs.shape)
+
+    _, result = lax.scan(_cumprod_scan, init, xs, reverse=reverse)
+
+    # print(result)
+
+    ret = interval(
+        jnp.moveaxis(result[:, 0], 0, axis), jnp.moveaxis(result[:, 1], 0, axis)
+    )
+
+    return ret
+
+
+def _fake_inclusion_cumprod_p(x: Interval, *, axis=0, reverse=False) -> Interval:
+    # TODO: fix this
+    # return interval(
+    #     lax.cumprod(x.lower, axis=axis, reverse=reverse),
+    #     lax.cumprod(x.upper, axis=axis, reverse=reverse),
+    # )
+    # ret = interval(jnp.ones_like(x.lower))
+    retl = [jnp.ones_like(x.lower[0])]
+    retu = [jnp.ones_like(x.upper[0])]
+    for i in range(x.lower.shape[axis]):
+        reti = interval(retl[-1], retu[-1]) * x[i]
+        retl.append(reti.lower)
+        retu.append(reti.upper)
+
+    return interval(jnp.asarray(retl[1:]), jnp.array(retu[1:]))
+
+
+# TODO:: correct this
+_inclusion_cumprod_p.n_ulps = 0
+inclusion_registry[lax.cumprod_p] = _inclusion_cumprod_p
 
 # Some linear algebra routines
 
