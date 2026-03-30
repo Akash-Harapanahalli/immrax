@@ -168,7 +168,8 @@ def _linbp_jaxpr(
                     else:
                         ans = _tighten(ans)
             else:
-                subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+                bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+                subfuns = bind_params.pop('subfuns', ())
                 ans = eqn.primitive.bind(*subfuns, *invars, **bind_params)
         if eqn.primitive.multiple_results:
             safe_map(write, eqn.outvars, ans)

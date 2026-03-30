@@ -81,7 +81,7 @@ class System(abc.ABC):
         return self.f(*args, **kwargs)
 
     @partial(
-        jax.jit, static_argnums=(0, 4), static_argnames=("solver", "f_kwargs", "inputs")
+        jax.jit, static_argnums=(0, 4), static_argnames=("solver", "f_kwargs", "inputs", "max_steps")
     )
     def compute_trajectory(
         self,
@@ -93,6 +93,7 @@ class System(abc.ABC):
         *,
         solver: Union[Literal["euler", "rk45", "tsit5"], AbstractSolver] = "tsit5",
         f_kwargs: immutabledict = immutabledict({}),
+        max_steps: int = 4096,
         **kwargs,
     ) -> RawTrajectory:
         """Computes the trajectory of the system from time t0 to tf with initial condition x0.
@@ -152,7 +153,6 @@ class System(abc.ABC):
                     f"Times {t0=} and {tf=} must be integers for discrete evolution, got {type(t0)=} and {type(tf)=}"
                 )
 
-            max_steps = 4096
             times = jnp.where(
                 jnp.arange(max_steps) <= tf - t0,
                 t0 + jnp.arange(max_steps),
