@@ -19,6 +19,7 @@ from jax._src.util import safe_map
 from jax.tree_util import register_pytree_node_class
 
 from immrax.inclusion.interval import Interval, interval
+from immrax.inclusion.nif import _inclusion_dot_general_p
 
 """
 Forward linear bound propagation through a JAX function via Jaxpr interpretation.
@@ -167,7 +168,8 @@ def _linbp_jaxpr(
                     else:
                         ans = _tighten(ans)
             else:
-                subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+                bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+                subfuns = bind_params.pop('subfuns', ())
                 ans = eqn.primitive.bind(*subfuns, *invars, **bind_params)
         if eqn.primitive.multiple_results:
             safe_map(write, eqn.outvars, ans)
@@ -303,56 +305,26 @@ def _linbp_mul_p(x, y, *, relu_mode, **kwargs):
 linbp_registry[lax.mul_p] = _linbp_mul_p
 
 
-def _fix_nin_last(lA_raw, x_lA_ndim, dim_nums):
-    """Move the n_in axis back to the last position after dot_general.
-
-    When x.lA has shape (*S, n_in) and we apply dot_general(x.lA, W, dim_nums)
-    where dim_nums contracts over some S axes (not n_in), JAX places the result
-    axes in order: batch + free_lhs + free_rhs.  The n_in axis is the *last*
-    free_lhs axis, so it lands at position n_batch + n_free_lhs - 1 instead of
-    the final position.  This helper transposes it back to the end.
-    """
-    (lhs_c, rhs_c), (lhs_b, rhs_b) = dim_nums
-    n_batch = len(lhs_b)
-    # n_free_lhs counts dims of x.lA that are neither contracting nor batch;
-    # one of them is n_in (the last dim of x.lA).
-    n_free_lhs = x_lA_ndim - len(lhs_c) - len(lhs_b)
-    n_free_rhs = lA_raw.ndim - n_batch - n_free_lhs
-    if n_free_rhs == 0:
-        return lA_raw  # n_in is already last
-    nin_pos = n_batch + n_free_lhs - 1
-    total = lA_raw.ndim
-    perm = list(range(total))
-    perm.pop(nin_pos)
-    perm.append(nin_pos)
-    return jnp.transpose(lA_raw, perm)
-
-
 def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
     (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
     dim_nums = dimension_numbers
 
     if isinstance(x, LinearBound) and not isinstance(y, LinearBound):
-        # x is LinearBound, y (W) is constant: e.g. x @ W  (equinox linear)
-        # x.lA has shape (*S_x, n_in); dot_general contracts over S_x dims,
-        # leaving n_in as the last free_lhs dim — but JAX places it before
-        # free_rhs dims.  We fix that with _fix_nin_last.
+        # x is LinearBound, y (W) is constant: e.g. x @ W
+        # x.uA has shape (*S_x, n_in); n_in is an LHS free dim in dot_general,
+        # so JAX would place it before RHS free dims, giving (*S_x_free, n_in, *S_out)
+        # instead of (*S_out, n_in). Fix: vmap over the n_in axis.
         W = y
         Wp = jnp.clip(W, 0, None)
         Wn = jnp.clip(W, None, 0)
-        x_lA_ndim = x.lA.ndim
-
-        def _dg(a, b):
-            raw = lax.dot_general(a, b, dim_nums)
-            return _fix_nin_last(raw, x_lA_ndim, dim_nums)
-
-        uA = _dg(x.uA, Wp) + _dg(x.lA, Wn)
-        lA = _dg(x.lA, Wp) + _dg(x.uA, Wn)
-        ub = lax.dot_general(x.ub, Wp, dim_nums) + lax.dot_general(x.lb, Wn, dim_nums)
-        lb = lax.dot_general(x.lb, Wp, dim_nums) + lax.dot_general(x.ub, Wn, dim_nums)
-        # Concrete bounds
-        ul = lax.dot_general(x.u, Wp, dim_nums) + lax.dot_general(x.l, Wn, dim_nums)
-        ll = lax.dot_general(x.l, Wp, dim_nums) + lax.dot_general(x.u, Wn, dim_nums)
+        dot = lambda a, b: lax.dot_general(a, b, dim_nums)
+        dot_vmap = jax.vmap(dot, in_axes=(-1, None), out_axes=-1)
+        uA = dot_vmap(x.uA, Wp) + dot_vmap(x.lA, Wn)
+        lA = dot_vmap(x.lA, Wp) + dot_vmap(x.uA, Wn)
+        ub = dot(x.ub, Wp) + dot(x.lb, Wn)
+        lb = dot(x.lb, Wp) + dot(x.ub, Wn)
+        ul = dot(x.u, Wp) + dot(x.l, Wn)
+        ll = dot(x.l, Wp) + dot(x.u, Wn)
         return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=ll, u=ul)
 
     elif not isinstance(x, LinearBound) and isinstance(y, LinearBound):
@@ -369,27 +341,16 @@ def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
         return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=ll, u=ul)
 
     else:
-        # Both LinearBound: IBP fallback
+        # Both LinearBound: fall back to natif interval arithmetic, which does
+        # element-wise 4-corner min/max then reduces over contracting dims.
         n_in = x.n_in
-        ll = (
-            lax.dot_general(jnp.clip(x.l, 0, None), y.l, dim_nums)
-            + lax.dot_general(jnp.clip(x.l, None, 0), y.u, dim_nums)
-            + lax.dot_general(jnp.clip(x.u, 0, None), y.l, dim_nums)
-            + lax.dot_general(jnp.clip(x.u, None, 0), y.u, dim_nums)
+        result = _inclusion_dot_general_p(
+            interval(x.l, x.u),
+            interval(y.l, y.u),
+            dimension_numbers=dim_nums,
+            **kwargs,
         )
-        # Simple IBP
-        corners = [
-            lax.dot_general(x.l, y.l, dim_nums),
-            lax.dot_general(x.l, y.u, dim_nums),
-            lax.dot_general(x.u, y.l, dim_nums),
-            lax.dot_general(x.u, y.u, dim_nums),
-        ]
-        ll = jnp.minimum(
-            jnp.minimum(corners[0], corners[1]), jnp.minimum(corners[2], corners[3])
-        )
-        ul = jnp.maximum(
-            jnp.maximum(corners[0], corners[1]), jnp.maximum(corners[2], corners[3])
-        )
+        ll, ul = result.lower, result.upper
         S = ll.shape
         return LinearBound(
             lA=jnp.zeros((*S, n_in)),
@@ -526,13 +487,15 @@ for _p_name in ["scatter_p", "scatter_add_p", "scatter_mul_p"]:
 
 def _linbp_reduce_sum_p(x, *, relu_mode, axes, out_sharding=None, **kwargs):
     """reduce_sum is linear: A-matrices reduce exactly over the same axes."""
-    _rs = lambda t: lax.reduce_sum_p.bind(t, axes=axes, out_sharding=out_sharding)
     if not isinstance(x, LinearBound):
-        return _rs(x)
-    # axes refers to dimensions of the data tensor; n_in is the appended last dim
-    # of lA/uA and is not affected (axes index into the data dims only).
+        return lax.reduce_sum_p.bind(x, axes=axes, out_sharding=out_sharding)
+    # out_sharding is sized for the primal output rank; lA/uA have one extra
+    # trailing n_in dimension, so omit out_sharding for them to avoid a rank
+    # mismatch in JAX's sharding system.
+    _rs = lambda t: lax.reduce_sum_p.bind(t, axes=axes, out_sharding=out_sharding)
+    _rs_A = lambda t: lax.reduce_sum_p.bind(t, axes=axes)
     return LinearBound(
-        lA=_rs(x.lA), lb=_rs(x.lb), uA=_rs(x.uA), ub=_rs(x.ub),
+        lA=_rs_A(x.lA), lb=_rs(x.lb), uA=_rs_A(x.uA), ub=_rs(x.ub),
         l=_rs(x.l), u=_rs(x.u),
     )
 
@@ -891,7 +854,9 @@ def _linbp_sin_p(x, *, relu_mode, **kwargs):
     beta_chord = jnp.sin(l) - alpha * l
     mid = (l + u) / 2
     alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
-    sin_sq = jnp.sqrt(jnp.clip(1.0 - alpha ** 2, 0.0))
+    one_minus_a2 = jnp.maximum(1.0 - alpha ** 2, 0.0)
+    safe_val = jnp.where(one_minus_a2 <= 0.0, jnp.ones_like(one_minus_a2), one_minus_a2)
+    sin_sq = jnp.where(one_minus_a2 <= 0.0, jnp.zeros_like(one_minus_a2), jnp.sqrt(safe_val))
     x_base = jnp.arccos(alpha_c)                            # ∈ (0, π)
 
     # Upper: x_+ = arccos(α) + 2kπ
@@ -953,7 +918,9 @@ def _linbp_cos_p(x, *, relu_mode, **kwargs):
     beta_chord = jnp.cos(l) - alpha * l
     mid = (l + u) / 2
     alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
-    cos_sq = jnp.sqrt(jnp.clip(1.0 - alpha ** 2, 0.0))
+    one_minus_a2 = jnp.maximum(1.0 - alpha ** 2, 0.0)
+    safe_val = jnp.where(one_minus_a2 <= 0.0, jnp.ones_like(one_minus_a2), one_minus_a2)
+    cos_sq = jnp.where(one_minus_a2 <= 0.0, jnp.zeros_like(one_minus_a2), jnp.sqrt(safe_val))
     x_base_p = jnp.arcsin(-alpha_c)                         # ∈ (−π/2, π/2)
     x_base_n = jnp.pi - x_base_p                            # ∈ (π/2, 3π/2)
 

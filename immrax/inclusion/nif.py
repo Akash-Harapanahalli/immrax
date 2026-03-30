@@ -146,7 +146,8 @@ def natif_jaxpr(
         safe_map(write, jaxpr.invars, args)
         lu = last_used(jaxpr)
         for eqn in jaxpr.eqns:
-            subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+            bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+            subfuns = bind_params.pop('subfuns', ())
             name_stack = (
                 source_info_util.current_name_stack() + eqn.source_info.name_stack
             )
