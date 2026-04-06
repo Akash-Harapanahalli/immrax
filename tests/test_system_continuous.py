@@ -119,11 +119,11 @@ def x0_4d():
 @pytest.fixture(
     params=[
         pytest.param(
-            (lambda t, x: jnp.array([0.1, 0.1]), lambda x, t: jnp.zeros(1)),
+            (lambda t, x: jnp.array([0.1, 0.1]), lambda t, x: jnp.zeros(1)),
             id="const_input_1",
         ),
         pytest.param(
-            (lambda t, x: jnp.array([-0.1, 0.2]), lambda x, t: jnp.zeros(1)),
+            (lambda t, x: jnp.array([-0.1, 0.2]), lambda t, x: jnp.zeros(1)),
             id="const_input_2",
         ),
     ]
