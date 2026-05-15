@@ -399,11 +399,16 @@ def _is_exact(iv, lo, hi):
 
 
 class TestIntervalConstructorRigorous:
-    """interval() should widen by default."""
+    """interval() should not widen by default (rigorous=False)."""
 
-    def test_default_widens(self):
+    def test_default_no_widen(self):
         lo, hi = jnp.float32(1.0), jnp.float32(2.0)
         iv = interval(lo, hi)
+        assert _is_exact(iv, lo, hi)
+
+    def test_rigorous_true_widens(self):
+        lo, hi = jnp.float32(1.0), jnp.float32(2.0)
+        iv = interval(lo, hi, rigorous=True)
         assert _is_widened(iv, lo, hi)
 
     def test_rigorous_false_no_widen(self):
@@ -411,10 +416,16 @@ class TestIntervalConstructorRigorous:
         iv = interval(lo, hi, rigorous=False)
         assert _is_exact(iv, lo, hi)
 
-    def test_degenerate_widens(self):
-        """interval(x) (point interval) should widen by 1 ULP."""
+    def test_degenerate_no_widen(self):
+        """interval(x) (point interval) should not widen by default."""
         x = jnp.float32(3.14)
         iv = interval(x)
+        assert _is_exact(iv, x, x)
+
+    def test_degenerate_rigorous_true_widens(self):
+        """interval(x, rigorous=True) should widen by 1 ULP."""
+        x = jnp.float32(3.14)
+        iv = interval(x, rigorous=True)
         assert _is_widened(iv, x, x)
 
     def test_degenerate_rigorous_false_no_widen(self):
@@ -429,20 +440,32 @@ class TestIntervalConstructorRigorous:
         iv = interval(iv0)
         assert iv is iv0
 
-    def test_vector(self):
+    def test_vector_no_widen(self):
         lo = jnp.array([1.0, 2.0], dtype=jnp.float32)
         hi = jnp.array([3.0, 4.0], dtype=jnp.float32)
         iv = interval(lo, hi)
+        assert _is_exact(iv, lo, hi)
+
+    def test_vector_rigorous_true_widens(self):
+        lo = jnp.array([1.0, 2.0], dtype=jnp.float32)
+        hi = jnp.array([3.0, 4.0], dtype=jnp.float32)
+        iv = interval(lo, hi, rigorous=True)
         assert _is_widened(iv, lo, hi)
 
 
 class TestIcentpertConstructorRigorous:
-    """icentpert() should widen by default."""
+    """icentpert() should not widen by default (rigorous=False)."""
 
-    def test_default_widens(self):
+    def test_default_no_widen(self):
         c = jnp.float32(1.0)
         p = jnp.float32(0.5)
         iv = icentpert(c, p)
+        assert _is_exact(iv, c - p, c + p)
+
+    def test_rigorous_true_widens(self):
+        c = jnp.float32(1.0)
+        p = jnp.float32(0.5)
+        iv = icentpert(c, p, rigorous=True)
         assert _is_widened(iv, c - p, c + p)
 
     def test_rigorous_false_no_widen(self):
@@ -486,10 +509,10 @@ class TestContextManagers:
 
     def test_context_restores_after_exit(self):
         lo, hi = jnp.float32(1.0), jnp.float32(2.0)
-        with non_rigorous():
+        with rigorous():
             pass
         iv = interval(lo, hi)
-        assert _is_widened(iv, lo, hi)
+        assert _is_exact(iv, lo, hi)
 
     def test_non_rigorous_icentpert(self):
         c = jnp.float32(1.0)
@@ -501,7 +524,7 @@ class TestContextManagers:
 
 class TestResolveRigorous:
     def test_default(self):
-        assert _resolve_rigorous() is True
+        assert _resolve_rigorous() is False
 
     def test_kwarg_overrides_default(self):
         assert _resolve_rigorous(False) is False

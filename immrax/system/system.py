@@ -182,7 +182,6 @@ class System(abc.ABC):
                     f"Times {t0=} and {tf=} must be integers for discrete evolution, got {type(t0)=} and {type(tf)=}"
                 )
 
-            max_steps = 4096
             times = jnp.where(
                 jnp.arange(max_steps) <= tf - t0,
                 t0 + jnp.arange(max_steps),

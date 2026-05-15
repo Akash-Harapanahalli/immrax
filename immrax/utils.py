@@ -257,6 +257,7 @@ def inv_fact(n):
     return lax.exp(-lax.lgamma(n + 1.0))
 
 
+
 # @partial(jax.jit,static_argnums=(1,))
 def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
     n = len(x) // 2
@@ -275,7 +276,6 @@ def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
         part_ = jnp.array([xc[A[i, j] + 1][j] for j in range(n)])
         ret.append(jnp.concatenate((_part, part_)))
     return jnp.array(ret)
-
 
 def gen_ics(x0, N, key=jax.random.key(0)):
     # X = np.empty((N, len(x0)))
@@ -348,6 +348,23 @@ def get_sparse_corners(x: Interval, verbose=False, **kwargs):
         ]
 
     return gsc
+
+@api_boundary
+@partial(jax.jit, static_argnums=(1,))
+def get_rohn_corners (A: Interval, sign: Literal['+', '-'] = '+') :
+    """Gets the 2^n corners of [A] which upper or lower bound x^T A x depending on the chosen sign (+/-)"""
+    if A.shape[0] != A.shape[1] or len(A.shape) != 2 :
+        raise Exception(f'A should be a square matrix, got {A.shape}')
+    n = A.shape[0]
+    Ac = A.center
+    Ap = A.pert
+
+    if sign == '+' :
+        return jnp.asarray([Ac + jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s)) for s in product(*[[-1, +1] for i in range(n)])])
+    elif sign == '-' :
+        return jnp.asarray([Ac - jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s)) for s in product(*[[-1, +1] for i in range(n)])])
+    else :
+        raise Exception("pm should be '+' or '-'.")
 
 
 @api_boundary

@@ -1099,3 +1099,61 @@ def test_reduce_sum_partial_axis():
     lb = linbp(lambda x: jnp.sum(x, axis=0))(ix)
     assert jnp.allclose(lb.l, jnp.array([0.0, 2.0]))
     assert jnp.allclose(lb.u, jnp.array([2.0, 4.0]))
+
+
+# ---------------------------------------------------------------------------
+# dot_general Branch 1 (x=LinearBound, y=constant) and Branch 3 (both LB)
+# ---------------------------------------------------------------------------
+
+def test_dot_general_branch1_shape():
+    """Branch 1: uA/lA must have shape (*S_out, n_in), not (n_in, *S_out)."""
+    n_in, n_out = 3, 5
+    W = jax.random.normal(jax.random.PRNGKey(0), (n_in, n_out))
+    ix = irx.icentpert(jnp.ones(n_in), 0.3)
+
+    lb = linbp(lambda x: x @ W)(ix)
+
+    assert lb.uA.shape == (n_out, n_in), f"uA shape {lb.uA.shape} != ({n_out}, {n_in})"
+    assert lb.lA.shape == (n_out, n_in)
+
+
+def test_dot_general_branch1_soundness():
+    """Branch 1: concrete bounds must contain all true output values."""
+    key = jax.random.PRNGKey(1)
+    n_in, n_out = 3, 5
+    W = jax.random.normal(key, (n_in, n_out))
+    ix = irx.icentpert(jnp.zeros(n_in), 0.5)
+
+    lb = linbp(lambda x: x @ W)(ix)
+
+    sample_key = jax.random.PRNGKey(42)
+    xs = _sample_in_interval(ix, N_SAMPLES, sample_key)
+    ys = jax.vmap(lambda x: x @ W)(xs)
+    assert jnp.all(ys >= lb.l - 1e-5)
+    assert jnp.all(ys <= lb.u + 1e-5)
+
+
+def test_dot_general_branch3_zero_amatrices():
+    """Branch 3 fallback returns zero A-matrices (non-affine output)."""
+    n_in = 4
+    ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
+
+    lb = linbp(lambda x: jnp.dot(x, x))(ix)
+
+    assert lb.uA.shape == (n_in,)
+    assert jnp.allclose(lb.uA, jnp.zeros(n_in))
+    assert jnp.allclose(lb.lA, jnp.zeros(n_in))
+
+
+def test_dot_general_branch3_soundness():
+    """Branch 3 fallback: concrete bounds must contain all true output values."""
+    n_in = 4
+    ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
+
+    lb = linbp(lambda x: jnp.dot(x, x))(ix)
+
+    sample_key = jax.random.PRNGKey(7)
+    xs = _sample_in_interval(ix, N_SAMPLES, sample_key)
+    ys = jax.vmap(lambda x: jnp.dot(x, x))(xs)
+    assert jnp.all(ys >= lb.l - 1e-5)
+    assert jnp.all(ys <= lb.u + 1e-5)
