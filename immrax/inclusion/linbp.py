@@ -118,6 +118,8 @@ def _linbp_jaxpr(
     tighten_bounds: bool = True,
     x_lb=None,
     x_ub=None,
+    return_env: bool = False,
+    iterated_bw: bool = False,
 ) -> list[Any]:
     def read(v: Atom) -> Any:
         return v.val if isinstance(v, Literal) else env[v]
@@ -143,7 +145,14 @@ def _linbp_jaxpr(
     safe_map(write, jaxpr.invars, args)
     lu = last_used(jaxpr)
 
-    for eqn in jaxpr.eqns:
+    # For iterated backward CROWN: map each var to the index of the eqn that produced it.
+    producing_idx: dict = {}
+    if iterated_bw:
+        for j, e in enumerate(jaxpr.eqns):
+            for ov in e.outvars:
+                producing_idx[ov] = j
+
+    for eqn_idx, eqn in enumerate(jaxpr.eqns):
         name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
         traceback = eqn.source_info.traceback if propagate_source_info else None
         with source_info_util.user_context(traceback, name_stack=name_stack):
@@ -151,12 +160,39 @@ def _linbp_jaxpr(
             if any(isinstance(v, LinearBound) for v in invars):
                 if eqn.primitive not in linbp_registry:
                     raise NotImplementedError(f"{eqn.primitive} not in linbp_registry")
+                # Iterated backward CROWN: at each activation / recursive-wrap eqn,
+                # tighten its LinearBound invars' l, u via a backward CROWN pass
+                # over the already-processed prefix of the jaxpr. Subsequent
+                # activations benefit from these tighter pre-activation bounds.
+                if iterated_bw and x_lb is not None and (
+                    eqn.primitive in _activation_prims_bw
+                    or eqn.primitive in _linbp_recursive_prims
+                ):
+                    for k, iv in enumerate(eqn.invars):
+                        if isinstance(iv, Literal):
+                            continue
+                        val = env.get(iv)
+                        if not isinstance(val, LinearBound):
+                            continue
+                        prod_idx = producing_idx.get(iv)
+                        if prod_idx is None:
+                            continue
+                        l_new, u_new = _backward_to_concrete(
+                            jaxpr, env, iv, prod_idx, x_lb, x_ub, relu_mode
+                        )
+                        env[iv] = LinearBound(
+                            val.lA, val.lb, val.uA, val.ub,
+                            jnp.maximum(val.l, l_new),
+                            jnp.minimum(val.u, u_new),
+                        )
+                    invars = safe_map(read, eqn.invars)
                 # Pass eqn.params directly (avoids get_bind_params moving things like
                 # call_jaxpr/num_consts out of kwargs and into subfuns).
                 # Only recursive primitives (jit_p, custom_jvp_call_p) need
                 # tighten_bounds/x_lb/x_ub — they forward them to nested jaxpr calls.
                 if eqn.primitive in _linbp_recursive_prims:
-                    extra = dict(tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub)
+                    extra = dict(tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
+                                 iterated_bw=iterated_bw)
                 else:
                     extra = {}
                 ans = linbp_registry[eqn.primitive](
@@ -175,9 +211,13 @@ def _linbp_jaxpr(
             safe_map(write, eqn.outvars, ans)
         else:
             write(eqn.outvars[0], ans)
-        clean_up_dead_vars(eqn, env, lu)
+        if not return_env:
+            clean_up_dead_vars(eqn, env, lu)
 
-    return safe_map(read, jaxpr.outvars)
+    outs = safe_map(read, jaxpr.outvars)
+    if return_env:
+        return outs, env
+    return outs
 
 
 # ---------------------------------------------------------------------------
@@ -1214,13 +1254,15 @@ def _linbp_div_p(x, y, *, relu_mode, **kwargs):
 linbp_registry[lax.div_p] = _linbp_div_p
 
 
-def _linbp_jit_p(*args, relu_mode, tighten_bounds=True, x_lb=None, x_ub=None, **bind_params):
+def _linbp_jit_p(*args, relu_mode, tighten_bounds=True, x_lb=None, x_ub=None,
+                 iterated_bw=False, **bind_params):
     """Handle jit_p (jax >= 0.9) / pjit_p (jax < 0.9) by recursing."""
     bind_jaxpr = bind_params.pop("jaxpr")
     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
         bind_jaxpr = bind_jaxpr.jaxpr
     return _linbp_jaxpr(bind_jaxpr, [], *args, relu_mode=relu_mode,
-                        tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub)
+                        tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
+                        iterated_bw=iterated_bw)
 
 
 _jit_primitive = getattr(jax._src.pjit, "jit_p", getattr(jax._src.pjit, "pjit_p", None))
@@ -1230,7 +1272,8 @@ if _jit_primitive is not None:
 
 
 def _linbp_custom_jvp_call_p(*args, relu_mode, call_jaxpr, num_consts,
-                             tighten_bounds=True, x_lb=None, x_ub=None, **bind_params):
+                             tighten_bounds=True, x_lb=None, x_ub=None,
+                             iterated_bw=False, **bind_params):
     """Handle custom_jvp_call by evaluating the primal call_jaxpr only."""
     if isinstance(call_jaxpr, jax.extend.core.ClosedJaxpr):
         consts = call_jaxpr.consts
@@ -1244,6 +1287,7 @@ def _linbp_custom_jvp_call_p(*args, relu_mode, call_jaxpr, num_consts,
     return _linbp_jaxpr(
         inner_jaxpr, consts + extra_consts, *actual_args, relu_mode=relu_mode,
         tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
+        iterated_bw=iterated_bw,
     )
 
 
@@ -1251,6 +1295,679 @@ _custom_jvp_call_p = getattr(jax._src.custom_derivatives, "custom_jvp_call_p", N
 if _custom_jvp_call_p is not None:
     linbp_registry[_custom_jvp_call_p] = _linbp_custom_jvp_call_p
     _linbp_recursive_prims.add(_custom_jvp_call_p)
+
+
+# ===========================================================================
+# Backward linear bound propagation (true CROWN with sign-conditioned slopes)
+# ===========================================================================
+#
+# Forward linbp (above) commits to a single ReLU lower-bound slope per neuron
+# based on the geometric heuristic l+u >= 2c.  In deep networks that's loose:
+# the optimal slope at each ReLU depends on the *sign* of the cumulative
+# downstream coefficient, which is only available when sweeping backward from
+# the output.
+#
+# Strategy: run forward linbp once to capture per-var LinearBounds (and thus
+# pre-activation l, u at every ReLU).  Then walk the jaxpr equations in
+# reverse, carrying a BackwardBound(A_lo, b_lo, A_hi, b_hi) per var.  At each
+# activation, decompose A by sign and pick a slope per (output, neuron).
+# At each linear primitive, transpose the operation.
+# ---------------------------------------------------------------------------
+
+
+from collections import namedtuple
+
+
+class BackwardBound(namedtuple("BackwardBound", ["A_lo", "b_lo", "A_hi", "b_hi"])):
+    """For a var v of shape S and an *original output* of size n_out,
+
+        A_lo, A_hi: shape (n_out, *S)
+        b_lo, b_hi: shape (n_out,)
+
+    Interpretation: lb(v) := sum over S of A_lo * v + b_lo gives a lower
+    bound on the original output (entry by entry along n_out); similarly
+    upper bound from A_hi, b_hi.
+    """
+    pass
+
+
+backward_registry: dict = {}
+_bw_recursive_prims: set = set()
+
+
+def _bw_sum_over_var(A, x):
+    """Contract A (a covector) with x (broadcastable to A's shape), returning scalar.
+
+    Called inside ``vmap`` over the leading n_out axis; A's shape is the var
+    shape S, x is shape broadcastable to S (possibly scalar).
+    """
+    return jnp.sum(jnp.asarray(A) * jnp.asarray(x))
+
+
+def _bw_dot_general(eqn, out_bd, env, **_):
+    """y = dot_general(a, b) with one of a, b a constant (no LinearBound).
+
+    Common cases for NNs: W @ x or x @ W with W constant.
+    """
+    dim_nums = eqn.params["dimension_numbers"]
+    (lhs_c, rhs_c), (lhs_b, rhs_b) = dim_nums
+    if lhs_b or rhs_b:
+        raise NotImplementedError("backward CROWN: batched dot_general not supported yet")
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+    if is_lb0 and is_lb1:
+        raise NotImplementedError("backward CROWN: dot_general of two LinearBounds")
+
+    # We need A_input such that bound on output via A_output translates back.
+    # output = sum over contracting axes of (lhs * rhs).
+    # For each row j of A_output (a covector on the output shape),
+    # bound_j = sum over output_dims of A_output[j] * output.
+    # Substituting output = einsum(lhs, rhs) and re-grouping gives
+    # A_input as another einsum.  We use jax.linear_transpose for safety.
+    if is_lb1:
+        # v0 is constant W; v1 is the variable input
+        W = val0
+        var = v1
+        var_shape = var.aval.shape
+        primal = lambda x: lax.dot_general(W, x, dim_nums)
+    else:
+        W = val1
+        var = v0
+        var_shape = var.aval.shape
+        primal = lambda x: lax.dot_general(x, W, dim_nums)
+    dummy = jnp.zeros(var_shape, dtype=jnp.result_type(jnp.float32))
+
+    def transpose_one(cov):
+        (tr,) = jax.linear_transpose(primal, dummy)(cov)
+        return tr
+
+    new_A_lo = jax.vmap(transpose_one)(out_bd.A_lo)
+    new_A_hi = jax.vmap(transpose_one)(out_bd.A_hi)
+    in_bd = BackwardBound(new_A_lo, out_bd.b_lo, new_A_hi, out_bd.b_hi)
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_add(eqn, out_bd, env, **_):
+    """y = a + b. Linear; if one operand is constant, fold into bias terms."""
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+    if is_lb0 and is_lb1:
+        # both variable: A propagates to both; bias only to first to avoid duplication
+        z_lo = jnp.zeros_like(out_bd.b_lo)
+        z_hi = jnp.zeros_like(out_bd.b_hi)
+        in0 = BackwardBound(out_bd.A_lo, out_bd.b_lo, out_bd.A_hi, out_bd.b_hi)
+        in1 = BackwardBound(out_bd.A_lo, z_lo, out_bd.A_hi, z_hi)
+        return [in0, in1]
+    # one is const
+    if not is_lb0:
+        const = val0
+        var = v1
+    else:
+        const = val1
+        var = v0
+    db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_lo)
+    db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_hi)
+    in_bd = BackwardBound(out_bd.A_lo, out_bd.b_lo + db_lo, out_bd.A_hi, out_bd.b_hi + db_hi)
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_sub(eqn, out_bd, env, **_):
+    """y = a - b."""
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+    if is_lb0 and is_lb1:
+        z_lo = jnp.zeros_like(out_bd.b_lo)
+        z_hi = jnp.zeros_like(out_bd.b_hi)
+        in0 = BackwardBound(out_bd.A_lo, out_bd.b_lo, out_bd.A_hi, out_bd.b_hi)
+        in1 = BackwardBound(-out_bd.A_lo, z_lo, -out_bd.A_hi, z_hi)
+        return [in0, in1]
+    if not is_lb0:
+        # y = const - var
+        const = val0
+        var = v1
+        db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_lo)
+        db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_hi)
+        in_bd = BackwardBound(
+            -out_bd.A_lo, out_bd.b_lo + db_lo,
+            -out_bd.A_hi, out_bd.b_hi + db_hi,
+        )
+    else:
+        # y = var - const
+        const = val1
+        var = v0
+        db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_lo)
+        db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, const))(out_bd.A_hi)
+        in_bd = BackwardBound(
+            out_bd.A_lo, out_bd.b_lo - db_lo,
+            out_bd.A_hi, out_bd.b_hi - db_hi,
+        )
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_mul(eqn, out_bd, env, **_):
+    """y = a * b with one of a, b a constant. Substituting y = c*x:
+        bound = A @ y + b = A @ (c*x) + b = (A * c_broadcasted) @ x + b
+    """
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+    if is_lb0 and is_lb1:
+        raise NotImplementedError("backward CROWN: mul of two LinearBounds")
+    if is_lb0:
+        var = v0
+        c = jnp.asarray(val1)
+    else:
+        var = v1
+        c = jnp.asarray(val0)
+    new_A_lo = out_bd.A_lo * c
+    new_A_hi = out_bd.A_hi * c
+    in_bd = BackwardBound(new_A_lo, out_bd.b_lo, new_A_hi, out_bd.b_hi)
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_neg(eqn, out_bd, env, **_):
+    """y = -x. Swap lower/upper roles and negate."""
+    in_bd = BackwardBound(-out_bd.A_hi, -out_bd.b_hi, -out_bd.A_lo, -out_bd.b_lo)
+    return [in_bd]
+
+
+def _bw_max_with_const(eqn, out_bd, env, *, relu_mode="adaptive"):
+    """y = max(x, c). Pre-activation l, u read from env[x].l, env[x].u.
+
+    Slope choice for active neurons follows ``relu_mode``:
+    ``'adaptive'`` — α_l ∈ {0, 1} by l+u ≥ 2c heuristic
+    ``'same-slope'`` — α_l = α_u (the chord); β_l = c(1-α_u)
+    ``'zero'``      — α_l = 0, β_l = c
+    ``'one'``       — α_l = 1, β_l = 0
+    Sign-conditioning happens in the A decomposition below regardless.
+    """
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+    if is_lb0 == is_lb1:
+        raise NotImplementedError("backward CROWN: max of two LinearBounds")
+    if is_lb0:
+        lb_in = val0; c_val = jnp.asarray(val1); var = v0
+    else:
+        lb_in = val1; c_val = jnp.asarray(val0); var = v1
+
+    l = lb_in.l
+    u = lb_in.u
+    on = l >= c_val
+    off = u <= c_val
+    active = ~on & ~off
+    safe_denom = jnp.where(active, u - l, 1.0)
+    alpha_u_act = (u - c_val) / safe_denom
+    alpha_u = jnp.where(on, 1.0, jnp.where(off, 0.0, alpha_u_act))
+    beta_u = jnp.where(on, 0.0, jnp.where(off, c_val, c_val - alpha_u * l))
+    if relu_mode == "same-slope":
+        alpha_l_act = alpha_u_act
+        beta_l_act = c_val * (1.0 - alpha_u_act)
+    elif relu_mode == "adaptive":
+        use_id = l + u >= 2.0 * c_val
+        alpha_l_act = jnp.where(use_id, 1.0, 0.0)
+        beta_l_act = jnp.where(use_id, 0.0, c_val)
+    elif relu_mode == "zero":
+        alpha_l_act = jnp.zeros_like(alpha_u_act)
+        beta_l_act = jnp.broadcast_to(c_val, alpha_u_act.shape).astype(alpha_u_act.dtype)
+    elif relu_mode == "one":
+        alpha_l_act = jnp.ones_like(alpha_u_act)
+        beta_l_act = jnp.zeros_like(alpha_u_act)
+    else:
+        raise ValueError(f"Unknown relu_mode: {relu_mode!r}")
+    alpha_l = jnp.where(on, 1.0, jnp.where(off, 0.0, alpha_l_act))
+    beta_l = jnp.where(on, 0.0, jnp.where(off, c_val, beta_l_act))
+
+    # Decompose A by sign over the var dims (trailing dims of A).
+    # For upper bound: positive A contributes via upper bound of y; negative
+    # A contributes via lower bound. β_l = 0 for ReLU (c=0); β_u handled below.
+    Ahi_p = jnp.clip(out_bd.A_hi, 0, None)
+    Ahi_n = jnp.clip(out_bd.A_hi, None, 0)
+    Alo_p = jnp.clip(out_bd.A_lo, 0, None)
+    Alo_n = jnp.clip(out_bd.A_lo, None, 0)
+
+    # Broadcast alpha/beta (shape S) over leading n_out axis of A.
+    new_A_hi = Ahi_p * alpha_u + Ahi_n * alpha_l
+    new_A_lo = Alo_p * alpha_l + Alo_n * alpha_u
+    db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, beta_u))(Ahi_p) + \
+            jax.vmap(lambda a: _bw_sum_over_var(a, beta_l))(Ahi_n)
+    db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, beta_l))(Alo_p) + \
+            jax.vmap(lambda a: _bw_sum_over_var(a, beta_u))(Alo_n)
+    in_bd = BackwardBound(new_A_lo, out_bd.b_lo + db_lo, new_A_hi, out_bd.b_hi + db_hi)
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_structural(eqn, out_bd, env, **_):
+    """Generic structural op (slice, squeeze, reshape, broadcast_in_dim,
+    concatenate, etc.): use jax.linear_transpose on the primitive."""
+    var_idx = next(i for i, v in enumerate(eqn.invars) if isinstance(env.get(v), LinearBound))
+    var = eqn.invars[var_idx]
+    var_shape = var.aval.shape
+
+    # Build primal of the primitive with the variable arg replaced by dummy
+    bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+    subfuns = bind_params.pop("subfuns", ())
+    fixed = [env.get(v) if env.get(v) is not None else (v.val if isinstance(v, Literal) else None)
+             for v in eqn.invars]
+    def primal(x):
+        full = list(fixed)
+        full[var_idx] = x
+        return eqn.primitive.bind(*subfuns, *full, **bind_params)
+    dummy = jnp.zeros(var_shape, dtype=jnp.float32)
+
+    def transpose_one(cov):
+        (tr,) = jax.linear_transpose(primal, dummy)(cov)
+        return tr
+
+    new_A_lo = jax.vmap(transpose_one)(out_bd.A_lo)
+    new_A_hi = jax.vmap(transpose_one)(out_bd.A_hi)
+    in_bd = BackwardBound(new_A_lo, out_bd.b_lo, new_A_hi, out_bd.b_hi)
+    return [in_bd if v is var else None for v in eqn.invars]
+
+
+def _bw_concatenate(eqn, out_bd, env, **_):
+    """y = concatenate(xs, axis). Split A along (axis+1) (n_out is leading).
+
+    For const invars (not LinearBound): fold their fixed contribution
+    A_output[:, const_slice] · const_value into the bias.
+    """
+    axis = eqn.params["dimension"]
+    sizes = [v.aval.shape[axis] for v in eqn.invars]
+    offsets = []
+    s = 0
+    for n in sizes:
+        offsets.append((s, s + n))
+        s += n
+
+    # First pass: accumulate bias contributions from const invars
+    b_lo_acc = out_bd.b_lo
+    b_hi_acc = out_bd.b_hi
+    n_var_dims = len(out_bd.A_lo.shape) - 1
+    for (lo, hi), var in zip(offsets, eqn.invars):
+        val = var.val if isinstance(var, Literal) else env.get(var)
+        if isinstance(val, LinearBound):
+            continue
+        sl = (slice(None),) + tuple(
+            slice(None) if d != axis else slice(lo, hi) for d in range(n_var_dims)
+        )
+        const_val = jnp.asarray(val)
+        Alo_p = jnp.clip(out_bd.A_lo[sl], 0, None)
+        Alo_n = jnp.clip(out_bd.A_lo[sl], None, 0)
+        Ahi_p = jnp.clip(out_bd.A_hi[sl], 0, None)
+        Ahi_n = jnp.clip(out_bd.A_hi[sl], None, 0)
+        # For a const, lower-bound contribution = A @ const (same value top and bottom)
+        # so just do A @ const for both directions.
+        db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, const_val))(out_bd.A_lo[sl])
+        db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, const_val))(out_bd.A_hi[sl])
+        b_lo_acc = b_lo_acc + db_lo
+        b_hi_acc = b_hi_acc + db_hi
+
+    # Second pass: distribute A_output[sl] to each LB invar; bias only to first
+    in_bds = []
+    bias_given = False
+    z_lo = jnp.zeros_like(out_bd.b_lo)
+    z_hi = jnp.zeros_like(out_bd.b_hi)
+    for (lo, hi), var in zip(offsets, eqn.invars):
+        val = var.val if isinstance(var, Literal) else env.get(var)
+        if not isinstance(val, LinearBound):
+            in_bds.append(None)
+            continue
+        sl = (slice(None),) + tuple(
+            slice(None) if d != axis else slice(lo, hi) for d in range(n_var_dims)
+        )
+        if not bias_given:
+            in_bds.append(BackwardBound(
+                out_bd.A_lo[sl], b_lo_acc,
+                out_bd.A_hi[sl], b_hi_acc,
+            ))
+            bias_given = True
+        else:
+            in_bds.append(BackwardBound(
+                out_bd.A_lo[sl], z_lo,
+                out_bd.A_hi[sl], z_hi,
+            ))
+    if not bias_given:
+        raise NotImplementedError("backward CROWN: concatenate with no LB invars")
+    return in_bds
+
+
+# Activation primitives that benefit from iterated backward CROWN at the
+# point of slope selection. Recursive primitives (jit_p, custom_jvp_call_p)
+# are also tightened because they wrap activations in practice.
+_activation_prims_bw: set = {lax.max_p, lax.min_p, lax.logistic_p, lax.tanh_p}
+
+
+backward_registry[lax.dot_general_p] = _bw_dot_general
+backward_registry[lax.add_p] = _bw_add
+backward_registry[lax.sub_p] = _bw_sub
+backward_registry[lax.mul_p] = _bw_mul
+backward_registry[lax.neg_p] = _bw_neg
+backward_registry[lax.max_p] = _bw_max_with_const
+backward_registry[lax.concatenate_p] = _bw_concatenate
+for _p in (lax.slice_p, lax.squeeze_p, lax.reshape_p, lax.broadcast_in_dim_p,
+           lax.transpose_p, lax.convert_element_type_p):
+    backward_registry[_p] = _bw_structural
+
+
+def _bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u):
+    """Backward through a single-input activation with linear bounds
+        α * x + β_l  ≤  σ(x)  ≤  α * x + β_u,   α ≥ 0
+    Sign-condition the bias terms (slope is the same for both bounds).
+    """
+    new_A_hi = out_bd.A_hi * alpha
+    new_A_lo = out_bd.A_lo * alpha
+    Ahi_p = jnp.clip(out_bd.A_hi, 0, None)
+    Ahi_n = jnp.clip(out_bd.A_hi, None, 0)
+    Alo_p = jnp.clip(out_bd.A_lo, 0, None)
+    Alo_n = jnp.clip(out_bd.A_lo, None, 0)
+    db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, beta_u))(Ahi_p) + \
+            jax.vmap(lambda a: _bw_sum_over_var(a, beta_l))(Ahi_n)
+    db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, beta_l))(Alo_p) + \
+            jax.vmap(lambda a: _bw_sum_over_var(a, beta_u))(Alo_n)
+    return BackwardBound(new_A_lo, out_bd.b_lo + db_lo, new_A_hi, out_bd.b_hi + db_hi)
+
+
+def _bw_logistic(eqn, out_bd, env, **_):
+    """Backward through sigmoid. α, β_l, β_u match _linbp_logistic_p."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    sig_l, sig_u = jax.nn.sigmoid(l), jax.nn.sigmoid(u)
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, sig_l * (1.0 - sig_l), (sig_u - sig_l) / safe_denom)
+    beta_chord = sig_l - alpha * l
+
+    one_minus_4alpha = jnp.maximum(1.0 - 4.0 * alpha, 0.0)
+    safe_disc = jnp.where(one_minus_4alpha <= 0.0, jnp.ones_like(one_minus_4alpha), one_minus_4alpha)
+    disc = jnp.where(one_minus_4alpha <= 0.0, jnp.zeros_like(one_minus_4alpha), jnp.sqrt(safe_disc))
+
+    sig_xu = (1.0 + disc) / 2.0
+    x_upper = jnp.log(sig_xu) - jnp.log(1.0 - sig_xu)
+    beta_u_crit = sig_xu - alpha * x_upper
+
+    sig_xl = (1.0 - disc) / 2.0
+    x_lower = jnp.log(sig_xl) - jnp.log(1.0 - sig_xl)
+    beta_l_crit = sig_xl - alpha * x_lower
+
+    beta_u = jnp.where(x_upper <= u, beta_u_crit, beta_chord)
+    beta_l = jnp.where(x_lower >= l, beta_l_crit, beta_chord)
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+def _bw_tanh(eqn, out_bd, env, **_):
+    """Backward through tanh. α, β_l, β_u match _linbp_tanh_p."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    tanh_l, tanh_u = jnp.tanh(l), jnp.tanh(u)
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, 1.0 - tanh_l ** 2, (tanh_u - tanh_l) / safe_denom)
+    chord_beta = tanh_l - alpha * l
+
+    one_minus_alpha = jnp.maximum(1.0 - alpha, 0.0)
+    safe_oma = jnp.where(one_minus_alpha <= 0.0, jnp.ones_like(one_minus_alpha), one_minus_alpha)
+    tanh_xu = jnp.where(one_minus_alpha <= 0.0, jnp.zeros_like(one_minus_alpha), jnp.sqrt(safe_oma))
+    x_upper = jnp.arctanh(jnp.clip(tanh_xu, 0.0, 1.0 - 1e-7))
+    beta_u_crit = tanh_xu - alpha * x_upper
+    x_lower = -x_upper
+    beta_l_crit = -tanh_xu - alpha * x_lower
+
+    beta_u = jnp.where(x_upper <= u, beta_u_crit, chord_beta)
+    beta_l = jnp.where(x_lower >= l, beta_l_crit, chord_beta)
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+backward_registry[lax.logistic_p] = _bw_logistic
+backward_registry[lax.tanh_p] = _bw_tanh
+
+
+def _bw_jit(eqn, out_bds_out, env, *, relu_mode):
+    """Recurse into jit_p call_jaxpr."""
+    bind_params = dict(eqn.params)
+    inner = bind_params["jaxpr"]
+    if isinstance(inner, jax.extend.core.ClosedJaxpr):
+        inner_consts = inner.consts
+        inner_jaxpr = inner.jaxpr
+    else:
+        inner_consts = []
+        inner_jaxpr = inner
+    # Map outer outvars' BackwardBounds to inner outvars (parallel).
+    # Run a forward linbp on the inner jaxpr to populate an inner env, then
+    # backward-walk it.
+    args = [env[v] if isinstance(env.get(v), LinearBound) else
+            (v.val if isinstance(v, Literal) else env.get(v))
+            for v in eqn.invars]
+    _, inner_env = _linbp_jaxpr(
+        inner_jaxpr, inner_consts, *args, relu_mode=relu_mode,
+        tighten_bounds=True, return_env=True,
+    )
+    inner_bw = {}
+    for ov_outer, ov_inner in zip(eqn.outvars, inner_jaxpr.outvars):
+        inner_bw[ov_inner] = out_bds_out[ov_outer]
+    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode)
+    # Map back: invars
+    return [inner_bw.get(iv) for iv in inner_jaxpr.invars]
+
+
+def _bw_custom_jvp_call(eqn, out_bds_out, env, *, relu_mode):
+    """Recurse into custom_jvp_call primal jaxpr (ignore jvp branch)."""
+    bind_params = dict(eqn.params)
+    call_jaxpr = bind_params["call_jaxpr"]
+    num_consts = bind_params.get("num_consts", 0)
+    if isinstance(call_jaxpr, jax.extend.core.ClosedJaxpr):
+        inner_consts = list(call_jaxpr.consts)
+        inner_jaxpr = call_jaxpr.jaxpr
+    else:
+        inner_consts = []
+        inner_jaxpr = call_jaxpr
+    extra_consts = []
+    actual_invars = eqn.invars
+    if num_consts:
+        extra_consts = [env.get(v) if env.get(v) is not None else (v.val if isinstance(v, Literal) else None) for v in eqn.invars[:num_consts]]
+        actual_invars = eqn.invars[num_consts:]
+    args = [env[v] if isinstance(env.get(v), LinearBound) else
+            (v.val if isinstance(v, Literal) else env.get(v))
+            for v in actual_invars]
+    _, inner_env = _linbp_jaxpr(
+        inner_jaxpr, inner_consts + extra_consts, *args, relu_mode=relu_mode,
+        tighten_bounds=True, return_env=True,
+    )
+    inner_bw = {}
+    for ov_outer, ov_inner in zip(eqn.outvars, inner_jaxpr.outvars):
+        inner_bw[ov_inner] = out_bds_out[ov_outer]
+    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode)
+    out = [None] * len(eqn.invars)
+    for j, iv_inner in enumerate(inner_jaxpr.invars):
+        out[num_consts + j] = inner_bw.get(iv_inner)
+    return out
+
+
+if _jit_primitive is not None:
+    backward_registry[_jit_primitive] = _bw_jit
+    _bw_recursive_prims.add(_jit_primitive)
+if _custom_jvp_call_p is not None:
+    backward_registry[_custom_jvp_call_p] = _bw_custom_jvp_call
+    _bw_recursive_prims.add(_custom_jvp_call_p)
+
+
+def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str):
+    """Walk jaxpr.eqns in reverse, propagating BackwardBounds through bw_env."""
+    for eqn in reversed(jaxpr.eqns):
+        # Collect output bounds for this eqn's outvars
+        if not any(ov in bw_env for ov in eqn.outvars):
+            continue
+        # For single-output primitives (typical), grab the one bound
+        handler = backward_registry.get(eqn.primitive)
+        if handler is None:
+            raise NotImplementedError(
+                f"backward CROWN: no rule for primitive {eqn.primitive}"
+            )
+        if eqn.primitive in _bw_recursive_prims:
+            out_bds_map = {ov: bw_env[ov] for ov in eqn.outvars if ov in bw_env}
+            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode)
+        else:
+            out_bd = bw_env[eqn.outvars[0]]
+            in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
+        for v, bd in zip(eqn.invars, in_bds):
+            if bd is None:
+                continue
+            if v in bw_env:
+                # Accumulate (multi-use var)
+                prev = bw_env[v]
+                bw_env[v] = BackwardBound(
+                    prev.A_lo + bd.A_lo, prev.b_lo + bd.b_lo,
+                    prev.A_hi + bd.A_hi, prev.b_hi + bd.b_hi,
+                )
+            else:
+                bw_env[v] = bd
+
+
+def _backward_to_concrete(jaxpr, env, target_var, target_idx, x_lb, x_ub, relu_mode):
+    """Run a backward CROWN sweep treating ``target_var`` as the output.
+
+    Walks ``jaxpr.eqns`` from ``target_idx`` down to 0, using the slopes
+    currently stored in ``env`` (so iterated tightening cascades through
+    earlier activations).  Concretizes at ``[x_lb, x_ub]`` and returns
+    ``(l, u)`` matching ``target_var.aval.shape``.
+    """
+    import math
+    S = tuple(target_var.aval.shape)
+    n_out = math.prod(S) if S else 1
+    I = jnp.eye(n_out).reshape((n_out,) + S)
+    bw_env = {target_var: BackwardBound(I, jnp.zeros(n_out), I, jnp.zeros(n_out))}
+
+    for i in range(target_idx, -1, -1):
+        eqn = jaxpr.eqns[i]
+        if not any(ov in bw_env for ov in eqn.outvars):
+            continue
+        handler = backward_registry.get(eqn.primitive)
+        if handler is None:
+            raise NotImplementedError(
+                f"backward CROWN: no rule for primitive {eqn.primitive}"
+            )
+        if eqn.primitive in _bw_recursive_prims:
+            out_bds_map = {ov: bw_env[ov] for ov in eqn.outvars if ov in bw_env}
+            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode)
+        else:
+            out_bd = bw_env[eqn.outvars[0]]
+            in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
+        for v, bd in zip(eqn.invars, in_bds):
+            if bd is None:
+                continue
+            if v in bw_env:
+                prev = bw_env[v]
+                bw_env[v] = BackwardBound(
+                    prev.A_lo + bd.A_lo, prev.b_lo + bd.b_lo,
+                    prev.A_hi + bd.A_hi, prev.b_hi + bd.b_hi,
+                )
+            else:
+                bw_env[v] = bd
+
+    if len(jaxpr.invars) != 1:
+        # Multi-input not supported here; fall back to forward-computed bounds.
+        return env[target_var].l, env[target_var].u
+    inp_var = jaxpr.invars[0]
+    bd = bw_env.get(inp_var)
+    if bd is None:
+        return env[target_var].l, env[target_var].u
+    Alo_p = jnp.clip(bd.A_lo, 0, None); Alo_n = jnp.clip(bd.A_lo, None, 0)
+    Ahi_p = jnp.clip(bd.A_hi, 0, None); Ahi_n = jnp.clip(bd.A_hi, None, 0)
+    l_flat = _bw_concrete(Alo_p, Alo_n, x_lb, x_ub) + bd.b_lo
+    u_flat = _bw_concrete(Ahi_p, Ahi_n, x_ub, x_lb) + bd.b_hi
+    return l_flat.reshape(S), u_flat.reshape(S)
+
+
+def _linbp_backward_jaxpr(
+    jaxpr: Jaxpr, consts, *args,
+    relu_mode: str = "adaptive",
+    tighten_bounds: bool = True,
+    x_lb=None, x_ub=None,
+    iterated_bw: bool = False,
+):
+    """Forward linbp to capture env, then backward sweep with sign-conditioned slopes.
+
+    With ``iterated_bw=True``, the forward sweep additionally runs a backward
+    CROWN pass at each activation / wrapper to tighten the pre-activation
+    ``l, u`` before the slope is picked (pure backward CROWN).
+
+    Returns a list of BackwardBound, one per jaxpr.outvar, expressed as a linear
+    function of the input variable (jaxpr.invars[0]).
+    """
+    outs, env = _linbp_jaxpr(
+        jaxpr, consts, *args, relu_mode=relu_mode,
+        tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
+        return_env=True, iterated_bw=iterated_bw,
+    )
+    bw_env = {}
+    import math
+    for ov in jaxpr.outvars:
+        S = tuple(ov.aval.shape)
+        n_out = math.prod(S) if S else 1
+        # Initialise with identity coefficient: A has shape (n_out, *S)
+        I = jnp.eye(n_out).reshape((n_out,) + S)
+        bw_env[ov] = BackwardBound(I, jnp.zeros(n_out), I, jnp.zeros(n_out))
+    _bw_walk(jaxpr, env, bw_env, relu_mode=relu_mode)
+    return [bw_env[v] for v in jaxpr.invars]
+
+
+def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
+                   iterated_bw: bool = False):
+    """Backward CROWN: like ``linbp`` but with sign-conditioned per-(output,
+    neuron) slope picking at each ReLU.
+
+    Returns a callable mapping an ``Interval`` to a ``LinearBound`` shaped to
+    match ``crown()``'s expectation (lA/uA = (n_out, n_in), lb/ub = (n_out,)).
+    """
+    def wrapped(inp) -> LinearBound:
+        lb_init, trace_point, x_lb, x_ub = _resolve_linbp_input(inp)
+        closed_jaxpr = eqx.filter_make_jaxpr(f)(trace_point)[0]
+        in_bds = _linbp_backward_jaxpr(
+            closed_jaxpr.jaxpr, closed_jaxpr.literals, lb_init,
+            relu_mode=relu_mode, tighten_bounds=tighten_bounds,
+            x_lb=x_lb, x_ub=x_ub, iterated_bw=iterated_bw,
+        )
+        # We assume a single input variable.
+        if len(in_bds) != 1:
+            raise NotImplementedError("backward CROWN: multi-input functions not supported yet")
+        bd = in_bds[0]
+        # The function input was the identity LinearBound (lb_init); so the
+        # backward coefficient at the input variable directly gives the linear
+        # bound on the output with respect to x_in.  Concretize l, u using IBP
+        # outputs from the forward pass for the concrete bounds.
+        # We need to evaluate A @ x + b at [x_lb, x_ub] for l, u.
+        if x_lb is None:
+            l = jnp.full(bd.b_lo.shape, -jnp.inf)
+            u = jnp.full(bd.b_hi.shape, jnp.inf)
+        else:
+            Alo_p = jnp.clip(bd.A_lo, 0, None); Alo_n = jnp.clip(bd.A_lo, None, 0)
+            Ahi_p = jnp.clip(bd.A_hi, 0, None); Ahi_n = jnp.clip(bd.A_hi, None, 0)
+            l = _bw_concrete(Alo_p, Alo_n, x_lb, x_ub) + bd.b_lo
+            u = _bw_concrete(Ahi_p, Ahi_n, x_ub, x_lb) + bd.b_hi
+        return LinearBound(lA=bd.A_lo, lb=bd.b_lo, uA=bd.A_hi, ub=bd.b_hi, l=l, u=u)
+
+    return wrapped
+
+
+def _bw_concrete(Ap, An, x_for_pos, x_for_neg):
+    """Concretize: sum over var dims of (Ap * x_for_pos + An * x_for_neg)."""
+    n_out = Ap.shape[0]
+    return jnp.tensordot(Ap, x_for_pos, axes=Ap.ndim - 1) + \
+           jnp.tensordot(An, x_for_neg, axes=An.ndim - 1)
 
 
 # ---------------------------------------------------------------------------

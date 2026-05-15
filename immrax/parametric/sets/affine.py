@@ -211,9 +211,9 @@ class AdjointEmbedding(ParametricEmbedding):
                 t,
                 interval(alpha_p) @ big_iz + ox,
                 *args,
-                centers=(centers,),
-                permutations=self.permutation,
-            )[0]
+                center=centers,
+                permutation=self.permutation,
+            )
             ls = []
             us = []
 
@@ -442,9 +442,9 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
             interval(alpha_p) @ big_iz + ox,
             big_iu,
             *args,
-            centers=(centers,),
-            permutations=self.permutation,
-        )[0]
+            center=centers,
+            permutation=self.permutation,
+        )
 
         ls = []
         us = []

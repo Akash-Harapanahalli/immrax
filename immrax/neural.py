@@ -183,7 +183,7 @@ class NeuralNetwork(eqx.Module, Control):
         return self(x)
 
 
-from immrax.inclusion.linbp import LinearBound, linbp
+from immrax.inclusion.linbp import LinearBound, linbp, linbp_backward
 
 
 class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
@@ -202,9 +202,20 @@ class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
 
 
 def crown(
-    f: Callable[..., jax.Array], out_len: int = None
+    f: Callable[..., jax.Array], out_len: int = None,
+    *, backward: bool = True, iterated: bool = False,
 ) -> Callable[..., CROWNResult]:
-    lb_fn = linbp(f, relu_mode="adaptive")
+    """Backward CROWN by default (sign-conditioned slope at each ReLU).
+
+    Pass ``backward=False`` to fall back to forward linbp.
+    Pass ``iterated=True`` for *pure* backward CROWN: at each ReLU the
+    pre-activation l, u are re-derived by a backward CROWN pass to the input
+    rather than using the forward-IBP-tightened values.
+    """
+    if backward:
+        lb_fn = linbp_backward(f, relu_mode="adaptive", iterated_bw=iterated)
+    else:
+        lb_fn = linbp(f, relu_mode="adaptive")
 
     def F(ix: Interval) -> CROWNResult:
         lb = lb_fn(ix)
@@ -232,9 +243,15 @@ class FastlinResult(namedtuple("FastlinResult", ["C", "ld", "ud"])):
 
 
 def fastlin(
-    f: Callable[..., jax.Array], out_len: int = None
+    f: Callable[..., jax.Array], out_len: int = None,
+    *, backward: bool = True, iterated: bool = False,
 ) -> Callable[..., FastlinResult]:
-    lb_fn = linbp(f, relu_mode="same-slope")
+    """Backward same-slope (FastLin) by default. ``iterated=True`` re-derives
+    pre-activation ``l, u`` via backward CROWN at each ReLU (pure backward)."""
+    if backward:
+        lb_fn = linbp_backward(f, relu_mode="same-slope", iterated_bw=iterated)
+    else:
+        lb_fn = linbp(f, relu_mode="same-slope")
 
     def F(ix: Interval) -> FastlinResult:
         lb = lb_fn(ix)
