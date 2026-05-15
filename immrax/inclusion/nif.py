@@ -1021,11 +1021,14 @@ def _inclusion_triangular_solve(
     conjugate_a=False,
     unit_diagonal=False,
 ):
-    # return natif(partial(jax.vmap(_manual_triangular_solve, in_axes=()),
-    #                      left_side=left_side, lower=lower, transpose_a=transpose_a, conjugate_a=conjugate_a, unit_diagonal=unit_diagonal))(A, b)
+    # The previous version wrapped this in `jax.vmap(..., in_axes=())`,
+    # which is invalid (vmap requires `in_axes` of length matching the
+    # positional args; an empty tuple raises). The underlying
+    # `_manual_triangular_solve` already operates on rank-2 ``A`` and
+    # rank-1 ``b``; lift it directly with `natif`.
     return natif(
         partial(
-            jax.vmap(_manual_triangular_solve, in_axes=()),
+            _manual_triangular_solve,
             left_side=left_side,
             lower=lower,
             transpose_a=transpose_a,
