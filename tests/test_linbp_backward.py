@@ -302,3 +302,247 @@ def test_linbp_backward_same_slope_lA_equals_uA(arch_act, net_key):
     ix = _make_interval('small', arch[0])
     lb = linbp_backward(net, relu_mode='same-slope')(ix)
     assert jnp.allclose(lb.lA, lb.uA), "same-slope backward must have lA == uA"
+
+
+# ---------------------------------------------------------------------------
+# Backward CROWN dot_general(LinearBound, LinearBound): bilinear concretization
+# ---------------------------------------------------------------------------
+
+def test_backward_dot_general_lb_lb_zero_amatrices():
+    """Bilinear ``y = x @ x`` has no exact linear bound in x; the backward
+    handler must concretize, yielding ``lA = uA = 0`` and a constant interval."""
+    n_in = 4
+    ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
+    lb = linbp_backward(lambda x: jnp.dot(x, x))(ix)
+    # backward CROWN follows the forward (*S_out, *S_in) convention; scalar
+    # output ⇒ S_out = (), so lA/uA shape == (n_in,).
+    assert lb.lA.shape == (n_in,)
+    assert lb.uA.shape == (n_in,)
+    assert jnp.allclose(lb.lA, jnp.zeros_like(lb.lA))
+    assert jnp.allclose(lb.uA, jnp.zeros_like(lb.uA))
+
+
+def test_backward_dot_general_lb_lb_soundness():
+    """Concretized bound on ``y = x @ x`` must contain all sampled outputs."""
+    n_in = 4
+    ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
+    lb = linbp_backward(lambda x: jnp.dot(x, x))(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(11))
+    ys = jax.vmap(lambda x: jnp.dot(x, x))(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+
+
+def test_backward_dot_general_lb_lb_quadratic_form_soundness():
+    """Bilinear ``y = (Wx) @ x`` after a linear layer must still be sound."""
+    n_in = 3
+    key = jax.random.PRNGKey(2)
+    W = jax.random.normal(key, (n_in, n_in))
+    ix = irx.icentpert(jnp.array([0.5, -0.3, 0.8]), 0.4)
+
+    def f(x):
+        return jnp.dot(W @ x, x)
+
+    lb = linbp_backward(f)(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(3))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+    # The bound must be a constant interval (no linear dependence preserved).
+    assert jnp.allclose(lb.lA, jnp.zeros_like(lb.lA))
+    assert jnp.allclose(lb.uA, jnp.zeros_like(lb.uA))
+
+
+# ---------------------------------------------------------------------------
+# Backward CROWN split: multi-output linear primitive
+# ---------------------------------------------------------------------------
+
+def test_backward_split_identity():
+    """``concat(split(x)) == x``: backward CROWN of this should give an exact
+    affine identity (lA = uA = I, biases zero, l = x_lb, u = x_ub)."""
+    n_in = 5
+    ix = irx.icentpert(jnp.arange(1.0, n_in + 1), 0.5)
+
+    def f(x):
+        a, b = jnp.split(x, [2])
+        return jnp.concatenate([a, b])
+
+    lb = linbp_backward(f)(ix)
+    assert jnp.allclose(lb.lA, jnp.eye(n_in), atol=1e-6)
+    assert jnp.allclose(lb.uA, jnp.eye(n_in), atol=1e-6)
+    assert jnp.allclose(lb.lb, jnp.zeros(n_in), atol=1e-6)
+    assert jnp.allclose(lb.ub, jnp.zeros(n_in), atol=1e-6)
+
+
+def test_backward_split_then_linear_soundness():
+    """``y = W_a @ a + W_b @ b`` where ``a, b = split(x, ...)``. Sound bounds."""
+    n_in = 6
+    split_idx = 2
+    n_a, n_b = split_idx, n_in - split_idx
+    n_out = 3
+    key = jax.random.PRNGKey(0)
+    k1, k2 = jax.random.split(key)
+    Wa = jax.random.normal(k1, (n_out, n_a))
+    Wb = jax.random.normal(k2, (n_out, n_b))
+    ix = irx.icentpert(jnp.arange(1.0, n_in + 1) * 0.1, 0.3)
+
+    def f(x):
+        a, b = jnp.split(x, [split_idx])
+        return Wa @ a + Wb @ b
+
+    lb = linbp_backward(f)(ix)
+    assert lb.lA.shape == (n_out, n_in)
+    assert lb.uA.shape == (n_out, n_in)
+
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(1))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+
+
+def test_backward_split_three_chunks_soundness():
+    """``split(x, [2, 5])`` yields three chunks; each contributes to a vector
+    output through its own linear / nonlinear pipeline."""
+    n_in = 8
+    ix = irx.icentpert(jnp.arange(1.0, n_in + 1) * 0.2, 0.2)
+    Wa = jnp.array([[1.0, -1.0], [0.5, 0.5]])           # (2, 2)
+    Wb = jnp.array([[1.0, 0.0, -1.0], [0.0, 1.0, 1.0]]) # (2, 3)
+    Wc = jnp.array([[1.0, -1.0, 0.5], [0.0, 1.0, 1.0]]) # (2, 3)
+
+    def f(x):
+        a, b, c = jnp.split(x, [2, 5])
+        # Mix of activations through each chunk; avoid LB*LB (separate handler).
+        return Wa @ jax.nn.relu(a) + Wb @ jax.nn.relu(-b) + Wc @ jax.nn.relu(c)
+
+    lb = linbp_backward(f)(ix)
+    assert lb.lA.shape == (2, n_in)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(2))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL), f"lower violated: ys.min={ys.min(0)} l={lb.l}"
+    assert jnp.all(ys <= lb.u + TOL), f"upper violated: ys.max={ys.max(0)} u={lb.u}"
+
+
+def test_backward_split_only_one_chunk_used():
+    """Use only the first chunk; the second's BackwardBound is never created.
+    The handler must zero-fill the missing outvar's cotangent."""
+    n_in = 6
+    split_idx = 3
+    n_a = split_idx
+    ix = irx.icentpert(jnp.arange(1.0, n_in + 1) * 0.1, 0.4)
+    w = jnp.array([1.0, 2.0, -0.5])  # weights for the first chunk
+
+    def f(x):
+        a, _b = jnp.split(x, [split_idx])
+        return w @ a  # linear; depends only on first chunk
+
+    lb = linbp_backward(f)(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(3))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+    # Linear function ⇒ tight: lA == uA, with weights on first chunk and zeros on second
+    assert jnp.allclose(lb.lA, lb.uA, atol=1e-6)
+    expected_A = jnp.concatenate([w, jnp.zeros(n_in - n_a)])
+    # f outputs a scalar (w @ a), so lb.lA has shape (n_in,) under the
+    # (*S_out, *S_in) convention.
+    assert jnp.allclose(lb.lA, expected_A, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Backward CROWN add_any: produced by JAX autodiff (vjp/grad)
+# ---------------------------------------------------------------------------
+
+def test_backward_add_any_direct_injection():
+    """``add_any_p`` is semantically identical to ``add_p`` and should pass
+    through the same backward handler. Inject one directly via the primitive."""
+    from jax._src import ad_util
+    n = 4
+    ix = irx.icentpert(jnp.arange(1.0, n + 1) * 0.1, 0.3)
+    W = jnp.array([[1.0, -1.0, 0.5, 0.0], [0.0, 2.0, -0.5, 1.0]])
+
+    def f(x):
+        a = 2.0 * x
+        b = -0.5 * x
+        y = ad_util.add_any_p.bind(a, b)
+        return W @ y
+
+    # Sanity: add_any must actually appear in the traced jaxpr.
+    import equinox as eqx
+    closed = eqx.filter_make_jaxpr(f)(jnp.zeros(n))[0]
+    prims = {eqn.primitive.name for eqn in closed.jaxpr.eqns}
+    assert "add_any" in prims, f"expected add_any in jaxpr; got {prims}"
+
+    lb = linbp_backward(f)(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(0))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+    # Linear function ⇒ tight: lA == uA, and lA matches W * (2 + (-0.5)) = W * 1.5.
+    assert jnp.allclose(lb.lA, lb.uA, atol=1e-6)
+    assert jnp.allclose(lb.lA, 1.5 * W, atol=1e-6)
+
+
+def test_backward_neg_soundness_after_nonlinear_path():
+    """``y = neg(x)`` must propagate biases unchanged (not swap lo↔hi).
+    Regression: prior implementation swapped A_lo/A_hi and negated biases,
+    which was silently OK when lA == uA (linear-only paths) but produced
+    sign-flipped, unsound bounds once a nonlinear primitive (here ``mul`` of
+    two LinearBounds via jacfwd) introduced a ``b_lo != b_hi`` along the path.
+    """
+    ix = irx.icentpert(jnp.array([1.0, 0.5]), 0.3)
+
+    def f(x):
+        return jax.jacfwd(lambda y: -y[0] * jnp.sin(y[1]))(x)
+
+    lb = linbp_backward(f)(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(0))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL), f"lower violated: ys.min={ys.min(0)} l={lb.l}"
+    assert jnp.all(ys <= lb.u + TOL), f"upper violated: ys.max={ys.max(0)} u={lb.u}"
+
+
+def test_backward_add_any_both_lb_operands():
+    """``add_any(a, b)`` with both ``a, b`` LinearBounds. Both must receive
+    a BackwardBound; bias attributed to first only to avoid double counting."""
+    from jax._src import ad_util
+    n = 3
+    ix = irx.icentpert(jnp.array([0.5, -0.3, 0.8]), 0.4)
+    W = jnp.array([[1.0, -1.0, 0.5], [0.0, 1.0, 1.0]])
+
+    def f(x):
+        a = jax.nn.relu(x)             # nonlinear LB
+        b = jax.nn.relu(-x)            # nonlinear LB
+        y = ad_util.add_any_p.bind(a, b)  # = |x|
+        return W @ y
+
+    import equinox as eqx
+    closed = eqx.filter_make_jaxpr(f)(jnp.zeros(n))[0]
+    prims = {eqn.primitive.name for eqn in closed.jaxpr.eqns}
+    assert "add_any" in prims, f"expected add_any in jaxpr; got {prims}"
+
+    lb = linbp_backward(f)(ix)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(1))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL)
+    assert jnp.all(ys <= lb.u + TOL)
+
+
+def test_backward_dot_general_lb_lb_vector_output_soundness():
+    """Vector-output bilinear: y[i] = (W_i @ x) @ x for n_out output rows.
+    Exercises backward CROWN through dot_general(LB, LB) with n_out > 1."""
+    n_in, n_out = 3, 4
+    key = jax.random.PRNGKey(5)
+    Ws = jax.random.normal(key, (n_out, n_in, n_in))
+    ix = irx.icentpert(jnp.array([0.5, -0.2, 0.7]), 0.3)
+
+    def f(x):
+        # For each row i, compute (W_i @ x) @ x — bilinear in x.
+        return jax.vmap(lambda W: (W @ x) @ x)(Ws)
+
+    lb = linbp_backward(f)(ix)
+    assert lb.lA.shape == (n_out, n_in)
+    assert lb.uA.shape == (n_out, n_in)
+    xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(6))
+    ys = jax.vmap(f)(xs)
+    assert jnp.all(ys >= lb.l - TOL), f"lower violated: ys.min={ys.min(0)} l={lb.l}"
+    assert jnp.all(ys <= lb.u + TOL), f"upper violated: ys.max={ys.max(0)} u={lb.u}"

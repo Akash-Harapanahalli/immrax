@@ -530,10 +530,11 @@ def _linbp_reduce_sum_p(x, *, relu_mode, axes, out_sharding=None, **kwargs):
     if not isinstance(x, LinearBound):
         return lax.reduce_sum_p.bind(x, axes=axes, out_sharding=out_sharding)
     # out_sharding is sized for the primal output rank; lA/uA have one extra
-    # trailing n_in dimension, so omit out_sharding for them to avoid a rank
-    # mismatch in JAX's sharding system.
+    # trailing n_in dimension, so omit it (pass None) for them to avoid a rank
+    # mismatch in JAX's sharding system.  In JAX >= 0.9.2 the kwarg is
+    # required by reduce_sum's ur rule, so always pass it explicitly.
     _rs = lambda t: lax.reduce_sum_p.bind(t, axes=axes, out_sharding=out_sharding)
-    _rs_A = lambda t: lax.reduce_sum_p.bind(t, axes=axes)
+    _rs_A = lambda t: lax.reduce_sum_p.bind(t, axes=axes, out_sharding=None)
     return LinearBound(
         lA=_rs_A(x.lA), lb=_rs(x.lb), uA=_rs_A(x.uA), ub=_rs(x.ub),
         l=_rs(x.l), u=_rs(x.u),
@@ -1406,7 +1407,31 @@ def _bw_dot_general(eqn, out_bd, env, **_):
     is_lb0 = isinstance(val0, LinearBound)
     is_lb1 = isinstance(val1, LinearBound)
     if is_lb0 and is_lb1:
-        raise NotImplementedError("backward CROWN: dot_general of two LinearBounds")
+        # y = dot_general(a, b), both depend on x.  Bilinear in x, so no exact
+        # linear bound exists; concretize via IBP and propagate as a pure bias.
+        # The accumulated bias is attributed to the first invar only; the
+        # second carries zero bias to avoid double counting.
+        a_iv = interval(val0.l, val0.u)
+        b_iv = interval(val1.l, val1.u)
+        y_iv = _inclusion_dot_general_p(a_iv, b_iv, dimension_numbers=dim_nums)
+        y_l, y_u = y_iv.lower, y_iv.upper
+
+        A_lo_p = jnp.clip(out_bd.A_lo, 0, None)
+        A_lo_n = jnp.clip(out_bd.A_lo, None, 0)
+        A_hi_p = jnp.clip(out_bd.A_hi, 0, None)
+        A_hi_n = jnp.clip(out_bd.A_hi, None, 0)
+        axes = tuple(range(1, out_bd.A_lo.ndim))
+        db_lo = jnp.sum(A_lo_p * y_l + A_lo_n * y_u, axis=axes)
+        db_hi = jnp.sum(A_hi_p * y_u + A_hi_n * y_l, axis=axes)
+
+        n_out = out_bd.A_lo.shape[0]
+        z_a = jnp.zeros((n_out, *val0.l.shape), dtype=out_bd.A_lo.dtype)
+        z_b = jnp.zeros((n_out, *val1.l.shape), dtype=out_bd.A_lo.dtype)
+        z_lo = jnp.zeros_like(out_bd.b_lo)
+        z_hi = jnp.zeros_like(out_bd.b_hi)
+        in0 = BackwardBound(z_a, out_bd.b_lo + db_lo, z_a, out_bd.b_hi + db_hi)
+        in1 = BackwardBound(z_b, z_lo, z_b, z_hi)
+        return [in0, in1]
 
     # We need A_input such that bound on output via A_output translates back.
     # output = sum over contracting axes of (lhs * rhs).
@@ -1510,22 +1535,61 @@ def _bw_mul(eqn, out_bd, env, **_):
     is_lb0 = isinstance(val0, LinearBound)
     is_lb1 = isinstance(val1, LinearBound)
     if is_lb0 and is_lb1:
-        raise NotImplementedError("backward CROWN: mul of two LinearBounds")
+        # Bilinear in x; concretize via interval arithmetic, attribute the
+        # accumulated bias to the first invar only (zero bias on the second).
+        l0, u0 = val0.l, val0.u
+        l1, u1 = val1.l, val1.u
+        c00 = l0 * l1
+        c01 = l0 * u1
+        c10 = u0 * l1
+        c11 = u0 * u1
+        y_l = jnp.minimum(jnp.minimum(c00, c01), jnp.minimum(c10, c11))
+        y_u = jnp.maximum(jnp.maximum(c00, c01), jnp.maximum(c10, c11))
+
+        A_lo_p = jnp.clip(out_bd.A_lo, 0, None)
+        A_lo_n = jnp.clip(out_bd.A_lo, None, 0)
+        A_hi_p = jnp.clip(out_bd.A_hi, 0, None)
+        A_hi_n = jnp.clip(out_bd.A_hi, None, 0)
+        axes = tuple(range(1, out_bd.A_lo.ndim))
+        db_lo = jnp.sum(A_lo_p * y_l + A_lo_n * y_u, axis=axes)
+        db_hi = jnp.sum(A_hi_p * y_u + A_hi_n * y_l, axis=axes)
+
+        n_out = out_bd.A_lo.shape[0]
+        z_a = jnp.zeros((n_out, *val0.l.shape), dtype=out_bd.A_lo.dtype)
+        z_b = jnp.zeros((n_out, *val1.l.shape), dtype=out_bd.A_lo.dtype)
+        z_lo = jnp.zeros_like(out_bd.b_lo)
+        z_hi = jnp.zeros_like(out_bd.b_hi)
+        in0 = BackwardBound(z_a, out_bd.b_lo + db_lo, z_a, out_bd.b_hi + db_hi)
+        in1 = BackwardBound(z_b, z_lo, z_b, z_hi)
+        return [in0, in1]
     if is_lb0:
         var = v0
         c = jnp.asarray(val1)
     else:
         var = v1
         c = jnp.asarray(val0)
-    new_A_lo = out_bd.A_lo * c
-    new_A_hi = out_bd.A_hi * c
+    # Multiply by constant: handle broadcasting (e.g. scalar var * vector const
+    # where the eqn implicitly broadcasts the scalar to vector before mul).
+    # Use jax.linear_transpose to correctly reduce over any broadcast dims.
+    var_shape = var.aval.shape
+    dummy = jnp.zeros(var_shape, dtype=out_bd.A_lo.dtype)
+    primal = lambda x_in: x_in * c
+
+    def transpose_one(cov):
+        (tr,) = jax.linear_transpose(primal, dummy)(cov)
+        return tr
+
+    new_A_lo = jax.vmap(transpose_one)(out_bd.A_lo)
+    new_A_hi = jax.vmap(transpose_one)(out_bd.A_hi)
     in_bd = BackwardBound(new_A_lo, out_bd.b_lo, new_A_hi, out_bd.b_hi)
     return [in_bd if v is var else None for v in eqn.invars]
 
 
 def _bw_neg(eqn, out_bd, env, **_):
-    """y = -x. Swap lower/upper roles and negate."""
-    in_bd = BackwardBound(-out_bd.A_hi, -out_bd.b_hi, -out_bd.A_lo, -out_bd.b_lo)
+    """y = -x.  Exact substitution: lb_orig ≥ A_lo @ y + b_lo = (-A_lo) @ x + b_lo.
+    The same negation applies to the upper bound; biases are unchanged.
+    """
+    in_bd = BackwardBound(-out_bd.A_lo, out_bd.b_lo, -out_bd.A_hi, out_bd.b_hi)
     return [in_bd]
 
 
@@ -1697,8 +1761,61 @@ def _bw_concatenate(eqn, out_bd, env, **_):
 _activation_prims_bw: set = {lax.max_p, lax.min_p, lax.logistic_p, lax.tanh_p}
 
 
+def _bw_split(eqn, out_bds_out, env, **_):
+    """y_1, ..., y_k = split(x, sizes=..., axis=...).
+
+    Inverse (transpose) of split is concatenate; use ``jax.linear_transpose``
+    over each cotangent row to recover ``A`` on the input.  Missing outvars
+    (chunks not used downstream) are zero-filled.  Bias contributions from
+    each used chunk are summed onto the single input invar.
+    """
+    var = eqn.invars[0]
+    var_shape = var.aval.shape
+    bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+    subfuns = bind_params.pop("subfuns", ())
+
+    def primal(x):
+        return tuple(eqn.primitive.bind(*subfuns, x, **bind_params))
+
+    sample_bd = next(iter(out_bds_out.values()))
+    n_out = sample_bd.A_lo.shape[0]
+    dtype = sample_bd.A_lo.dtype
+
+    def make_covs(field):
+        return tuple(
+            getattr(out_bds_out[ov], field) if ov in out_bds_out
+            else jnp.zeros((n_out, *ov.aval.shape), dtype=dtype)
+            for ov in eqn.outvars
+        )
+
+    A_lo_covs = make_covs("A_lo")
+    A_hi_covs = make_covs("A_hi")
+
+    dummy = jnp.zeros(var_shape, dtype=dtype)
+    T = jax.linear_transpose(primal, dummy)
+
+    def apply_T(*covs):
+        (tr,) = T(covs)
+        return tr
+
+    new_A_lo = jax.vmap(apply_T)(*A_lo_covs)
+    new_A_hi = jax.vmap(apply_T)(*A_hi_covs)
+
+    b_lo = sum(
+        (out_bds_out[ov].b_lo for ov in eqn.outvars if ov in out_bds_out),
+        start=jnp.zeros(n_out, dtype=dtype),
+    )
+    b_hi = sum(
+        (out_bds_out[ov].b_hi for ov in eqn.outvars if ov in out_bds_out),
+        start=jnp.zeros(n_out, dtype=dtype),
+    )
+
+    return [BackwardBound(new_A_lo, b_lo, new_A_hi, b_hi)]
+
+
 backward_registry[lax.dot_general_p] = _bw_dot_general
 backward_registry[lax.add_p] = _bw_add
+backward_registry[ad_util.add_any_p] = _bw_add
 backward_registry[lax.sub_p] = _bw_sub
 backward_registry[lax.mul_p] = _bw_mul
 backward_registry[lax.neg_p] = _bw_neg
@@ -1707,6 +1824,239 @@ backward_registry[lax.concatenate_p] = _bw_concatenate
 for _p in (lax.slice_p, lax.squeeze_p, lax.reshape_p, lax.broadcast_in_dim_p,
            lax.transpose_p, lax.convert_element_type_p):
     backward_registry[_p] = _bw_structural
+for _p_name in ("dynamic_slice_p", "gather_p"):
+    if hasattr(lax, _p_name):
+        backward_registry[getattr(lax, _p_name)] = _bw_structural
+
+
+def _bw_scatter(eqn, out_bd, env, **_):
+    """y = scatter(operand, indices, updates).
+
+    Linear in (operand, updates).  Scatter is linear and its transpose is
+    typically only implemented when ``unique_indices=True``; we override that
+    flag for the transpose call.  The caller is responsible for ensuring the
+    indices ARE unique (true for canonical at[...].set / .add patterns).
+
+    If ``updates`` is the LinearBound invar (the common NN case), the input
+    backward A becomes ``gather(out_bd.A, indices)``.  If ``operand`` is also
+    a LinearBound, the unchanged positions pass straight through.
+    """
+    invars = eqn.invars
+    operand_var, indices_var, updates_var = invars
+    operand_val = (operand_var.val if isinstance(operand_var, Literal)
+                   else env.get(operand_var))
+    indices_val = (indices_var.val if isinstance(indices_var, Literal)
+                   else env.get(indices_var))
+    updates_val = (updates_var.val if isinstance(updates_var, Literal)
+                   else env.get(updates_var))
+
+    is_lb_operand = isinstance(operand_val, LinearBound)
+    is_lb_updates = isinstance(updates_val, LinearBound)
+    if not (is_lb_operand or is_lb_updates):
+        return [None, None, None]
+
+    bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+    subfuns = bind_params.pop("subfuns", ())
+    # Force unique_indices so jax.linear_transpose succeeds.
+    bind_params["unique_indices"] = True
+
+    def primal(operand_x, updates_x):
+        return eqn.primitive.bind(*subfuns, operand_x, indices_val, updates_x,
+                                  **bind_params)
+
+    op_shape = operand_var.aval.shape
+    up_shape = updates_var.aval.shape
+    op_dummy = jnp.zeros(op_shape, dtype=jnp.float32)
+    up_dummy = jnp.zeros(up_shape, dtype=jnp.float32)
+
+    T = jax.linear_transpose(primal, op_dummy, up_dummy)
+
+    def transpose_one(cov):
+        return T(cov)  # returns (op_cot, up_cot)
+
+    new_A_op_lo, new_A_up_lo = jax.vmap(transpose_one)(out_bd.A_lo)
+    new_A_op_hi, new_A_up_hi = jax.vmap(transpose_one)(out_bd.A_hi)
+
+    out_bds = [None, None, None]
+    bias_given = False
+    z_lo = jnp.zeros_like(out_bd.b_lo)
+    z_hi = jnp.zeros_like(out_bd.b_hi)
+    if is_lb_operand:
+        out_bds[0] = BackwardBound(new_A_op_lo, out_bd.b_lo,
+                                   new_A_op_hi, out_bd.b_hi)
+        bias_given = True
+    else:
+        # operand is a constant — fold its contribution into bias.
+        op_const = jnp.asarray(operand_val)
+        db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, op_const))(new_A_op_lo)
+        db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, op_const))(new_A_op_hi)
+        out_bd_lo = out_bd.b_lo + db_lo
+        out_bd_hi = out_bd.b_hi + db_hi
+        if is_lb_updates:
+            out_bds[2] = BackwardBound(new_A_up_lo, out_bd_lo,
+                                       new_A_up_hi, out_bd_hi)
+            bias_given = True
+        else:
+            # Updates is also const — shouldn't occur if forward was LB.
+            return [None, None, None]
+
+    if is_lb_updates and is_lb_operand:
+        out_bds[2] = BackwardBound(new_A_up_lo,
+                                   z_lo if bias_given else out_bd.b_lo,
+                                   new_A_up_hi,
+                                   z_hi if bias_given else out_bd.b_hi)
+    return out_bds
+
+
+for _p_name in ("scatter_p", "scatter_add_p", "scatter_mul_p"):
+    if hasattr(lax, _p_name):
+        backward_registry[getattr(lax, _p_name)] = _bw_scatter
+if hasattr(lax, "split_p"):
+    # split is multi-output; needs the out_bds dict form, so register it as
+    # a "recursive" prim (the _bw_walk dispatch flag that passes all outvar
+    # bounds to the handler).
+    backward_registry[lax.split_p] = _bw_split
+    _bw_recursive_prims.add(lax.split_p)
+
+
+def _bw_select_n(eqn, out_bd, env, **_):
+    """y = select_n(which, case0, case1, ...).  ``which`` is an integer array
+    (not a LinearBound); each case can be a LinearBound or constant.  The
+    transpose maps the output cotangent to each case (zeroed outside the
+    selected positions); constant cases fold their value into the bias.
+    """
+    which_var = eqn.invars[0]
+    case_vars = eqn.invars[1:]
+    which_val = (which_var.val if isinstance(which_var, Literal)
+                 else env.get(which_var))
+    case_vals = [v.val if isinstance(v, Literal) else env.get(v)
+                 for v in case_vars]
+
+    bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+    subfuns = bind_params.pop("subfuns", ())
+
+    def primal(*case_xs):
+        return eqn.primitive.bind(*subfuns, which_val, *case_xs, **bind_params)
+
+    dummies = [jnp.zeros(v.aval.shape, dtype=out_bd.A_lo.dtype)
+               for v in case_vars]
+    T = jax.linear_transpose(primal, *dummies)
+
+    def transpose_one(cov):
+        return T(cov)  # returns tuple aligned with case_vars
+
+    cot_los = jax.vmap(transpose_one)(out_bd.A_lo)
+    cot_his = jax.vmap(transpose_one)(out_bd.A_hi)
+
+    in_bds = [None]  # `which` slot
+    z_lo = jnp.zeros_like(out_bd.b_lo)
+    z_hi = jnp.zeros_like(out_bd.b_hi)
+    # Find first LB index to absorb biases (bias attribution rule).
+    first_lb_idx = next(
+        (i for i, cv in enumerate(case_vals) if isinstance(cv, LinearBound)),
+        None,
+    )
+    for i, (case_var, case_val) in enumerate(zip(case_vars, case_vals)):
+        if not isinstance(case_val, LinearBound):
+            in_bds.append(None)
+            continue
+        if i == first_lb_idx:
+            b_lo_i = out_bd.b_lo
+            b_hi_i = out_bd.b_hi
+            # Fold all const cases' contributions into this bias.
+            for j, cv in enumerate(case_vals):
+                if isinstance(cv, LinearBound):
+                    continue
+                const_val = jnp.asarray(cv)
+                db_lo = jax.vmap(lambda a: _bw_sum_over_var(a, const_val))(cot_los[j])
+                db_hi = jax.vmap(lambda a: _bw_sum_over_var(a, const_val))(cot_his[j])
+                b_lo_i = b_lo_i + db_lo
+                b_hi_i = b_hi_i + db_hi
+            in_bds.append(BackwardBound(cot_los[i], b_lo_i, cot_his[i], b_hi_i))
+        else:
+            in_bds.append(BackwardBound(cot_los[i], z_lo, cot_his[i], z_hi))
+    return in_bds
+
+
+if hasattr(lax, "select_n_p"):
+    backward_registry[lax.select_n_p] = _bw_select_n
+
+
+def _bw_div(eqn, out_bd, env, **_):
+    """y = x / z.
+    - ``x / const``:   linear in x, delegate to mul-by-(1/const).
+    - ``const / z`` or ``x / z`` with z a LinearBound: nonlinear (rational);
+      concretize via IBP and propagate as a pure bias.
+    """
+    v0, v1 = eqn.invars
+    val0 = v0.val if isinstance(v0, Literal) else env.get(v0)
+    val1 = v1.val if isinstance(v1, Literal) else env.get(v1)
+    is_lb0 = isinstance(val0, LinearBound)
+    is_lb1 = isinstance(val1, LinearBound)
+
+    if is_lb0 and not is_lb1:
+        # x / c  ==  x * (1/c) ; reuse the const-mul backward.
+        var = v0
+        c = jnp.reciprocal(jnp.asarray(val1))
+        var_shape = var.aval.shape
+        dummy = jnp.zeros(var_shape, dtype=out_bd.A_lo.dtype)
+        primal = lambda x_in: x_in * c
+
+        def transpose_one(cov):
+            (tr,) = jax.linear_transpose(primal, dummy)(cov)
+            return tr
+
+        new_A_lo = jax.vmap(transpose_one)(out_bd.A_lo)
+        new_A_hi = jax.vmap(transpose_one)(out_bd.A_hi)
+        in_bd = BackwardBound(new_A_lo, out_bd.b_lo, new_A_hi, out_bd.b_hi)
+        return [in_bd if v is var else None for v in eqn.invars]
+
+    # Both LB or denominator-LB: concretize via 4-corner IBP and propagate
+    # as a pure bias.  Attribute bias to first LB invar.
+    def _concrete_iv(val):
+        if isinstance(val, LinearBound):
+            return val.l, val.u
+        a = jnp.asarray(val)
+        return a, a
+
+    l0, u0 = _concrete_iv(val0)
+    l1, u1 = _concrete_iv(val1)
+    c00 = l0 / l1
+    c01 = l0 / u1
+    c10 = u0 / l1
+    c11 = u0 / u1
+    y_l = jnp.minimum(jnp.minimum(c00, c01), jnp.minimum(c10, c11))
+    y_u = jnp.maximum(jnp.maximum(c00, c01), jnp.maximum(c10, c11))
+
+    A_lo_p = jnp.clip(out_bd.A_lo, 0, None)
+    A_lo_n = jnp.clip(out_bd.A_lo, None, 0)
+    A_hi_p = jnp.clip(out_bd.A_hi, 0, None)
+    A_hi_n = jnp.clip(out_bd.A_hi, None, 0)
+    axes = tuple(range(1, out_bd.A_lo.ndim))
+    db_lo = jnp.sum(A_lo_p * y_l + A_lo_n * y_u, axis=axes)
+    db_hi = jnp.sum(A_hi_p * y_u + A_hi_n * y_l, axis=axes)
+
+    n_out = out_bd.A_lo.shape[0]
+    z_lo = jnp.zeros_like(out_bd.b_lo)
+    z_hi = jnp.zeros_like(out_bd.b_hi)
+    out_bds = [None, None]
+    bias_given = False
+    for i, (v, val, is_lb) in enumerate(
+        [(v0, val0, is_lb0), (v1, val1, is_lb1)]
+    ):
+        if not is_lb:
+            continue
+        z = jnp.zeros((n_out, *val.l.shape), dtype=out_bd.A_lo.dtype)
+        if not bias_given:
+            out_bds[i] = BackwardBound(z, out_bd.b_lo + db_lo,
+                                       z, out_bd.b_hi + db_hi)
+            bias_given = True
+        else:
+            out_bds[i] = BackwardBound(z, z_lo, z, z_hi)
+    return out_bds
+
+
+backward_registry[lax.div_p] = _bw_div
 
 
 def _bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u):
@@ -1779,8 +2129,135 @@ def _bw_tanh(eqn, out_bd, env, **_):
     return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
 
 
+def _bw_exp(eqn, out_bd, env, **_):
+    """Backward through exp. α, β_l, β_u match _linbp_exp_p."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    exp_l, exp_u = jnp.exp(l), jnp.exp(u)
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, exp_l, (exp_u - exp_l) / safe_denom)
+    beta_u = exp_l - alpha * l
+    log_alpha = jnp.where(degenerate, l, jnp.log(jnp.clip(alpha, 1e-30)))
+    beta_l = alpha * (1.0 - log_alpha)
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+def _bw_log1p(eqn, out_bd, env, **_):
+    """Backward through log1p. α, β_l, β_u match _linbp_log1p_p."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    log1p_l = jnp.log1p(l)
+    log1p_u = jnp.log1p(u)
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(degenerate, 1.0 / (1.0 + l), (log1p_u - log1p_l) / safe_denom)
+    beta_l = log1p_l - alpha * l
+    log_alpha = jnp.log(jnp.clip(alpha, 1e-30))
+    beta_u = jnp.where(degenerate, log1p_l - alpha * l, alpha - 1.0 - log_alpha)
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+def _bw_sqrt(eqn, out_bd, env, **_):
+    """Backward through sqrt. α, β_l, β_u match _linbp_sqrt_p."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l = jnp.maximum(lb_in.l, 0.0)
+    u = jnp.maximum(lb_in.u, 0.0)
+    sqrt_l = jnp.sqrt(l)
+    sqrt_u = jnp.sqrt(u)
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    safe_sqrt_l = jnp.maximum(sqrt_l, 1e-15)
+    alpha = jnp.where(
+        degenerate,
+        1.0 / (2.0 * safe_sqrt_l),
+        (sqrt_u - sqrt_l) / safe_denom,
+    )
+    beta_l = sqrt_l - alpha * l
+    safe_alpha = jnp.maximum(alpha, 1e-30)
+    beta_u = jnp.where(degenerate, sqrt_l - alpha * l, 1.0 / (4.0 * safe_alpha))
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+def _bw_sin(eqn, out_bd, env, **_):
+    """Backward through sin. α, β_l, β_u match _linbp_sin_p (α may be negative)."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    wide = (u - l) >= 2 * jnp.pi
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
+    alpha = jnp.where(
+        wide, 0.0,
+        jnp.where(degenerate, jnp.cos(l), (jnp.sin(u) - jnp.sin(l)) / safe_denom),
+    )
+    beta_chord = jnp.sin(l) - alpha * l
+    mid = (l + u) / 2
+    alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
+    one_minus_a2 = jnp.maximum(1.0 - alpha ** 2, 0.0)
+    safe_val = jnp.where(one_minus_a2 <= 0.0, jnp.ones_like(one_minus_a2), one_minus_a2)
+    sin_sq = jnp.where(one_minus_a2 <= 0.0, jnp.zeros_like(one_minus_a2), jnp.sqrt(safe_val))
+    x_base = jnp.arccos(alpha_c)
+    x_plus = x_base + jnp.round((mid - x_base) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_plus = (x_plus >= l) & (x_plus <= u)
+    beta_u = jnp.where(
+        wide, 1.0,
+        jnp.where(in_plus, jnp.maximum(beta_chord, sin_sq - alpha * x_plus), beta_chord),
+    )
+    x_minus = -x_base + jnp.round((mid + x_base) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_minus = (x_minus >= l) & (x_minus <= u)
+    beta_l = jnp.where(
+        wide, -1.0,
+        jnp.where(in_minus, jnp.minimum(beta_chord, -sin_sq - alpha * x_minus), beta_chord),
+    )
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
+def _bw_cos(eqn, out_bd, env, **_):
+    """Backward through cos. α, β_l, β_u match _linbp_cos_p (α may be negative)."""
+    (var,) = eqn.invars
+    lb_in = env[var]
+    l, u = lb_in.l, lb_in.u
+    wide = (u - l) >= 2 * jnp.pi
+    degenerate = jnp.abs(u - l) < 1e-8
+    safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
+    alpha = jnp.where(
+        wide, 0.0,
+        jnp.where(degenerate, -jnp.sin(l), (jnp.cos(u) - jnp.cos(l)) / safe_denom),
+    )
+    beta_chord = jnp.cos(l) - alpha * l
+    mid = (l + u) / 2
+    alpha_c = jnp.clip(alpha, -1.0 + 1e-7, 1.0 - 1e-7)
+    one_minus_a2 = jnp.maximum(1.0 - alpha ** 2, 0.0)
+    safe_val = jnp.where(one_minus_a2 <= 0.0, jnp.ones_like(one_minus_a2), one_minus_a2)
+    cos_sq = jnp.where(one_minus_a2 <= 0.0, jnp.zeros_like(one_minus_a2), jnp.sqrt(safe_val))
+    x_base_p = jnp.arcsin(-alpha_c)
+    x_base_n = jnp.pi - x_base_p
+    x_plus = x_base_p + jnp.round((mid - x_base_p) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_plus = (x_plus >= l) & (x_plus <= u)
+    beta_u = jnp.where(
+        wide, 1.0,
+        jnp.where(in_plus, jnp.maximum(beta_chord, cos_sq - alpha * x_plus), beta_chord),
+    )
+    x_minus = x_base_n + jnp.round((mid - x_base_n) / (2 * jnp.pi)) * 2 * jnp.pi
+    in_minus = (x_minus >= l) & (x_minus <= u)
+    beta_l = jnp.where(
+        wide, -1.0,
+        jnp.where(in_minus, jnp.minimum(beta_chord, -cos_sq - alpha * x_minus), beta_chord),
+    )
+    return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
+
+
 backward_registry[lax.logistic_p] = _bw_logistic
 backward_registry[lax.tanh_p] = _bw_tanh
+backward_registry[lax.exp_p] = _bw_exp
+backward_registry[lax.log1p_p] = _bw_log1p
+backward_registry[lax.sqrt_p] = _bw_sqrt
+backward_registry[lax.sin_p] = _bw_sin
+backward_registry[lax.cos_p] = _bw_cos
 
 
 def _bw_jit(eqn, out_bds_out, env, *, relu_mode):
@@ -1871,7 +2348,7 @@ def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str):
             out_bd = bw_env[eqn.outvars[0]]
             in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
         for v, bd in zip(eqn.invars, in_bds):
-            if bd is None:
+            if bd is None or isinstance(v, Literal):
                 continue
             if v in bw_env:
                 # Accumulate (multi-use var)
@@ -1914,7 +2391,7 @@ def _backward_to_concrete(jaxpr, env, target_var, target_idx, x_lb, x_ub, relu_m
             out_bd = bw_env[eqn.outvars[0]]
             in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
         for v, bd in zip(eqn.invars, in_bds):
-            if bd is None:
+            if bd is None or isinstance(v, Literal):
                 continue
             if v in bw_env:
                 prev = bw_env[v]
@@ -1977,8 +2454,10 @@ def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
     """Backward CROWN: like ``linbp`` but with sign-conditioned per-(output,
     neuron) slope picking at each ReLU.
 
-    Returns a callable mapping an ``Interval`` to a ``LinearBound`` shaped to
-    match ``crown()``'s expectation (lA/uA = (n_out, n_in), lb/ub = (n_out,)).
+    Returns a callable mapping an ``Interval`` to a ``LinearBound``.  Shapes
+    match the forward :func:`linbp` convention: ``lA, uA`` are ``(*S_out, *S_in)``
+    and ``lb, ub, l, u`` are ``S_out`` — where ``S_out`` is the traced output
+    shape of ``f`` (so e.g. a matrix-valued ``f`` yields matrix-shaped bounds).
     """
     def wrapped(inp) -> LinearBound:
         lb_init, trace_point, x_lb, x_ub = _resolve_linbp_input(inp)
@@ -1988,15 +2467,9 @@ def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
             relu_mode=relu_mode, tighten_bounds=tighten_bounds,
             x_lb=x_lb, x_ub=x_ub, iterated_bw=iterated_bw,
         )
-        # We assume a single input variable.
         if len(in_bds) != 1:
             raise NotImplementedError("backward CROWN: multi-input functions not supported yet")
         bd = in_bds[0]
-        # The function input was the identity LinearBound (lb_init); so the
-        # backward coefficient at the input variable directly gives the linear
-        # bound on the output with respect to x_in.  Concretize l, u using IBP
-        # outputs from the forward pass for the concrete bounds.
-        # We need to evaluate A @ x + b at [x_lb, x_ub] for l, u.
         if x_lb is None:
             l = jnp.full(bd.b_lo.shape, -jnp.inf)
             u = jnp.full(bd.b_hi.shape, jnp.inf)
@@ -2005,7 +2478,18 @@ def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
             Ahi_p = jnp.clip(bd.A_hi, 0, None); Ahi_n = jnp.clip(bd.A_hi, None, 0)
             l = _bw_concrete(Alo_p, Alo_n, x_lb, x_ub) + bd.b_lo
             u = _bw_concrete(Ahi_p, Ahi_n, x_ub, x_lb) + bd.b_hi
-        return LinearBound(lA=bd.A_lo, lb=bd.b_lo, uA=bd.A_hi, ub=bd.b_hi, l=l, u=u)
+
+        # Reshape bounds from the backward CROWN's flat layout (n_out, *S_in)
+        # to the forward linbp convention (*S_out, *S_in).
+        S_out = tuple(closed_jaxpr.jaxpr.outvars[0].aval.shape)
+        in_shape = bd.A_lo.shape[1:]   # *S_in
+        lA = bd.A_lo.reshape(S_out + in_shape)
+        uA = bd.A_hi.reshape(S_out + in_shape)
+        lb = bd.b_lo.reshape(S_out)
+        ub = bd.b_hi.reshape(S_out)
+        l = l.reshape(S_out)
+        u = u.reshape(S_out)
+        return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=l, u=u)
 
     return wrapped
 
