@@ -16,11 +16,5 @@ from .parametric import *
 from . import embedding as embedding
 from .embedding import *
 
-try:
-    from . import taylor as taylor
-    from .taylor import *
-except Exception:
-    pass
-
 from . import refinement as refinement
 from . import utils as utils

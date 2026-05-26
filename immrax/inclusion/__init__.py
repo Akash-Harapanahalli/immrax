@@ -44,11 +44,6 @@ from .jacobian import (
     mjacM,
 )
 
-from .tensor import (
-    mdit,
-    dit,
-)
-
 __all__ = [
     "Interval",
     "interval",
@@ -82,8 +77,6 @@ __all__ = [
     "get_corners",
     "mjacif",
     "mjacM",
-    "mdit",
-    "dit",
     "widen",
     "rigorous",
     "non_rigorous",
