@@ -87,6 +87,17 @@ class LinearBound:
 # Registry and interpreter
 # ---------------------------------------------------------------------------
 
+
+def _degenerate_threshold(arr):
+    """Width below which (f(u) - f(l)) / (u - l) suffers catastrophic cancellation.
+
+    For float32 this is ~3.4e-4; for float64 ~1.5e-8. Above this width the chord
+    slope is numerically reliable; at or below it we fall back to f'(l) (the
+    tangent slope at l, which equals the chord slope in the limit u → l).
+    """
+    return jnp.sqrt(jnp.finfo(arr.dtype).eps)
+
+
 linbp_registry = {}
 
 # Primitives that recurse into inner jaxprs — these need tighten_bounds/x_lb/x_ub
@@ -761,7 +772,7 @@ def _linbp_logistic_p(x, *, relu_mode, **kwargs):
     sig_l, sig_u = jax.nn.sigmoid(l), jax.nn.sigmoid(u)
 
     # Chord slope α ∈ (0, 0.25]; falls back to σ'(l) for degenerate intervals.
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, sig_l * (1.0 - sig_l), (sig_u - sig_l) / safe_denom)
 
@@ -822,7 +833,7 @@ def _linbp_tanh_p(x, *, relu_mode, **kwargs):
     l, u = x.l, x.u
     tanh_l, tanh_u = jnp.tanh(l), jnp.tanh(u)
 
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, 1.0 - tanh_l ** 2, (tanh_u - tanh_l) / safe_denom)
 
@@ -885,7 +896,7 @@ def _linbp_sin_p(x, *, relu_mode, **kwargs):
     l, u = x.l, x.u
 
     wide = (u - l) >= 2 * jnp.pi
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
     alpha = jnp.where(
         wide, 0.0,
@@ -949,7 +960,7 @@ def _linbp_cos_p(x, *, relu_mode, **kwargs):
     l, u = x.l, x.u
 
     wide = (u - l) >= 2 * jnp.pi
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
     alpha = jnp.where(
         wide, 0.0,
@@ -1019,7 +1030,7 @@ def _linbp_tan_p(x, *, relu_mode, **kwargs):
     l, u = x.l, x.u
     tan_l, tan_u = jnp.tan(l), jnp.tan(u)
 
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, 1.0 + tan_l ** 2, (tan_u - tan_l) / safe_denom)
 
@@ -1094,7 +1105,7 @@ def _linbp_integer_pow_p(x, *, y, relu_mode, **kwargs):
         f_concrete_l = pow_l
         f_concrete_u = pow_u
 
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(
         degenerate,
@@ -1157,7 +1168,7 @@ def _linbp_exp_p(x, *, relu_mode, **kwargs):
     exp_l, exp_u = jnp.exp(l), jnp.exp(u)
 
     # Chord slope α_u = (eᵘ − eˡ) / (u − l); falls back to eˡ = exp'(l).
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, exp_l, (exp_u - exp_l) / safe_denom)
 
@@ -1201,7 +1212,7 @@ def _linbp_log1p_p(x, *, relu_mode, **kwargs):
     log1p_u = jnp.log1p(u)
 
     # Chord slope α = (log1p(u) − log1p(l)) / (u − l); falls back to 1/(1+l).
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, 1.0 / (1.0 + l), (log1p_u - log1p_l) / safe_denom)
 
@@ -1246,7 +1257,7 @@ def _linbp_sqrt_p(x, *, relu_mode, **kwargs):
     sqrt_l = jnp.sqrt(l)
     sqrt_u = jnp.sqrt(u)
 
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     safe_sqrt_l = jnp.maximum(sqrt_l, 1e-15)
     # Chord slope α = (√u − √l) / (u − l) = 1 / (√u + √l)
@@ -2083,7 +2094,7 @@ def _bw_logistic(eqn, out_bd, env, **_):
     lb_in = env[var]
     l, u = lb_in.l, lb_in.u
     sig_l, sig_u = jax.nn.sigmoid(l), jax.nn.sigmoid(u)
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, sig_l * (1.0 - sig_l), (sig_u - sig_l) / safe_denom)
     beta_chord = sig_l - alpha * l
@@ -2111,7 +2122,7 @@ def _bw_tanh(eqn, out_bd, env, **_):
     lb_in = env[var]
     l, u = lb_in.l, lb_in.u
     tanh_l, tanh_u = jnp.tanh(l), jnp.tanh(u)
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, 1.0 - tanh_l ** 2, (tanh_u - tanh_l) / safe_denom)
     chord_beta = tanh_l - alpha * l
@@ -2135,7 +2146,7 @@ def _bw_exp(eqn, out_bd, env, **_):
     lb_in = env[var]
     l, u = lb_in.l, lb_in.u
     exp_l, exp_u = jnp.exp(l), jnp.exp(u)
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, exp_l, (exp_u - exp_l) / safe_denom)
     beta_u = exp_l - alpha * l
@@ -2151,7 +2162,7 @@ def _bw_log1p(eqn, out_bd, env, **_):
     l, u = lb_in.l, lb_in.u
     log1p_l = jnp.log1p(l)
     log1p_u = jnp.log1p(u)
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     alpha = jnp.where(degenerate, 1.0 / (1.0 + l), (log1p_u - log1p_l) / safe_denom)
     beta_l = log1p_l - alpha * l
@@ -2168,7 +2179,7 @@ def _bw_sqrt(eqn, out_bd, env, **_):
     u = jnp.maximum(lb_in.u, 0.0)
     sqrt_l = jnp.sqrt(l)
     sqrt_u = jnp.sqrt(u)
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate, 1.0, u - l)
     safe_sqrt_l = jnp.maximum(sqrt_l, 1e-15)
     alpha = jnp.where(
@@ -2188,7 +2199,7 @@ def _bw_sin(eqn, out_bd, env, **_):
     lb_in = env[var]
     l, u = lb_in.l, lb_in.u
     wide = (u - l) >= 2 * jnp.pi
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
     alpha = jnp.where(
         wide, 0.0,
@@ -2222,7 +2233,7 @@ def _bw_cos(eqn, out_bd, env, **_):
     lb_in = env[var]
     l, u = lb_in.l, lb_in.u
     wide = (u - l) >= 2 * jnp.pi
-    degenerate = jnp.abs(u - l) < 1e-8
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
     safe_denom = jnp.where(degenerate | wide, 1.0, u - l)
     alpha = jnp.where(
         wide, 0.0,
