@@ -203,7 +203,7 @@ class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
 
 def crown(
     f: Callable[..., jax.Array], out_len: int = None,
-    *, backward: bool = True, iterated: bool = False,
+    *, backward: bool = True, iterated: bool = True,
 ) -> Callable[..., CROWNResult]:
     """Backward CROWN by default (sign-conditioned slope at each ReLU).
 
@@ -245,7 +245,7 @@ class FastlinResult(namedtuple("FastlinResult", ["C", "ld", "ud"])):
 
 def fastlin(
     f: Callable[..., jax.Array], out_len: int = None,
-    *, backward: bool = True, iterated: bool = False,
+    *, backward: bool = True, iterated: bool = True,
 ) -> Callable[..., FastlinResult]:
     """Backward same-slope (FastLin) by default. ``iterated=True`` re-derives
     pre-activation ``l, u`` via backward CROWN at each ReLU (pure backward)."""
