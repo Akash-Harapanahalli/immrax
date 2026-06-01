@@ -1,34 +1,50 @@
 import jax
 from jaxtyping import Integer, Float, ArrayLike
 from typing import Union, List, Callable, Literal
-from abc import ABC, abstractmethod
+from abc import abstractmethod
+import equinox as eqx
 from ..system import System
+from ..system.system import LegacyAttrModule
 from .parametope import Parametope
 from immutabledict import immutabledict
 from diffrax import AbstractSolver, ODETerm, Euler, Dopri5, Tsit5, SaveAt, diffeqsolve
 import warnings
-from functools import partial
 
 
-class ParametricEmbedding(ABC):
+class ParametricEmbedding(LegacyAttrModule):
+    """Base class for embeddings that lift a :class:`~immrax.system.System` to
+    dynamics over a parametric set representation (:class:`Parametope`).
+
+    ``ParametricEmbedding`` is an :class:`equinox.Module`, so a configured
+    embedding is a JAX pytree: the wrapped ``sys`` (and any array-valued fields
+    declared by a subclass) are pytree leaves, enabling ``jit``/``vmap`` over the
+    embedding as a whole.
+
+    Subclasses implement :meth:`_initialize` (build the auxiliary state evolved
+    alongside the parametope, for a particular initial set ``pt0``) and
+    :meth:`_dynamics` (the embedding right-hand side). :meth:`_initialize` must be
+    a pure function of ``pt0`` returning ``aux0`` — it must not mutate ``self``.
+    """
+
     sys: System
-
-    def __init__(self, sys: System):
-        self.sys = sys
 
     @abstractmethod
     def _initialize(self, pt0: Parametope) -> ArrayLike:
-        """Initialize the Embedding System for a particular initial set pt0
+        """Initialize the embedding for a particular initial set ``pt0``.
+
+        This must be a pure function: it returns the auxiliary state ``aux0`` to
+        evolve alongside the parametope and must *not* mutate ``self`` (the
+        embedding is an immutable :class:`equinox.Module`).
 
         Parameters
         ----------
-        pt0 : hParametope
-            _description_
+        pt0 : Parametope
+            The initial set.
 
         Returns
         -------
         ArrayLike
-            aux0: Auxilliary states to evolve with the embedding system
+            ``aux0``: auxiliary states to evolve with the embedding system.
         """
 
     @abstractmethod
@@ -43,9 +59,7 @@ class ParametricEmbedding(ABC):
             _description_
         """
 
-    @partial(
-        jax.jit, static_argnums=(0, 4), static_argnames=("solver", "f_kwargs", "inputs")
-    )
+    @eqx.filter_jit
     def compute_reachset(
         self,
         t0: Union[Integer, Float],

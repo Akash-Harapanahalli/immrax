@@ -1,5 +1,5 @@
 import abc
-from functools import partial
+import warnings
 from typing import Any, Callable, List, Literal, Union
 
 from diffrax import (
@@ -11,6 +11,7 @@ from diffrax import (
     Tsit5,
     diffeqsolve,
 )
+import equinox as eqx
 from immutabledict import immutabledict
 import jax
 import jax.numpy as jnp
@@ -30,7 +31,64 @@ class EvolutionError(Exception):
         )
 
 
-class System(abc.ABC):
+class LegacyAttrModule(eqx.Module):
+    """An :class:`equinox.Module` that tolerates the deprecated pattern of
+    assigning *undeclared* attributes inside a hand-written ``__init__``.
+
+    Equinox modules are frozen dataclasses: only declared fields may be set.
+    Historically, ``immrax`` subclasses stored parameters as plain
+    ``self.<name> = ...`` without declaring them. To keep that code running while
+    nudging toward the idiomatic ``eqx.field`` style, this base routes any
+    undeclared assignment into a static ``_legacy`` dict (emitting a
+    ``DeprecationWarning``). Legacy values are carried as aux data — they survive
+    the flatten/unflatten roundtrip that ``jit``/``vmap`` perform, but, being
+    static, are baked into the compiled graph rather than traced.
+    """
+
+    # ``kw_only`` is required: without it this defaulted base field would force a
+    # "non-default argument follows default argument" error on every subclass
+    # that declares a required (non-default) field.
+    _legacy: dict = eqx.field(static=True, default_factory=dict, kw_only=True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Declared fields go through equinox's frozen-aware setattr (allowed
+        # during __init__, rejected afterwards). Undeclared attributes are the
+        # deprecated legacy pattern: warn and stash them in ``_legacy``.
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+        else:
+            warnings.warn(
+                f"Setting undeclared attribute {name!r} on {type(self).__name__!r} "
+                f"is deprecated; declare it as an equinox field "
+                f"(e.g. `{name}: <type> = eqx.field(...)`). Legacy attributes are "
+                f"stored as static metadata and will not be traced by jit/vmap.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # ``self._legacy`` lazily creates the backing dict on first access
+            # (see ``__getattr__``); mutate it in place so the value is captured
+            # in aux data.
+            self._legacy[name] = value
+
+    def __getattr__(self, name: str) -> Any:
+        # Only invoked when normal attribute lookup fails. The ``_legacy`` store
+        # is created on first access: equinox does not run ``default_factory``
+        # for subclasses with a hand-written ``__init__``, and its post-init
+        # check reads ``_legacy`` via ``getattr`` — returning the (lazily
+        # created) empty dict here keeps those subclasses working.
+        if name == "_legacy":
+            legacy: dict = {}
+            object.__setattr__(self, "_legacy", legacy)
+            return legacy
+        legacy = self.__dict__.get("_legacy", {})
+        if name in legacy:
+            return legacy[name]
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+
+class System(LegacyAttrModule):
     r"""System
 
     A dynamical system of one of the following forms:
@@ -40,20 +98,38 @@ class System(abc.ABC):
 
     where :math:`t\in T\in\{\mathbb{Z},\mathbb{R}\}` is a discrete or continuous time variable, :math:`x\in\mathbb{R}^n` is the state of the system, and :math:`\dots` are some other inputs, perhaps control and disturbance.
 
-    There are two main attributes that need to be defined in a subclass:
+    ``System`` is an :class:`equinox.Module`, so subclasses are JAX pytrees: any
+    array-valued attribute declared as a field becomes a pytree leaf (visible to
+    ``jit``/``vmap``/``grad``), while ``evolution`` and ``xlen`` are static
+    metadata.
+
+    There are two attributes that need to be defined in a subclass:
 
     - `evolution` : Literal['continuous', 'discrete'], which specifies whether the system is continuous or discrete.
     - `xlen` : int, which specifies the dimension of the state space.
 
+    The idiomatic (equinox) way to define a subclass declares fields at class
+    level and lets equinox synthesize ``__init__``::
+
+        class VanDerPol(System):
+            mu: float = 1.0
+            evolution: str = eqx.field(static=True, default="continuous")
+            xlen: int = eqx.field(static=True, default=2)
+
+            def f(self, t, x):
+                return jnp.array([x[1], self.mu * (1 - x[0] ** 2) * x[1] - x[0]])
+
+    Subclasses with a hand-written ``__init__`` that only assign ``evolution``
+    and ``xlen`` continue to work. Assigning *undeclared* attributes (e.g.
+    storing a parameter as ``self.mu = ...`` without declaring ``mu`` as a field)
+    is deprecated: it emits a ``DeprecationWarning`` and the value is stored
+    outside the pytree, so it will *not* be traced by ``jit``/``vmap``.
+
     The main method that needs to be defined is `f(t, x, *args, **kwargs)`, which returns the time evolution of the state at time `t` and state `x`.
     """
 
-    evolution: Literal["continuous", "discrete"]
-    xlen: int
-
-    def __init__(self, evolution, xlen):
-        self.evolution = evolution
-        self.xlen = xlen
+    evolution: str = eqx.field(static=True)
+    xlen: int = eqx.field(static=True)
 
     @abc.abstractmethod
     def f(self, t: Union[Integer, Float], x: jax.Array, *args, **kwargs) -> jax.Array:
@@ -80,11 +156,7 @@ class System(abc.ABC):
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.f(*args, **kwargs)
 
-    @partial(
-        jax.jit,
-        static_argnums=(0, 4),
-        static_argnames=("solver", "f_kwargs", "inputs", "dense", "max_steps"),
-    )
+    @eqx.filter_jit
     def compute_trajectory(
         self,
         t0: Union[Integer, Float],
@@ -225,6 +297,8 @@ class LinearTransformedSystem(System):
     """
 
     sys: System
+    T: jax.Array
+    Tinv: jax.Array
 
     def __init__(self, sys: System, T: jax.Array) -> None:
         self.evolution = sys.evolution
@@ -243,6 +317,8 @@ class NonlinearTransformedSystem(System):
     """
 
     sys: System
+    phi: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
+    phi_inv: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -282,7 +358,7 @@ class LiftedSystem(System):
         return self.H @ self.sys.f(t, self.Hp @ x, *args, **kwargs)
 
 
-class OpenLoopSystem(System, abc.ABC):
+class OpenLoopSystem(System):
     """OpenLoopSystem
     An open-loop nonlinear dynamical system of the form
 

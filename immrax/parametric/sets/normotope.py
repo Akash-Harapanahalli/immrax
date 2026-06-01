@@ -1,19 +1,19 @@
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import Array, ArrayLike, Float
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
 from ...inclusion import Interval, interval, icentpert, i2centpert, mjacM
-from ...system import System
 from ..parametope import Parametope
 from ..embedding import ParametricEmbedding
 from .polytope import Polytope
 from .ellipsoid import Ellipsoid
-from ...utils import get_corners, get_sparse_corners, get_rohn_corners
+from ...utils import get_rohn_corners, get_corners
 
 from functools import partial
 from math import sqrt
@@ -127,57 +127,111 @@ class Normotope(Parametope):
 
 
 class NormotopeEmbedding(ParametricEmbedding):
-    def __init__(self, sys: System):
-        super().__init__(sys)
-        self.Df_x = jax.jacfwd(sys.f, 1)
-        self.Mf = mjacM(sys.f)
-        self.NT = None
-        self.gsc = None
+    r"""Embedding of a :class:`~immrax.system.System` onto :class:`Normotope`
+    dynamics.
 
-    def _initialize(self, nt0: Normotope, *, no_gsc=False) -> ArrayLike:
+    Parameters
+    ----------
+    sys : System
+        The system to embed.
+    gsc : Callable[[Interval], list], optional
+        The corner-selection strategy: a function mapping the interval Jacobian
+        :math:`[M]` to the list of corner matrices used in the
+        logarithmic-norm contraction bound. Defaults to
+        ``partial(get_rohn_corners, sign='+')``, which is exact for the
+        :class:`L2Normotope` case. Other choices include :func:`get_corners`
+        (all :math:`2^{n^2}` corners) or a presized :func:`get_sparse_corners`
+        instance. This is a static, construction-time selection — it is *not*
+        inferred from the initial set.
+    kappa : float, optional
+        Strength of the soft ``y``-clamp toward the tightened box. When an
+        external box ``ix`` is supplied to :meth:`_dynamics`, a term
+        ``-kappa * relu(y - y_box)`` is added to ``y``'s dynamics, where
+        ``y_box = max_i ||alpha (x_i - ox)||`` over the corners ``x_i`` of the
+        tightened box. This pulls ``y`` down toward the smallest radius that
+        still encloses the (already-valid) box, without losing the enclosure:
+        the term is active only where ``y > y_box``, i.e. where the static
+        certificate ``{||alpha(x-ox)|| <= y_box} ⊇ box ⊇ R`` already holds with
+        slack, so the value of ``y``'s derivative there is free to choose.
+        Defaults to ``0.0`` (no clamp; behaviour identical to the plain
+        intersection). Has no effect when ``ix`` is ``None``.
+    """
+
+    gsc: Callable = eqx.field(
+        static=True, default=partial(get_rohn_corners, sign="+")
+    )
+    kappa: float = eqx.field(static=True, default=0.0)
+
+    def _initialize(self, nt0: Normotope) -> ArrayLike:
         if not isinstance(nt0, Normotope):
             raise ValueError(f"{nt0=} is not a Normotope needed for NormotopeEmbedding")
-
-        self.NT = nt0.__class__
-
-        if isinstance(nt0, L2Normotope) :
-            self.gsc = partial(get_rohn_corners, sign='+')
-        elif not no_gsc:
-            ix0 = nt0.iover()
-            M = self.Mf(0.0, ix0, center=(jnp.zeros(1), nt0.ox))[1]
-            self.gsc = get_sparse_corners(interval(M))
-        else:
-            self.gsc = get_corners
-        
+        # No auxiliary state is evolved for normotopes; the adjoint setup and the
+        # inverse of alpha are recomputed per step inside ``_dynamics``.
         return None
 
     # @partial(jax.jit, static_argnums=(0,), static_argnames=("perm", "adjoint"))
-    def _dynamics(self, t, state, U=None, *, perm=None, adjoint=True):
-        # nt = self.NT.from_normotope(state[0])
+    def _dynamics(self, t, state, U=None, *, perm=None, adjoint=True, ix=None):
+        r"""Normotope embedding dynamics.
+
+        Parameters
+        ----------
+        ix : Interval, optional
+            A box over which to evaluate the mixed Jacobian, used *in addition
+            to* (intersected with) the normotope's own ``iover()``. The
+            contraction-rate bound is computed over the tighter
+            ``ix & nt.iover()``. Since both ``ix`` and ``nt.iover()`` are valid
+            interval enclosures of the reachable set, their intersection is too,
+            so passing a tighter ``ix`` only reduces conservatism. When ``None``
+            (the default) the behaviour is exactly ``nt.iover()``. When supplied
+            and ``kappa > 0``, a soft clamp pulls ``y`` toward the tightened box
+            (see ``kappa``).
+        """
         nt, aux = state
         Ut = U.reshape(nt.alpha.shape) if U is not None else jnp.zeros_like(nt.alpha)
 
-        aux = state[1]
         H = nt.alpha
         Hp = nt.alpha_inv
         y = nt.y
 
-        A = self.Df_x(0.0, nt.ox)
+        # Derive the Jacobian transforms from ``self.sys.f`` at call time (rather
+        # than freezing closures in ``__init__``) so that ``vmap``/``jit`` over
+        # the embedding's system parameters thread through correctly.
+        A = jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
 
         if adjoint:
             H_dot = -H @ A + Ut
         else:
             H_dot = Ut
 
-        MM = self.Mf(
-            t, nt.iover(), center=(jnp.zeros(1), nt.ox), permutation=perm
+        # Evaluate the mixed Jacobian over the tightest available valid enclosure
+        # of the reachable set: the normotope's own interval hull, optionally
+        # intersected with an externally supplied box ``ix`` (e.g. the running
+        # cross-iteration intersection tracked by ReachiLQR).
+        box = nt.iover() if ix is None else (ix & nt.iover())
+
+        MM = mjacM(self.sys.f)(
+            t, box, center=(jnp.zeros(1), nt.ox), permutation=perm
         )
         Mx = MM[1]
 
         mus = [nt.mu(H_dot @ Hp + H @ M @ Hp) for M in self.gsc(interval(Mx))]
         c = jnp.max(jnp.asarray(mus))
+        y_dot = c * y
 
-        return nt.__class__(self.sys.f(0.0, nt.ox), H_dot, c * y), None
+        # Soft clamp of y toward the tightened box. y_box = max_i ||H(x_i - ox)||
+        # over the corners x_i of `box`; since `box` (hence its corners) is frozen
+        # certificate data, gradients flow only through (H, ox). The pull is active
+        # only where y > y_box -- exactly where the static enclosure
+        # {||H(x-ox)|| <= y_box} ⊇ box ⊇ R already holds, so subtracting from y_dot
+        # there does not break the certificate.
+        if ix is not None and self.kappa != 0.0:
+            corners = get_corners(box)  # (2^n, n)
+            # y_box = max_i ||H (x_i - ox)|| using the normotope's own norm
+            # (nt.g(x) = norm(alpha @ (x - ox))), so this is correct for L1/L2/Linf.
+            y_box = jnp.max(jax.vmap(nt.g)(corners))
+            y_dot = y_dot - self.kappa * jnp.maximum(y - y_box, 0.0)
+
+        return nt.__class__(self.sys.f(0.0, nt.ox), H_dot, y_dot), None
 
 
 @register_pytree_node_class

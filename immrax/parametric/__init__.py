@@ -30,6 +30,8 @@ from .sets.normotope import (
     NormotopeEmbedding,
 )
 
+from .reach_ilqr import ReachiLQR, IterateResult, RunResult
+
 __all__ = [
     "Parametope",
     "g_parametope",
@@ -46,4 +48,7 @@ __all__ = [
     "L1Normotope",
     "L2Normotope",
     "NormotopeEmbedding",
+    "ReachiLQR",
+    "IterateResult",
+    "RunResult",
 ]
