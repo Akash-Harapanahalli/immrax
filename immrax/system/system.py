@@ -35,25 +35,19 @@ class LegacyAttrModule(eqx.Module):
     """An :class:`equinox.Module` that tolerates the deprecated pattern of
     assigning *undeclared* attributes inside a hand-written ``__init__``.
 
-    Equinox modules are frozen dataclasses: only declared fields may be set.
-    Historically, ``immrax`` subclasses stored parameters as plain
-    ``self.<name> = ...`` without declaring them. To keep that code running while
-    nudging toward the idiomatic ``eqx.field`` style, this base routes any
-    undeclared assignment into a static ``_legacy`` dict (emitting a
-    ``DeprecationWarning``). Legacy values are carried as aux data — they survive
-    the flatten/unflatten roundtrip that ``jit``/``vmap`` perform, but, being
-    static, are baked into the compiled graph rather than traced.
+    Equinox modules are frozen dataclasses, so only declared fields may be set.
+    Older ``immrax`` subclasses stored parameters as plain ``self.<name> = ...``
+    without declaring them; this base routes any such assignment into a static
+    ``_legacy`` dict (with a ``DeprecationWarning``). Legacy values survive the
+    flatten/unflatten roundtrip but, being static, are baked into the compiled
+    graph rather than traced.
     """
 
-    # ``kw_only`` is required: without it this defaulted base field would force a
-    # "non-default argument follows default argument" error on every subclass
-    # that declares a required (non-default) field.
+    # kw_only avoids "non-default argument follows default argument" on subclasses
+    # that declare required fields.
     _legacy: dict = eqx.field(static=True, default_factory=dict, kw_only=True)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # Declared fields go through equinox's frozen-aware setattr (allowed
-        # during __init__, rejected afterwards). Undeclared attributes are the
-        # deprecated legacy pattern: warn and stash them in ``_legacy``.
         if name in type(self).__dataclass_fields__:
             super().__setattr__(name, value)
         else:
@@ -65,17 +59,11 @@ class LegacyAttrModule(eqx.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            # ``self._legacy`` lazily creates the backing dict on first access
-            # (see ``__getattr__``); mutate it in place so the value is captured
-            # in aux data.
             self._legacy[name] = value
 
     def __getattr__(self, name: str) -> Any:
-        # Only invoked when normal attribute lookup fails. The ``_legacy`` store
-        # is created on first access: equinox does not run ``default_factory``
-        # for subclasses with a hand-written ``__init__``, and its post-init
-        # check reads ``_legacy`` via ``getattr`` — returning the (lazily
-        # created) empty dict here keeps those subclasses working.
+        # equinox skips default_factory for subclasses with a hand-written
+        # __init__, so create _legacy lazily on first access.
         if name == "_legacy":
             legacy: dict = {}
             object.__setattr__(self, "_legacy", legacy)
@@ -98,38 +86,21 @@ class System(LegacyAttrModule):
 
     where :math:`t\in T\in\{\mathbb{Z},\mathbb{R}\}` is a discrete or continuous time variable, :math:`x\in\mathbb{R}^n` is the state of the system, and :math:`\dots` are some other inputs, perhaps control and disturbance.
 
-    ``System`` is an :class:`equinox.Module`, so subclasses are JAX pytrees: any
-    array-valued attribute declared as a field becomes a pytree leaf (visible to
-    ``jit``/``vmap``/``grad``), while ``evolution`` and ``xlen`` are static
-    metadata.
-
-    There are two attributes that need to be defined in a subclass:
-
-    - `evolution` : Literal['continuous', 'discrete'], which specifies whether the system is continuous or discrete.
-    - `xlen` : int, which specifies the dimension of the state space.
-
-    The idiomatic (equinox) way to define a subclass declares fields at class
-    level and lets equinox synthesize ``__init__``::
+    Subclasses are :class:`equinox.Module` pytrees. Declare ``xlen`` (state
+    dimension) as a ``ClassVar`` and define ``f``; ``evolution`` defaults to
+    ``'continuous'`` (set ``evolution: ClassVar[str] = "discrete"`` for a
+    discrete-time system). Genuine parameters are ordinary fields::
 
         class VanDerPol(System):
+            xlen: ClassVar[int] = 2
             mu: float = 1.0
-            evolution: str = eqx.field(static=True, default="continuous")
-            xlen: int = eqx.field(static=True, default=2)
 
             def f(self, t, x):
                 return jnp.array([x[1], self.mu * (1 - x[0] ** 2) * x[1] - x[0]])
-
-    Subclasses with a hand-written ``__init__`` that only assign ``evolution``
-    and ``xlen`` continue to work. Assigning *undeclared* attributes (e.g.
-    storing a parameter as ``self.mu = ...`` without declaring ``mu`` as a field)
-    is deprecated: it emits a ``DeprecationWarning`` and the value is stored
-    outside the pytree, so it will *not* be traced by ``jit``/``vmap``.
-
-    The main method that needs to be defined is `f(t, x, *args, **kwargs)`, which returns the time evolution of the state at time `t` and state `x`.
     """
 
-    evolution: str = eqx.field(static=True)
     xlen: int = eqx.field(static=True)
+    evolution: str = eqx.field(static=True, default="continuous", kw_only=True)
 
     @abc.abstractmethod
     def f(self, t: Union[Integer, Float], x: jax.Array, *args, **kwargs) -> jax.Array:

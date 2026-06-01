@@ -1,20 +1,12 @@
 """Iterative LQR / DDP for norm-based reachable-set synthesis over a ParametricEmbedding.
 
-The class :class:`ReachiLQR` lifts the notebook-style ``iterate()`` from
-Harapanahalli_ACC2026 into a reusable, generic component that
-
-* operates on any :class:`~immrax.parametric.embedding.ParametricEmbedding`,
-* drives both the forward state sweep and the backward costate sweep with a
-  fixed-step Euler ``jax.lax.scan`` (the backward pass integrates the costate
-  and emits the per-step gains in a single fused scan),
-* accepts piecewise-constant control inputs along a fixed control grid,
-* supports both iLQR (Gauss-Newton) and DDP (full second-order) backward passes,
-* threads R (the control penalty) as a runtime argument so the outer R-schedule
-  does not trigger recompilation.
-
-The backward sweep linearizes at the *perturbed* trajectory (the trajectory that
-becomes the next iteration's nominal) under the *nominal* control, matching the
-Harapanahalli_ACC2026 notebooks.
+:class:`ReachiLQR` operates on any :class:`ParametricEmbedding`, drives both the
+forward state sweep and backward costate sweep with a fixed-step Euler
+``jax.lax.scan`` (the backward pass integrates the costate and emits per-step
+gains in one fused scan), supports iLQR (Gauss-Newton) and DDP (full
+second-order) modes, and threads R as a runtime argument so the outer R-schedule
+does not recompile. The backward sweep linearizes at the perturbed trajectory
+(next iteration's nominal) under the nominal control.
 """
 
 from __future__ import annotations
@@ -27,7 +19,7 @@ from jax.flatten_util import ravel_pytree
 from jaxtyping import Array, Float
 from immutabledict import immutabledict
 
-from ..inclusion import interval
+from ..inclusion import Interval, interval
 from .embedding import ParametricEmbedding
 from .parametope import Parametope
 
@@ -39,20 +31,54 @@ class IterateResult(NamedTuple):
     K_traj: Array      # (N, Ulen, Xlen)
     ts: Array          # (N+1,) control grid
     ifinal: Array      # int scalar, last valid grid index (<= N)
-    Us_new: Array      # (N, *control_shape) Us - gamma*l - K*(X - Xnom) per step
+    Us_new: Array      # (N, *hypercontrol_shape) Us - gamma*l - K*(X - Xnom) per step
     cost_final: Array  # scalar terminal cost at state_traj[ifinal]
-    # Per-timestep tightest interval enclosure of the reachable set seen so far:
-    # the running intersection, across iterations, of the perturbed set's
-    # ``iover()`` box at each grid point. Shape (N+1, n) where n is the state
-    # dimension. When ``track_iover=False`` these pass through unchanged.
-    iover_lower: Array  # (N+1, n)
-    iover_upper: Array  # (N+1, n)
+    # Running cross-iteration intersection of the perturbed set's iover() box at
+    # each grid point (an Interval of shape (N+1, n)); passes through unchanged
+    # when track_iover=False.
+    iover: Interval
 
 
 class RunResult(NamedTuple):
-    best: IterateResult
-    Us: Array
-    history: list  # list of dicts with per-iteration {R, ifinal, cost}
+    best: IterateResult  # best iterate by (ifinal, -cost)
+    Us: Array            # best.Us_new
+    history: list        # per-iteration {iter, R, ifinal, cost} dicts
+    iover: Interval      # final accumulated intersection box
+
+
+def constant_schedule(R: Float, revert_best: bool = False) -> Callable[[int], tuple]:
+    """R-schedule factory: constant ``(R, revert_best)`` every iteration."""
+    R, revert_best = float(R), bool(revert_best)
+
+    def schedule(i: int) -> tuple:
+        return R, revert_best
+
+    return schedule
+
+
+def phased_schedule(phases: Sequence[tuple]) -> Callable[[int], tuple]:
+    """R-schedule factory from ``phases = [(R, revert_best, n_iters), ...]``.
+
+    Returns a callable ``i -> (R, revert_best)`` carrying a ``.total`` attribute
+    (the summed iteration count), which :meth:`ReachiLQR.run` uses as the default
+    ``iters``. For example, "R=2 for 750 iterations (reverting to the best on the
+    last one), then R=20 for 750" is::
+
+        phased_schedule([(2.0, False, 749), (2.0, True, 1), (20.0, False, 750)])
+    """
+    bounds, total = [], 0
+    for R, revert_best, n in phases:
+        total += int(n)
+        bounds.append((total, float(R), bool(revert_best)))
+
+    def schedule(i: int) -> tuple:
+        for b, R, revert_best in bounds:
+            if i < b:
+                return R, revert_best
+        return bounds[-1][1], bounds[-1][2]
+
+    schedule.total = total
+    return schedule
 
 
 class ReachiLQR:
@@ -62,7 +88,9 @@ class ReachiLQR:
     ----------
     embedding
         A configured :class:`ParametricEmbedding`. Its ``_initialize(pt0)`` is
-        called eagerly to set up any internal state.
+        called eagerly to set up any internal state, and its
+        ``hypercontrol_shape(pt0)`` defines the shape of each control input
+        ``U_k`` (``Ulen = prod(hypercontrol_shape)``).
     pt0
         The initial parametope. Defines the pytree structure used internally for
         flatten/unflatten and the initial state of the forward sweep.
@@ -70,33 +98,22 @@ class ReachiLQR:
         ``phi(pt) -> scalar``. Evaluated at the perturbed trajectory's final
         parametope (and used for the Jmax early-termination event).
     running_cost
-        ``L(t, pt, U) -> scalar``. Optional user Lagrangian; autodiffed for the
-        gain computation. To match the original Harapanahalli_ACC2026 notebooks,
-        pass ``running_cost = lambda t, pt, U: 0.0`` and let the ``R`` runtime
-        arg of :meth:`iterate` apply ``R * I`` as Levenberg-Marquardt-style
-        damping on ``Quu``. R as a true Lagrangian term (``0.5 R ||U||^2``) is
-        more textbook-correct but couples the gain to the current ``Us``,
-        which can oscillate without a line search.
-    control_shape
-        Shape of each control input ``U_k``. Total control dimension is
-        ``Ulen = prod(control_shape)``.
+        ``L(t, pt, U) -> scalar``. Autodiffed for the gain computation. Passing
+        ``lambda t, pt, U: 0.0`` lets the ``R`` runtime arg of :meth:`iterate`
+        act as Levenberg-Marquardt damping ``R * I`` on ``Quu``; a true
+        Lagrangian term ``0.5 R ||U||^2`` is more textbook-correct but couples
+        the gain to the current ``Us`` and can oscillate without a line search.
     t0, tf
         Time horizon endpoints.
     N
-        Number of piecewise-constant control steps. The control grid has
-        ``N+1`` time points ``t0, t0 + dt_ctl, ..., tf`` where
-        ``dt_ctl = (tf - t0) / N``.
+        Number of piecewise-constant control steps; the control grid is
+        ``t0, t0 + dt_ctl, ..., tf`` with ``dt_ctl = (tf - t0) / N``.
     DDP
-        If True, include second-order ``s' @ fxx``-type terms in the Q-function
-        (differential dynamic programming). If False, use iLQR (Gauss-Newton).
+        If True, include second-order ``s' @ fxx`` terms (DDP); else iLQR.
     solver
-        Integration scheme for both sweeps. Only ``"euler"`` is supported: the
-        fixed-step Euler scan with ``dt = dt_ctl`` is what gives notebook-parity
-        runtime, and a fixed step is required to fuse the backward costate +
-        gain pass into a single scan.
+        Only ``"euler"`` is supported; the fused fixed-step scan requires it.
     dt
-        Nominal step size. The scan always uses the control-grid spacing
-        ``dt_ctl = (tf - t0) / N``; ``dt`` is retained for API compatibility.
+        Retained for API compatibility; the scan uses ``dt_ctl``.
     """
 
     def __init__(
@@ -105,7 +122,6 @@ class ReachiLQR:
         pt0: Parametope,
         terminal_cost: Callable[[Parametope], Float],
         running_cost: Callable[[Float, Parametope, Array], Float],
-        control_shape: tuple,
         t0: Float,
         tf: Float,
         N: int,
@@ -124,8 +140,10 @@ class ReachiLQR:
         self.embedding = embedding
         self.terminal_cost = terminal_cost
         self.running_cost = running_cost
-        self.control_shape = tuple(int(s) for s in control_shape)
-        self.Ulen = int(jnp.prod(jnp.array(self.control_shape)))
+        self.hypercontrol_shape = tuple(
+            int(s) for s in embedding.hypercontrol_shape(pt0)
+        )
+        self.Ulen = int(jnp.prod(jnp.array(self.hypercontrol_shape)))
         self.t0 = float(t0)
         self.tf = float(tf)
         self.N = int(N)
@@ -135,17 +153,15 @@ class ReachiLQR:
         self.track_iover = bool(track_iover)
         self.f_kwargs = f_kwargs
 
-        # Eagerly set up the embedding's per-pt0 state (e.g. NormotopeEmbedding caches NT, gsc).
         self.aux0 = self.embedding._initialize(pt0)
         x0_flat, self._unflatten = ravel_pytree((pt0, self.aux0))
         self.Xlen = int(x0_flat.size)
         self.x0_flat = x0_flat
         self.pt0 = pt0
-        # State dimension n (for the per-timestep iover boxes). Requires the
-        # parametope to support ``iover()`` — only needed when tracking is on.
+        # State dimension for the per-timestep iover boxes; only needed when tracking.
         self.n = int(pt0.iover().shape[0]) if self.track_iover else 0
-        # Cached flatten that just concatenates leaves (no unflatten closure rebuild).
-        # The output structure of `_dynamics` matches (pt, aux), so this is always valid.
+        # _dynamics output matches the (pt, aux) structure, so a flat concatenate
+        # of leaves is always a valid inverse of _unflatten.
         self._flatten = lambda pt_aux: jnp.concatenate(
             [jnp.ravel(leaf) for leaf in jax.tree_util.tree_leaves(pt_aux)]
         )
@@ -153,7 +169,6 @@ class ReachiLQR:
         self.ts_grid = jnp.linspace(self.t0, self.tf, self.N + 1)
         self.dt_ctl = (self.tf - self.t0) / self.N
 
-        # Compile the inner workhorse once.
         self._iterate_jit = jax.jit(self._iterate_impl)
 
     # ---------------------------------------------------------------- internals
@@ -165,28 +180,20 @@ class ReachiLQR:
         return jnp.concatenate([x_pert, x_nom])
 
     def _f_flat(self, t: Float, x_flat: Array, U_flat: Array, ix=None) -> Array:
-        """Flat-vector wrapper around ``embedding._dynamics``.
-
-        If ``ix`` (an :class:`~immrax.inclusion.Interval`) is supplied, it is
-        passed to ``_dynamics`` as the box over which the mixed Jacobian is
-        evaluated, in place of the parametope's own ``iover()``. ReachiLQR uses
-        this to feed the running cross-iteration intersection box (a tighter, but
-        still valid, enclosure of the reachable set) and shave conservatism off
-        the contraction rate.
-        """
+        """Flat-vector wrapper around ``embedding._dynamics``. ``ix``, if given,
+        is the box for the mixed-Jacobian evaluation (the running intersection)."""
         pt, aux = self._unflatten(x_flat)
-        U = U_flat.reshape(self.control_shape)
+        U = U_flat.reshape(self.hypercontrol_shape)
         kw = dict(self.f_kwargs)
         if ix is not None:
             kw["ix"] = ix
         dpt_daux = self.embedding._dynamics(t, (pt, aux), U, **kw)
         return self._flatten(dpt_daux)
 
-    def _iover_lu(self, x_flat: Array) -> tuple[Array, Array]:
-        """``(lower, upper)`` of the parametope's interval hull from a flat state."""
+    def _iover_box(self, x_flat: Array) -> Interval:
+        """The parametope's interval hull from a flat state."""
         pt, _ = self._unflatten(x_flat)
-        ix = pt.iover()
-        return ix.lower, ix.upper
+        return pt.iover()
 
     def _terminal_flat(self, x_flat: Array) -> Float:
         pt, _ = self._unflatten(x_flat)
@@ -196,7 +203,7 @@ class ReachiLQR:
         self, t: Float, x_flat: Array, U_flat: Array
     ) -> Float:
         pt, _ = self._unflatten(x_flat)
-        return self.running_cost(t, pt, U_flat.reshape(self.control_shape))
+        return self.running_cost(t, pt, U_flat.reshape(self.hypercontrol_shape))
 
     # ----------------------------------------------------- forward + backward
 
@@ -208,8 +215,7 @@ class ReachiLQR:
         R: Float,
         gamma: Float,
         Jmax: Float,
-        iover_lower_in: Array,
-        iover_upper_in: Array,
+        iover_in: Interval,
     ) -> IterateResult:
         Xlen = self.Xlen
         Ulen = self.Ulen
@@ -228,20 +234,16 @@ class ReachiLQR:
                 & jnp.all(jnp.isfinite(y_flat))
             )
 
-        # ---- forward sweep: fixed-step Euler scan (freezes derivative on bad cost) ----
-        # Euler with dt == dt_ctl saves exactly one state per control-grid point.
+        # ---- forward sweep: fixed-step Euler scan, dt == dt_ctl ----
         def forward_step(y_flat, k):
             t = self.ts_grid[k]
-            idx = jnp.minimum(k, N - 1)  # control-grid index at ts_grid[k]
+            idx = jnp.minimum(k, N - 1)
             x_pert, x_nom = self._split(y_flat)
             U_nom = Us[idx].reshape(-1)
             U_pert = U_nom - gamma * l_traj[idx] - K_traj[idx] @ (x_pert - x_nom)
-            # Optional: feed the running cross-iteration intersection box at this
-            # grid point to the mixed-Jacobian evaluation (tighter contraction).
-            ix_k = interval(iover_lower_in[k], iover_upper_in[k]) if track else None
-            # lax.cond (not where) so the two dynamics evals are SKIPPED once the
-            # set blows up — most steps are dead on early iterations, and this is
-            # what gives notebook-parity runtime.
+            ix_k = iover_in[k] if track else None
+            # lax.cond (not where) skips both dynamics evals once the set blows up;
+            # most steps are dead on early iterations, which is the runtime win.
             deriv = jax.lax.cond(
                 alive_fn(y_flat),
                 lambda: self._join(
@@ -259,65 +261,58 @@ class ReachiLQR:
         pert_traj = sol_ys[:, :Xlen]
         state_traj = sol_ys[:, Xlen:]  # nominal
 
-        # ifinal = last grid index where the perturbed cost is within Jmax and
-        # the state is finite (cumulative-and: once dead, stays dead).
+        # ifinal = last grid index still alive (once dead, stays dead).
         alive_grid = jax.vmap(alive_fn)(sol_ys)
         alive_cum = jnp.cumprod(alive_grid.astype(jnp.int32))
         ifinal = jnp.maximum(jnp.sum(alive_cum) - 1, 0)
 
-        # Per-step perturbed control. Pad with nominal Us[i] past ifinal to keep
-        # Us_new finite (matters because Us_new becomes next iter's input).
+        # Perturbed control per step, padded with nominal Us[i] past ifinal so
+        # Us_new (next iter's input) stays finite.
         def per_step_U(i):
             U_nom = Us[i].reshape(-1)
             U_pert = U_nom - gamma * l_traj[i] - K_traj[i] @ (pert_traj[i] - state_traj[i])
-            return jnp.where(i < ifinal, U_pert.reshape(self.control_shape), Us[i])
+            return jnp.where(i < ifinal, U_pert.reshape(self.hypercontrol_shape), Us[i])
 
         Us_new = jax.vmap(per_step_U)(jnp.arange(N))
 
         # ---- update the running per-timestep intersection box ----
-        # Each grid point's perturbed normotope is a valid enclosure of the true
-        # reachable set R(t_k), so intersecting its interval hull into the box
-        # keeps a valid (and tighter) enclosure. Only update where the step is
-        # alive (k <= ifinal); past ifinal the set has blown up and the frozen
-        # state is not a valid enclosure. The box accumulates monotonically and
-        # is fed back into the next iteration's mixed-Jacobian evaluation.
+        # Each alive grid point's perturbed set is a valid enclosure of R(t_k),
+        # so intersecting its hull keeps a valid (tighter) box. Skip steps past
+        # ifinal (blown up). The box only shrinks and feeds the next iteration.
         if track:
-            lo_new, up_new = jax.vmap(self._iover_lu)(pert_traj)  # (N+1, n) each
-            box_lo = jnp.maximum(iover_lower_in, lo_new)
-            box_up = jnp.minimum(iover_upper_in, up_new)
+            new_box = jax.vmap(self._iover_box)(pert_traj)  # Interval (N+1, n)
+            box_lo = jnp.maximum(iover_in.lower, new_box.lower)
+            box_up = jnp.minimum(iover_in.upper, new_box.upper)
             alive_k = (jnp.arange(N + 1) <= ifinal)[:, None]
-            iover_lower_out = jnp.where(alive_k, box_lo, iover_lower_in)
-            iover_upper_out = jnp.where(alive_k, box_up, iover_upper_in)
+            iover_out = interval(
+                jnp.where(alive_k, box_lo, iover_in.lower),
+                jnp.where(alive_k, box_up, iover_in.upper),
+            )
         else:
-            iover_lower_out = iover_lower_in
-            iover_upper_out = iover_upper_in
+            iover_out = iover_in
 
-        # ---- backward sweep: single fused Euler scan over the costate (sig, s, S),
-        # emitting per-step gains (l_i, K_i) in the same pass. The Jacobians fx, fu
-        # are therefore evaluated once per step, not twice. Linearization is at the
-        # perturbed trajectory under the nominal control (matches the notebook).
+        # ---- backward sweep: fused Euler scan over the costate (sig, s, S),
+        # emitting per-step gains (l_i, K_i) in the same pass. Linearization is at
+        # the perturbed trajectory under the nominal control.
         x_final = pert_traj[ifinal]
         sig_T = self._terminal_flat(x_final)
         s_T = jax.grad(self._terminal_flat)(x_final)
         S_T = jax.hessian(self._terminal_flat)(x_final)
 
         def backward_step(carry, U_p):
-            sig, s, S, i = carry  # i = state index of this step (control index + 1)
+            sig, s, S, i = carry  # i = state index of this step
             ii = jnp.clip(i, 0, N)
             mask = i < ifinal
             t = self.ts_grid[ii]
             x_flat = pert_traj[ii]
             U_flat = U_p.reshape(-1)
 
-            # The backward gain computation linearizes against the plain
-            # per-iteration dynamics (no intersection box): the box tightens the
-            # forward contraction rate, but the gains must be consistent with the
-            # dynamics the rollout actually follows.
+            # No intersection box here: the gains must match the dynamics the
+            # rollout actually follows, not the tightened forward contraction.
             f_flat_bwd = lambda t_, x_, u_: self._f_flat(t_, x_, u_)
 
-            # lax.cond (not where) so the expensive fx/fu Jacobians are SKIPPED on
-            # masked steps (everything past ifinal). On early iterations most of
-            # the horizon is masked; this is the dominant runtime saving.
+            # lax.cond skips the expensive fx/fu Jacobians on masked steps (past
+            # ifinal); most of the horizon is masked early on.
             def real_branch():
                 fx = jax.jacfwd(f_flat_bwd, 1)(t, x_flat, U_flat).T
                 fu = jax.jacfwd(f_flat_bwd, 2)(t, x_flat, U_flat).T
@@ -367,8 +362,6 @@ class ReachiLQR:
             backward_step, (sig_T, s_T, S_T, N), Us, length=N, reverse=True
         )
 
-        # Cost reported on the perturbed trajectory at ifinal (the trajectory that
-        # becomes the next iteration's nominal). Matches the notebook's reporting.
         cost_final = self._terminal_flat(pert_traj[ifinal])
 
         return IterateResult(
@@ -380,8 +373,7 @@ class ReachiLQR:
             ifinal=ifinal,
             Us_new=Us_new,
             cost_final=cost_final,
-            iover_lower=iover_lower_out,
-            iover_upper=iover_upper_out,
+            iover=iover_out,
         )
 
     # --------------------------------------------------------- public surface
@@ -393,19 +385,32 @@ class ReachiLQR:
         return l_traj, K_traj
 
     def initial_controls(self) -> Array:
-        """Convenience: zero ``Us`` of shape ``(N, *control_shape)``."""
-        return jnp.zeros((self.N, *self.control_shape))
+        """Convenience: zero ``Us`` of shape ``(N, *hypercontrol_shape)``."""
+        return jnp.zeros((self.N, *self.hypercontrol_shape))
 
-    def initial_iover(self) -> tuple[Array, Array]:
-        """Convenience: the unbounded ``(lower, upper)`` per-timestep box.
+    def initial_iover(self) -> Interval:
+        """The unbounded per-timestep box ``[-inf, +inf]`` (an Interval of shape
+        ``(N+1, n)``), so the first iteration's intersection is just its own
+        ``iover()``."""
+        # Pin the dtype: a Python-scalar fill (``jnp.full(..., -jnp.inf)``) yields
+        # a weak_type array, whereas the box returned by ``iterate`` is strong;
+        # the mismatch would force a recompile on the first fed-back iteration.
+        dtype = self.x0_flat.dtype
+        return interval(
+            jnp.full((self.N + 1, self.n), -jnp.inf, dtype=dtype),
+            jnp.full((self.N + 1, self.n), jnp.inf, dtype=dtype),
+        )
 
-        Initialized to ``[-inf, +inf]`` so the first iteration's intersection is
-        just that iteration's own ``iover()``. Shapes are ``(N+1, n)``; when
-        ``track_iover`` is off, ``n == 0`` and these are inert placeholders.
+    def setup(self) -> "ReachiLQR":
+        """Warm up the JIT: run one ``iterate`` and block until it finishes, so
+        the one-time compile cost is paid here and excluded from any subsequently
+        timed run. The runtime values of ``R``/``gamma``/``Jmax`` do not affect
+        the compiled program, so placeholders are used; the only effect is
+        populating the jit cache. Returns ``self`` for chaining.
         """
-        lo = jnp.full((self.N + 1, self.n), -jnp.inf)
-        up = jnp.full((self.N + 1, self.n), jnp.inf)
-        return lo, up
+        res = self.iterate(self.initial_controls(), *self.initial_gains(), 1.0)
+        jax.block_until_ready(res)
+        return self
 
     def iterate(
         self,
@@ -416,18 +421,17 @@ class ReachiLQR:
         *,
         gamma: Float = 1.0,
         Jmax: Float = jnp.inf,
-        iover_lower: Array | None = None,
-        iover_upper: Array | None = None,
+        iover: Interval | None = None,
     ) -> IterateResult:
         """Run one outer iLQR/DDP iteration.
 
-        When ``track_iover`` is enabled, pass the previous iteration's
-        ``iover_lower``/``iover_upper`` (from the returned :class:`IterateResult`)
-        to accumulate the running cross-iteration intersection box; if omitted,
-        the box is (re)initialized to ``[-inf, +inf]``.
+        When ``track_iover`` is enabled, pass the previous iteration's ``iover``
+        (from the returned :class:`IterateResult`) to accumulate the running
+        cross-iteration intersection box; if omitted, the box is (re)initialized
+        to ``[-inf, +inf]``.
         """
-        if iover_lower is None or iover_upper is None:
-            iover_lower, iover_upper = self.initial_iover()
+        if iover is None:
+            iover = self.initial_iover()
         return self._iterate_jit(
             Us,
             l_traj,
@@ -435,76 +439,78 @@ class ReachiLQR:
             jnp.asarray(R),
             jnp.asarray(gamma),
             jnp.asarray(Jmax),
-            iover_lower,
-            iover_upper,
+            iover,
         )
 
     def run(
         self,
         Us0: Array | None = None,
         *,
-        R_schedule: Sequence[Float] = (1.0,),
-        iters_per_R: int = 100,
+        R_schedule: Callable[[int], tuple] | Float,
+        iters: int | None = None,
         gamma: Float = 1.0,
         Jmax: Float = jnp.inf,
+        on_iterate: Callable[[int, Float, IterateResult], None] | None = None,
         verbose: bool = False,
     ) -> RunResult:
-        """Outer R-schedule loop with best-tracking and revert-on-regression.
+        """Outer R-schedule loop with best-tracking.
 
-        Mirrors the notebook's outer loop: for each ``R`` in ``R_schedule``, run
-        ``iters_per_R`` ``iterate`` calls, lexicographically maximizing
-        ``(ifinal, -cost)``, and reverting the working ``Us`` to the best seen so
-        far whenever it gets worse.
+        ``R_schedule`` is a callable ``i -> (R, revert_best)`` (e.g. from
+        :func:`phased_schedule`); a scalar is wrapped via
+        :func:`constant_schedule`. ``revert_best`` resets the working ``Us`` to
+        the best-seen-so-far after that iteration (used at phase boundaries).
+        ``iters`` defaults to the schedule's ``.total`` when present.
+        ``on_iterate(i, R, result)``, if given, is called each iteration with the
+        raw :class:`IterateResult` (e.g. to record trajectories for plotting).
         """
+        schedule = (
+            R_schedule if callable(R_schedule) else constant_schedule(R_schedule)
+        )
+        if iters is None:
+            iters = getattr(schedule, "total", None)
+        if iters is None:
+            raise ValueError(
+                "run() needs `iters` (or an R_schedule with a `.total`, e.g. from "
+                "phased_schedule)."
+            )
+        iters = int(iters)
+
         Us = self.initial_controls() if Us0 is None else Us0
         l_traj, K_traj = self.initial_gains()
-        # The intersection box accumulates across ALL iterations (and across
-        # R-segments) and is never reverted: every iterate contributes a valid
-        # enclosure regardless of whether its cost regressed.
-        iover_lower, iover_upper = self.initial_iover()
+        # The intersection box accumulates across all iterations and is never
+        # reverted: every iterate contributes a valid enclosure.
+        iover = self.initial_iover()
 
-        best = None
+        best_res = None
+        best_Us = None
         history: list = []
 
-        for R in R_schedule:
+        for i in range(iters):
+            R, revert_best = schedule(i)
             R = float(R)
-            for k in range(iters_per_R):
-                res = self.iterate(
-                    Us,
-                    l_traj,
-                    K_traj,
-                    R,
-                    gamma=gamma,
-                    Jmax=Jmax,
-                    iover_lower=iover_lower,
-                    iover_upper=iover_upper,
-                )
-                iover_lower = res.iover_lower
-                iover_upper = res.iover_upper
-                ifinal = int(res.ifinal)
-                cost = float(res.cost_final)
-                history.append({"R": R, "iter": k, "ifinal": ifinal, "cost": cost})
-                if verbose:
-                    print(
-                        f"R={R:>8.3g}  it={k:>4d}  ifinal={ifinal:>5d}  cost={cost: .4f}"
-                    )
+            res = self.iterate(
+                Us, l_traj, K_traj, R, gamma=gamma, Jmax=Jmax, iover=iover
+            )
+            iover = res.iover
+            ifinal = int(res.ifinal)
+            cost = float(res.cost_final)
+            history.append({"iter": i, "R": R, "ifinal": ifinal, "cost": cost})
 
-                if best is None or (ifinal, -cost) > (
-                    int(best.best.ifinal),
-                    -float(best.best.cost_final),
-                ):
-                    best = RunResult(best=res, Us=res.Us_new, history=[])
+            if best_res is None or (ifinal, -cost) > (
+                int(best_res.ifinal),
+                -float(best_res.cost_final),
+            ):
+                best_res, best_Us = res, res.Us_new
 
-                Us = res.Us_new
-                l_traj = res.l_traj
-                K_traj = res.K_traj
+            if on_iterate is not None:
+                on_iterate(i, R, res)
+            if verbose:
+                print(f"i={i:>5d}  R={R:>8.3g}  ifinal={ifinal:>5d}  cost={cost: .4f}")
 
-            if verbose and best is not None:
-                print(
-                    f"  reverting to best  ifinal={int(best.best.ifinal)}  cost={float(best.best.cost_final): .4f}"
-                )
-            if best is not None:
-                Us = best.Us
+            # Advance Us, reverting to the best-seen at a phase boundary.
+            Us = best_Us if revert_best else res.Us_new
+            l_traj = res.l_traj
+            K_traj = res.K_traj
 
-        assert best is not None
-        return RunResult(best=best.best, Us=best.Us, history=history)
+        assert best_res is not None
+        return RunResult(best=best_res, Us=best_Us, history=history, iover=iover)

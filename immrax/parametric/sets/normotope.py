@@ -36,7 +36,6 @@ class Normotope(Parametope):
         self, ox: ArrayLike, alpha: ArrayLike, y: Float, alpha_inv: Array | None = None
     ):
         super().__init__(ox, alpha, y)
-        # self.alpha_inv = alpha_inv if alpha_inv is not None else jnp.linalg.inv(alpha)
         self._alpha_inv = alpha_inv
 
     def g(self, x: Array) -> Float:
@@ -96,10 +95,6 @@ class Normotope(Parametope):
     def from_parametope(cls, pt: Parametope) -> "Normotope":
         return Normotope(pt.ox, pt.alpha, pt.y)
 
-    # def __getitem__ (self, item):
-    #     """Allows indexing into the normotope's parameters."""
-    #     return self.__class__.from_parametope (Parametope(self.ox[item], self.alpha[item], self.y[item]))
-
     def vec(self) -> Array:
         """Vectorizes the normotope into a one dimensional array."""
         return jnp.concatenate(
@@ -121,10 +116,6 @@ class Normotope(Parametope):
         alpha = vec[n:N].reshape(-1, n)
         return cls(ox, alpha, y)
 
-    # def sample_boundary (self, key:jax.random.PRNGKey, num_samples:int) -> Array:
-    #     """Samples points uniformly from the boundary of the normotope."""
-    #     raise NotImplementedError("Subclasses must implement the sample_boundary method.")
-
 
 class NormotopeEmbedding(ParametricEmbedding):
     r"""Embedding of a :class:`~immrax.system.System` onto :class:`Normotope`
@@ -135,26 +126,18 @@ class NormotopeEmbedding(ParametricEmbedding):
     sys : System
         The system to embed.
     gsc : Callable[[Interval], list], optional
-        The corner-selection strategy: a function mapping the interval Jacobian
-        :math:`[M]` to the list of corner matrices used in the
-        logarithmic-norm contraction bound. Defaults to
-        ``partial(get_rohn_corners, sign='+')``, which is exact for the
-        :class:`L2Normotope` case. Other choices include :func:`get_corners`
-        (all :math:`2^{n^2}` corners) or a presized :func:`get_sparse_corners`
-        instance. This is a static, construction-time selection — it is *not*
-        inferred from the initial set.
+        Corner-selection strategy mapping the interval Jacobian :math:`[M]` to
+        the corner matrices used in the log-norm contraction bound. Defaults to
+        ``partial(get_rohn_corners, sign='+')`` (exact for :class:`L2Normotope`);
+        other choices include :func:`get_corners` or a :func:`get_sparse_corners`
+        instance. Static and construction-time, not inferred from the set.
     kappa : float, optional
-        Strength of the soft ``y``-clamp toward the tightened box. When an
-        external box ``ix`` is supplied to :meth:`_dynamics`, a term
-        ``-kappa * relu(y - y_box)`` is added to ``y``'s dynamics, where
-        ``y_box = max_i ||alpha (x_i - ox)||`` over the corners ``x_i`` of the
-        tightened box. This pulls ``y`` down toward the smallest radius that
-        still encloses the (already-valid) box, without losing the enclosure:
-        the term is active only where ``y > y_box``, i.e. where the static
-        certificate ``{||alpha(x-ox)|| <= y_box} ⊇ box ⊇ R`` already holds with
-        slack, so the value of ``y``'s derivative there is free to choose.
-        Defaults to ``0.0`` (no clamp; behaviour identical to the plain
-        intersection). Has no effect when ``ix`` is ``None``.
+        Strength of the soft ``y``-clamp toward an external box ``ix``. When
+        ``ix`` is supplied to :meth:`_dynamics`, ``-kappa * relu(y - y_box)`` is
+        added to ``y``'s dynamics with ``y_box = max_i ||alpha (x_i - ox)||`` over
+        the corners of ``ix``. Active only where ``y > y_box`` — where the static
+        enclosure already holds with slack — so the certificate is preserved.
+        Defaults to ``0.0`` (no clamp); ignored when ``ix`` is ``None``.
     """
 
     gsc: Callable = eqx.field(
@@ -165,26 +148,23 @@ class NormotopeEmbedding(ParametricEmbedding):
     def _initialize(self, nt0: Normotope) -> ArrayLike:
         if not isinstance(nt0, Normotope):
             raise ValueError(f"{nt0=} is not a Normotope needed for NormotopeEmbedding")
-        # No auxiliary state is evolved for normotopes; the adjoint setup and the
-        # inverse of alpha are recomputed per step inside ``_dynamics``.
+        # No auxiliary state to evolve; everything is recomputed in _dynamics.
         return None
 
-    # @partial(jax.jit, static_argnums=(0,), static_argnames=("perm", "adjoint"))
+    def hypercontrol_shape(self, nt0: Normotope) -> tuple:
+        # The control is added to H_dot (the shaping-matrix derivative).
+        return nt0.alpha.shape
+
     def _dynamics(self, t, state, U=None, *, perm=None, adjoint=True, ix=None):
         r"""Normotope embedding dynamics.
 
         Parameters
         ----------
         ix : Interval, optional
-            A box over which to evaluate the mixed Jacobian, used *in addition
-            to* (intersected with) the normotope's own ``iover()``. The
-            contraction-rate bound is computed over the tighter
-            ``ix & nt.iover()``. Since both ``ix`` and ``nt.iover()`` are valid
-            interval enclosures of the reachable set, their intersection is too,
-            so passing a tighter ``ix`` only reduces conservatism. When ``None``
-            (the default) the behaviour is exactly ``nt.iover()``. When supplied
-            and ``kappa > 0``, a soft clamp pulls ``y`` toward the tightened box
-            (see ``kappa``).
+            A box intersected with the normotope's own ``iover()`` for the
+            mixed-Jacobian evaluation; tighter ``ix`` only reduces conservatism.
+            Defaults to ``None`` (plain ``nt.iover()``). With ``kappa > 0`` it
+            also enables the soft ``y``-clamp (see ``kappa``).
         """
         nt, aux = state
         Ut = U.reshape(nt.alpha.shape) if U is not None else jnp.zeros_like(nt.alpha)
@@ -193,9 +173,8 @@ class NormotopeEmbedding(ParametricEmbedding):
         Hp = nt.alpha_inv
         y = nt.y
 
-        # Derive the Jacobian transforms from ``self.sys.f`` at call time (rather
-        # than freezing closures in ``__init__``) so that ``vmap``/``jit`` over
-        # the embedding's system parameters thread through correctly.
+        # Derived at call time (not frozen in __init__) so vmap/jit over the
+        # system's parameters thread through.
         A = jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
 
         if adjoint:
@@ -203,10 +182,8 @@ class NormotopeEmbedding(ParametricEmbedding):
         else:
             H_dot = Ut
 
-        # Evaluate the mixed Jacobian over the tightest available valid enclosure
-        # of the reachable set: the normotope's own interval hull, optionally
-        # intersected with an externally supplied box ``ix`` (e.g. the running
-        # cross-iteration intersection tracked by ReachiLQR).
+        # Mixed Jacobian over the tightest valid enclosure: the normotope's own
+        # hull, optionally intersected with an external box ix.
         box = nt.iover() if ix is None else (ix & nt.iover())
 
         MM = mjacM(self.sys.f)(
@@ -218,16 +195,11 @@ class NormotopeEmbedding(ParametricEmbedding):
         c = jnp.max(jnp.asarray(mus))
         y_dot = c * y
 
-        # Soft clamp of y toward the tightened box. y_box = max_i ||H(x_i - ox)||
-        # over the corners x_i of `box`; since `box` (hence its corners) is frozen
-        # certificate data, gradients flow only through (H, ox). The pull is active
-        # only where y > y_box -- exactly where the static enclosure
-        # {||H(x-ox)|| <= y_box} ⊇ box ⊇ R already holds, so subtracting from y_dot
-        # there does not break the certificate.
+        # Soft clamp of y toward the tightened box (see kappa). The box corners
+        # are frozen certificate data, so gradients flow only through (H, ox), and
+        # the pull is active only where the static enclosure already holds.
         if ix is not None and self.kappa != 0.0:
-            corners = get_corners(box)  # (2^n, n)
-            # y_box = max_i ||H (x_i - ox)|| using the normotope's own norm
-            # (nt.g(x) = norm(alpha @ (x - ox))), so this is correct for L1/L2/Linf.
+            corners = get_corners(box)
             y_box = jnp.max(jax.vmap(nt.g)(corners))
             y_dot = y_dot - self.kappa * jnp.maximum(y - y_box, 0.0)
 
@@ -316,9 +288,7 @@ class L1Normotope(Normotope):
         return icentpert(jnp.zeros(n), jnp.ones(n))
 
     def to_polytope(self) -> Polytope:
-        # n = self.alpha.shape[0]
-        # return Polytope (self.ox, self.alpha, jnp.ones(2*n)*self.y)
-        # S is the matrix whose rows are all sign combinations of length n
+        # S has rows for all sign combinations of length n
         n = self.alpha.shape[0]
         S = jnp.array(list(product(*[[1, -1]] * n)))
         return Polytope(self.ox, S @ self.alpha, jnp.ones(2 * 2**n) * self.y)
@@ -359,9 +329,6 @@ class L2Normotope(Normotope):
 
     def iover(self) -> Interval:
         """Tightest interval overapproximation of an L2 normotope."""
-        n = self.alpha.shape[0]
-        # Pinv = jnp.linalg.inv(self.alpha.T@self.alpha/self.y**2)
-        # Pinv = self.alpha.T @ self.alpha
         Pinv = self.alpha_inv @ self.alpha_inv.T * self.y**2
         return icentpert(self.ox, jnp.sqrt(jnp.diag(Pinv)))
 
@@ -375,14 +342,9 @@ class L2Normotope(Normotope):
         r"""Computes the :math:`\ell_2` logarithmic norm of A"""
         return jnp.max(jnp.linalg.eigvalsh((A + A.T) / 2))
 
-    # def to_polytope (self) -> Polytope :
-    #     n = self.alpha.shape[0]
-    #     return Polytope (self.ox, self.alpha, jnp.ones(2*n)*self.y)
-
     def plot_projection(
         self, ax: "Axes", xi: int = 0, yi: int = 1, rescale: bool = False, **kwargs
     ) -> None:
-        # self.to_polytope().plot_projection(ax, xi, yi, rescale, **kwargs)
         Ellipsoid(self.ox, self.alpha / self.y, jnp.array([0.0, 1.0])).plot_projection(
             ax, xi, yi, rescale, **kwargs
         )
@@ -391,7 +353,6 @@ class L2Normotope(Normotope):
     def from_interval(cls, *args) -> "L2Normotope":
         cent, pert = i2centpert(interval(*args))
         rn = jnp.sqrt(len(cent))
-        # rn = 1.
         return L2Normotope(cent, jnp.diag(1 / (rn * pert)), 1.0)
 
     @classmethod

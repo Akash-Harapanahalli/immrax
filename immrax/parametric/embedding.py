@@ -49,15 +49,22 @@ class ParametricEmbedding(LegacyAttrModule):
 
     @abstractmethod
     def _dynamics(self, t, state, *args):
-        """Embedding dynamics
+        """Embedding right-hand side: the dynamics of ``(parametope, aux)``."""
 
-        Parameters
-        ----------
-        t : _type_
-            _description_
-        state : _type_
-            _description_
+    def hypercontrol_shape(self, pt0: Parametope) -> tuple:
+        """Shape of the control input :meth:`_dynamics` accepts for ``pt0``.
+
+        The control enters :meth:`_dynamics` in an embedding-specific shape that
+        is not otherwise discoverable from the generic ``_dynamics(t, state,
+        *args)`` signature. Consumers such as :class:`ReachiLQR` use this to size
+        their gains and to reshape their internal flat control vector back to what
+        ``_dynamics`` expects. Subclasses that support a control override this;
+        the default signals that the embedding exposes no control.
         """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not define hypercontrol_shape; it "
+            "exposes no control input for synthesis."
+        )
 
     @eqx.filter_jit
     def compute_reachset(
@@ -73,7 +80,6 @@ class ParametricEmbedding(LegacyAttrModule):
         **kwargs,
     ):
         def func(t, x, args):
-            # Unpack the inputs
             return self._dynamics(t, x, *[u(t, x) for u in inputs], **f_kwargs)
 
         term = ODETerm(func)
@@ -94,7 +100,6 @@ class ParametricEmbedding(LegacyAttrModule):
         return diffeqsolve(
             term, solver, t0, tf, dt, (pt0, aux0), saveat=saveat, **kwargs
         )
-        # return func(t0, (pt0, aux0), None)
 
 
 class ParametopeEmbedding(ParametricEmbedding):

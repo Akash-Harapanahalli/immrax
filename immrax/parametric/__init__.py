@@ -30,7 +30,13 @@ from .sets.normotope import (
     NormotopeEmbedding,
 )
 
-from .reach_ilqr import ReachiLQR, IterateResult, RunResult
+from .reach_ilqr import (
+    ReachiLQR,
+    IterateResult,
+    RunResult,
+    constant_schedule,
+    phased_schedule,
+)
 
 __all__ = [
     "Parametope",
@@ -51,4 +57,6 @@ __all__ = [
     "ReachiLQR",
     "IterateResult",
     "RunResult",
+    "constant_schedule",
+    "phased_schedule",
 ]
