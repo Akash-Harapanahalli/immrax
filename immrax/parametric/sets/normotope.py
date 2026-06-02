@@ -13,7 +13,7 @@ from ..parametope import Parametope
 from ..embedding import ParametricEmbedding
 from .polytope import Polytope
 from .ellipsoid import Ellipsoid
-from ...utils import get_rohn_corners, get_corners
+from ...utils import get_rohn_corners, get_corners, get_sparse_corners
 
 from functools import partial
 from math import sqrt
@@ -126,11 +126,11 @@ class NormotopeEmbedding(ParametricEmbedding):
     sys : System
         The system to embed.
     gsc : Callable[[Interval], list], optional
-        Corner-selection strategy mapping the interval Jacobian :math:`[M]` to
-        the corner matrices used in the log-norm contraction bound. Defaults to
-        ``partial(get_rohn_corners, sign='+')`` (exact for :class:`L2Normotope`);
-        other choices include :func:`get_corners` or a :func:`get_sparse_corners`
-        instance. Static and construction-time, not inferred from the set.
+        Corner-selection strategy for the log-norm contraction bound. If ``None``
+        (default), resolved in :meth:`_initialize`: ``get_rohn_corners`` for an
+        :class:`L2Normotope` (exact), else :func:`get_sparse_corners`. Pass a
+        callable to override (e.g. :func:`get_corners`, since the sparse pattern
+        can't be built under ``jit``).
     kappa : float, optional
         Strength of the soft ``y``-clamp toward an external box ``ix``. When
         ``ix`` is supplied to :meth:`_dynamics`, ``-kappa * relu(y - y_box)`` is
@@ -140,22 +140,29 @@ class NormotopeEmbedding(ParametricEmbedding):
         Defaults to ``0.0`` (no clamp); ignored when ``ix`` is ``None``.
     """
 
-    gsc: Callable = eqx.field(
-        static=True, default=partial(get_rohn_corners, sign="+")
-    )
+    gsc: Callable = eqx.field(static=True, default=None)
     kappa: float = eqx.field(static=True, default=0.0)
 
     def _initialize(self, nt0: Normotope) -> ArrayLike:
         if not isinstance(nt0, Normotope):
             raise ValueError(f"{nt0=} is not a Normotope needed for NormotopeEmbedding")
-        # No auxiliary state to evolve; everything is recomputed in _dynamics.
+        # Resolve gsc once (rohn for L2, sparse otherwise); object.__setattr__
+        # because the static field is otherwise frozen. No aux state to evolve.
+        if self.gsc is None:
+            if isinstance(nt0, L2Normotope):
+                gsc = partial(get_rohn_corners, sign="+")
+            else:
+                ix0 = nt0.iover()
+                M = mjacM(self.sys.f)(0.0, ix0, center=(jnp.zeros(1), nt0.ox))[1]
+                gsc = get_sparse_corners(interval(M))
+            object.__setattr__(self, "gsc", gsc)
         return None
 
     def hypercontrol_shape(self, nt0: Normotope) -> tuple:
         # The control is added to H_dot (the shaping-matrix derivative).
         return nt0.alpha.shape
 
-    def _dynamics(self, t, state, U=None, *, perm=None, adjoint=True, ix=None):
+    def _dynamics(self, t, state, *args, U=None, perm=None, adjoint=True, ix=None):
         r"""Normotope embedding dynamics.
 
         Parameters

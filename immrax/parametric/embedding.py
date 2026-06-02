@@ -66,6 +66,17 @@ class ParametricEmbedding(LegacyAttrModule):
             "exposes no control input for synthesis."
         )
 
+    def iover(self, state):
+        """Interval overapproximation of the set for embedding state ``(pt, aux)``.
+
+        The default delegates to the parametope's own ``iover()``. Embeddings
+        whose enclosure needs auxiliary state (e.g. a maintained inverse ``H+``)
+        override this. Consumers such as :class:`ReachiLQR` call it as
+        ``embedding.iover((pt, aux))``.
+        """
+        pt, _aux = state
+        return pt.iover()
+
     @eqx.filter_jit
     def compute_reachset(
         self,

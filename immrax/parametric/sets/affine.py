@@ -110,7 +110,17 @@ class AdjointEmbedding(ParametricEmbedding):
         # return (alpha_p, N)
         return (self.alpha_p0, self.N0)
 
-    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, **kwargs):
+    def hypercontrol_shape(self, pt0: hParametope) -> tuple:
+        # The hypercontrol is added to the H (alpha) dynamics.
+        return pt0.alpha.shape
+
+    def iover(self, state):
+        pt, aux = state
+        alpha_p, N = aux
+        iz = _refine_N(pt.hinv(pt.y), N)
+        return interval(alpha_p) @ iz + pt.ox
+
+    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, U=None, **kwargs):
         pt, aux = state
         ox = pt.ox
 
@@ -182,6 +192,12 @@ class AdjointEmbedding(ParametricEmbedding):
 
             ustar = -self.kap * jax.grad(soft)(alpha)
 
+        # Hypercontrol enters exactly like the CBF term ustar: it perturbs H_dot
+        # AND must appear in the offset-growth bound below, so the enclosure stays
+        # sound. Fold it into ustar so every use of ustar accounts for it.
+        Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
+        ustar = ustar + Uctrl
+
         ## Offset Dynamics given ustar
 
         MJACM = True
@@ -192,15 +208,7 @@ class AdjointEmbedding(ParametricEmbedding):
         big_iz = pt.hinv(pt.y)
         Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
 
-        def refine(y: Interval):
-            if len(N) > 0:
-                refinements = _mat_refine_all(N, jnp.arange(len(y)), y)
-                return interval(
-                    jnp.max(refinements.lower, axis=0),
-                    jnp.min(refinements.upper, axis=0),
-                )
-            else:
-                return y
+        refine = lambda y: _refine_N(y, N)
 
         if MJACM:
             if self.permutation is None:
@@ -295,29 +303,21 @@ class AdjointEmbedding(ParametricEmbedding):
             E = embed(F_second)
 
         E_res = E(t, y * mul, *args) * mul
-        # E_res = jnp.zeros_like(mul)
 
-        # hParametope dynamics in same pytree structure as pt
-        pt_dot = pt.from_parametope(
-            hParametope(self.sys.f(*centers), u0 + ustar, E_res)
-        )
-        # jnp.where(jnp.logical_and(y <= 1e-2, E_res <= 0), jnp.zeros_like(y), E_res)))
-        # jnp.where(E_res <= 0, jnp.zeros_like(y), E_res)))
-
-        # sets d/dt [alpha_p @ alpha] = 0, so alpha_p @ alpha = I
-        alpha_p_dot = -alpha_p @ (u0 + ustar) @ alpha_p
-        # alpha_p_dot = J@alpha_p
-
-        # sets d/dt [N @ alpha] = 0, so N @ alpha = 0
-        N_dot = -N @ (u0 + ustar) @ alpha_p
-        # N_dot = jnp.zeros_like(N)
+        # H_dot includes the hypercontrol (folded into ustar above); propagate it
+        # through H+ and N so alpha_p @ alpha = I and N @ alpha = 0 are preserved.
+        H_dot = u0 + ustar
+        pt_dot = pt.from_parametope(hParametope(self.sys.f(*centers), H_dot, E_res))
+        alpha_p_dot = -alpha_p @ H_dot @ alpha_p
+        N_dot = -N @ H_dot @ alpha_p
 
         return (pt_dot, (alpha_p_dot, N_dot))
 
 
 class FastlinAdjointEmbedding(ParametricEmbedding):
     def __init__(
-        self, sys, alpha_p0, N0, permutation=None, ustars=None, tt=None, kap=None
+        self, sys, alpha_p0, N0, permutation=None, ustars=None, tt=None, kap=None,
+        forward_mode: str = "ibp", iterated: bool = False,
     ):
         #  refine_factory:Callable[[ArrayLike], Callable]=partial(SampleRefinement, num_samples=10)):
         super().__init__(sys)
@@ -331,6 +331,8 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         self.ustars = ustars
         self.tt = tt
         self.kap = kap
+        self.forward_mode = forward_mode
+        self.iterated = iterated
 
     def _initialize(self, pt0: hParametope) -> ArrayLike:
         if not isinstance(pt0, hParametope):
@@ -346,7 +348,17 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         # return (alpha_p, N)
         return (self.alpha_p0, self.N0)
 
-    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, **kwargs):
+    def hypercontrol_shape(self, pt0: hParametope) -> tuple:
+        # The hypercontrol is added to the H (alpha) dynamics.
+        return pt0.alpha.shape
+
+    def iover(self, state):
+        pt, aux = state
+        alpha_p, N = aux
+        iz = _refine_N(pt.hinv(pt.y), N)
+        return interval(alpha_p) @ iz + pt.ox
+
+    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, U=None, **kwargs):
         pt, aux = state
         ox = pt.ox
 
@@ -370,7 +382,9 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         lifted_net.u = lambda t, y: lifted_net(y)
 
         # fastlin_res = fastlin(self.sys.control)(interval(alpha_p)@(big_iz + alpha@ox))
-        fastlin_res = fastlin(lifted_net)(big_iz + alpha @ ox)
+        fastlin_res = fastlin(
+            lifted_net, iterated=self.iterated, forward_mode=self.forward_mode,
+        )(big_iz + alpha @ ox)
         C = fastlin_res.C
         # C = jax.jacfwd(lifted_net)(alpha@ox)
 
@@ -417,21 +431,19 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
                 -(Lfh + Lgh @ u0flat + k) * Lgh.T / (Lgh @ Lgh.T),
             ).reshape(alpha.shape)
 
+        # Hypercontrol enters exactly like the CBF term ustar: it perturbs H_dot
+        # AND must appear in the offset-growth bound below, so the enclosure stays
+        # sound. Fold it into ustar so every use of ustar accounts for it.
+        Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
+        ustar = ustar + Uctrl
+
         ## Offset Dynamics given ustar
 
         # For properly handling signs in lower offsets
         K_2 = len(y) // 2
         mul = jnp.concatenate((-jnp.ones(K_2), jnp.ones(K_2)))
 
-        def refine(y: Interval):
-            if len(N) > 0:
-                refinements = _mat_refine_all(N, jnp.arange(len(y)), y)
-                return interval(
-                    jnp.max(refinements.lower, axis=0),
-                    jnp.min(refinements.upper, axis=0),
-                )
-            else:
-                return y
+        refine = lambda y: _refine_N(y, N)
 
         if self.permutation is None:
             lenperm = sum([len(arg) for arg in centers])
@@ -480,18 +492,28 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         E = embed(F)
         E_res = E(t, y * mul, *args) * mul
 
-        # hParametope dynamics in same pytree structure as pt
+        # H_dot includes the hypercontrol (folded into ustar above); propagate it
+        # through H+ and N so alpha_p @ alpha = I and N @ alpha = 0 are preserved.
+        H_dot = u0 + ustar
         pt_dot = pt.from_parametope(
-            hParametope(self.sys.olsystem.f(*centers), u0 + ustar, E_res)
+            hParametope(self.sys.olsystem.f(*centers), H_dot, E_res)
         )
-
-        # sets d/dt [alpha_p @ alpha] = 0, so alpha_p @ alpha = I
-        alpha_p_dot = -alpha_p @ (u0 + ustar) @ alpha_p
-
-        # sets d/dt [N @ alpha] = 0, so N @ alpha = 0
-        N_dot = -N @ (u0 + ustar) @ alpha_p
+        alpha_p_dot = -alpha_p @ H_dot @ alpha_p
+        N_dot = -N @ H_dot @ alpha_p
 
         return (pt_dot, (alpha_p_dot, N_dot))
+
+
+def _refine_N(y: Interval, N) -> Interval:
+    """Tighten the offset interval ``y`` using the null-space rows ``N``
+    (a no-op when ``N`` is empty)."""
+    if len(N) > 0:
+        refinements = _mat_refine_all(N, jnp.arange(len(y)), y)
+        return interval(
+            jnp.max(refinements.lower, axis=0),
+            jnp.min(refinements.upper, axis=0),
+        )
+    return y
 
 
 def _vec_refine(null_vector: jax.Array, var_index: jax.Array, y: Interval):

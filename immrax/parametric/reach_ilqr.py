@@ -159,7 +159,11 @@ class ReachiLQR:
         self.x0_flat = x0_flat
         self.pt0 = pt0
         # State dimension for the per-timestep iover boxes; only needed when tracking.
-        self.n = int(pt0.iover().shape[0]) if self.track_iover else 0
+        self.n = (
+            int(self.embedding.iover((pt0, self.aux0)).shape[0])
+            if self.track_iover
+            else 0
+        )
         # _dynamics output matches the (pt, aux) structure, so a flat concatenate
         # of leaves is always a valid inverse of _unflatten.
         self._flatten = lambda pt_aux: jnp.concatenate(
@@ -187,13 +191,17 @@ class ReachiLQR:
         kw = dict(self.f_kwargs)
         if ix is not None:
             kw["ix"] = ix
-        dpt_daux = self.embedding._dynamics(t, (pt, aux), U, **kw)
+        dpt_daux = self.embedding._dynamics(t, (pt, aux), U=U, **kw)
         return self._flatten(dpt_daux)
 
     def _iover_box(self, x_flat: Array) -> Interval:
-        """The parametope's interval hull from a flat state."""
-        pt, _ = self._unflatten(x_flat)
-        return pt.iover()
+        """Interval hull of the reachable set from a flat ``(pt, aux)`` state.
+
+        Delegates to ``embedding.iover``, which can use the aux (e.g. a maintained
+        ``H+``) — not just the parametope.
+        """
+        state = self._unflatten(x_flat)
+        return self.embedding.iover(state)
 
     def _terminal_flat(self, x_flat: Array) -> Float:
         pt, _ = self._unflatten(x_flat)

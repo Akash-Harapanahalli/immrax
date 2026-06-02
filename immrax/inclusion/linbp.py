@@ -19,7 +19,11 @@ from jax._src.util import safe_map
 from jax.tree_util import register_pytree_node_class
 
 from immrax.inclusion.interval import Interval, interval
-from immrax.inclusion.nif import _inclusion_dot_general_p
+from immrax.inclusion.nif import (
+    _inclusion_dot_general_p,
+    inclusion_registry,
+    _set_rigorous,
+)
 
 """
 Forward linear bound propagation through a JAX function via Jaxpr interpretation.
@@ -204,6 +208,10 @@ def _linbp_jaxpr(
                 if eqn.primitive in _linbp_recursive_prims:
                     extra = dict(tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
                                  iterated_bw=iterated_bw)
+                elif eqn.primitive in _linbp_tighten_prims:
+                    # Tightening-eligible primitives need to know whether _tighten
+                    # will overwrite their l/u so they can skip IBP propagation.
+                    extra = dict(_tighten_will_run=(tighten_bounds and x_lb is not None))
                 else:
                     extra = {}
                 ans = linbp_registry[eqn.primitive](
@@ -229,6 +237,193 @@ def _linbp_jaxpr(
     if return_env:
         return outs, env
     return outs
+
+
+def _ibp_jaxpr(
+    jaxpr: Jaxpr,
+    consts,
+    *args,
+    relu_mode: str = "adaptive",
+    propagate_source_info: bool = True,
+    x_lb=None,
+    x_ub=None,
+    return_env: bool = False,
+    iterated_bw: bool = False,
+) -> list[Any]:
+    """Pure interval-arithmetic (IBP) forward sweep.
+
+    Walks ``jaxpr.eqns`` exactly like :func:`natif_jaxpr`, reusing the same
+    per-primitive handlers in ``inclusion_registry``.  The only differences:
+
+    1. Env entries are stored as ``LinearBound(lA=None, lb=None, uA=None,
+       ub=None, l=..., u=...)`` so the downstream backward CROWN sweep can
+       read ``env[var].l`` / ``env[var].u`` uniformly.
+    2. Dead-var cleanup is suppressed so the env is intact for the backward
+       walk.
+    3. With ``iterated_bw=True``, at each activation / recursive-wrap eqn we
+       run :func:`_backward_to_concrete` over the already-processed prefix
+       to tighten the pre-activation ``l, u`` — yielding standard backward
+       CROWN behaviour with no linear-bound forward propagation.
+
+    Rigorous widening is disabled (handlers are evaluated in non-rigorous
+    mode); linbp_backward does not produce ULP-widened bounds.
+    """
+    def _wrap(iv):
+        return LinearBound(lA=None, lb=None, uA=None, ub=None,
+                           l=iv.lower, u=iv.upper)
+
+    def _as_handler_arg(v):
+        # Env entries are LinearBound with .l/.u; convert to Interval for handlers.
+        if isinstance(v, LinearBound):
+            return Interval(v.l, v.u)
+        return v
+
+    def read(v: Atom) -> Any:
+        return v.val if isinstance(v, Literal) else env[v]
+
+    def write(v: Var, val: Any) -> None:
+        env[v] = val
+
+    env: dict[Var, Any] = {}
+    safe_map(write, jaxpr.constvars, consts)
+    # Inputs may be LinearBound (from _linbp_backward_jaxpr's identity init) or
+    # Interval; either way the env entry needs .l/.u, so re-wrap uniformly.
+    def _ingest(a):
+        if isinstance(a, LinearBound):
+            return LinearBound(lA=None, lb=None, uA=None, ub=None, l=a.l, u=a.u)
+        if isinstance(a, Interval):
+            return _wrap(a)
+        return a
+    safe_map(write, jaxpr.invars, [_ingest(a) for a in args])
+
+    # For iterated CROWN: map each var to the index of the eqn that produced it.
+    producing_idx: dict = {}
+    if iterated_bw:
+        for j, e in enumerate(jaxpr.eqns):
+            for ov in e.outvars:
+                producing_idx[ov] = j
+
+    old_rigorous = _set_rigorous(False)
+    try:
+        for eqn in jaxpr.eqns:
+            name_stack = (
+                source_info_util.current_name_stack() + eqn.source_info.name_stack
+            )
+            traceback = eqn.source_info.traceback if propagate_source_info else None
+            with source_info_util.user_context(traceback, name_stack=name_stack):
+                # iterated CROWN: at each activation / recursive primitive, replace
+                # the forward-IBP pre-activation l, u with the tighter bounds from
+                # a backward CROWN sweep over the prefix processed so far.
+                if iterated_bw and x_lb is not None and (
+                    eqn.primitive in _activation_prims_bw
+                    or eqn.primitive in _linbp_recursive_prims
+                ):
+                    for iv in eqn.invars:
+                        if isinstance(iv, Literal):
+                            continue
+                        val = env.get(iv)
+                        if not isinstance(val, LinearBound):
+                            continue
+                        prod_idx = producing_idx.get(iv)
+                        if prod_idx is None:
+                            continue
+                        l_new, u_new = _backward_to_concrete(
+                            jaxpr, env, iv, prod_idx, x_lb, x_ub, relu_mode,
+                            forward_mode="ibp",
+                        )
+                        env[iv] = LinearBound(
+                            None, None, None, None,
+                            jnp.maximum(val.l, l_new),
+                            jnp.minimum(val.u, u_new),
+                        )
+
+                raw_invars = safe_map(read, eqn.invars)
+                handler_invars = [_as_handler_arg(v) for v in raw_invars]
+                any_interval = any(isinstance(v, Interval) for v in handler_invars)
+
+                if any_interval:
+                    if eqn.primitive in _linbp_recursive_prims:
+                        # Recurse into nested jaxprs (jit_p, custom_jvp_call_p)
+                        # using _ibp_jaxpr so the inner sweep stays IBP.
+                        ans = _ibp_recursive(
+                            eqn, handler_invars,
+                            relu_mode=relu_mode, x_lb=x_lb, x_ub=x_ub,
+                            iterated_bw=iterated_bw,
+                        )
+                    else:
+                        if eqn.primitive not in inclusion_registry:
+                            raise NotImplementedError(
+                                f"{eqn.primitive} not in inclusion_registry"
+                            )
+                        bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+                        subfuns = bind_params.pop('subfuns', ())
+                        handler = inclusion_registry[eqn.primitive]
+                        ans = handler(*subfuns, *handler_invars, **bind_params)
+                else:
+                    bind_params = dict(eqn.primitive.get_bind_params(eqn.params))
+                    subfuns = bind_params.pop('subfuns', ())
+                    ans = eqn.primitive.bind(*subfuns, *handler_invars, **bind_params)
+
+            if eqn.primitive.multiple_results:
+                wrapped = [_wrap(a) if isinstance(a, Interval) else a for a in ans]
+                safe_map(write, eqn.outvars, wrapped)
+            else:
+                wrapped = _wrap(ans) if isinstance(ans, Interval) else ans
+                write(eqn.outvars[0], wrapped)
+            # NOTE: no clean_up_dead_vars — env is needed for the backward sweep.
+    finally:
+        _set_rigorous(old_rigorous)
+
+    outs = safe_map(read, jaxpr.outvars)
+    if return_env:
+        return outs, env
+    return outs
+
+
+def _ibp_recursive(eqn, handler_invars, *, relu_mode, x_lb, x_ub, iterated_bw):
+    """Recurse _ibp_jaxpr into a nested jaxpr (jit_p, custom_jvp_call_p)."""
+    params = dict(eqn.params)
+    # jit_p / pjit_p carry the inner jaxpr under "jaxpr"
+    if "jaxpr" in params:
+        inner = params["jaxpr"]
+        if isinstance(inner, jax.extend.core.ClosedJaxpr):
+            inner_jaxpr = inner.jaxpr
+            inner_consts = inner.literals
+        else:
+            inner_jaxpr = inner
+            inner_consts = []
+        outs = _ibp_jaxpr(
+            inner_jaxpr, inner_consts, *handler_invars,
+            relu_mode=relu_mode, x_lb=x_lb, x_ub=x_ub,
+            iterated_bw=iterated_bw,
+        )
+    elif "call_jaxpr" in params:
+        # custom_jvp_call_p
+        num_consts = params.get("num_consts", 0)
+        inner = params["call_jaxpr"]
+        if isinstance(inner, jax.extend.core.ClosedJaxpr):
+            inner_jaxpr = inner.jaxpr
+            inner_consts = list(inner.consts)
+        else:
+            inner_jaxpr = inner
+            inner_consts = []
+        extra_consts = list(handler_invars[:num_consts])
+        actual_args = handler_invars[num_consts:]
+        outs = _ibp_jaxpr(
+            inner_jaxpr, inner_consts + extra_consts, *actual_args,
+            relu_mode=relu_mode, x_lb=x_lb, x_ub=x_ub,
+            iterated_bw=iterated_bw,
+        )
+    else:
+        raise NotImplementedError(
+            f"_ibp_recursive: don't know how to unpack {eqn.primitive}"
+        )
+    # _ibp_jaxpr returns LinearBound entries; convert outputs back to Interval
+    # so the caller can wrap them uniformly.
+    if eqn.primitive.multiple_results:
+        return [Interval(o.l, o.u) if isinstance(o, LinearBound) else o for o in outs]
+    o = outs[0] if isinstance(outs, list) else outs
+    return Interval(o.l, o.u) if isinstance(o, LinearBound) else o
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +551,8 @@ def _linbp_mul_p(x, y, *, relu_mode, **kwargs):
 linbp_registry[lax.mul_p] = _linbp_mul_p
 
 
-def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
+def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers,
+                         _tighten_will_run=False, **kwargs):
     (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
     dim_nums = dimension_numbers
 
@@ -374,8 +570,12 @@ def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
         lA = dot_vmap(x.lA, Wp) + dot_vmap(x.uA, Wn)
         ub = dot(x.ub, Wp) + dot(x.lb, Wn)
         lb = dot(x.lb, Wp) + dot(x.ub, Wn)
-        ul = dot(x.u, Wp) + dot(x.l, Wn)
-        ll = dot(x.l, Wp) + dot(x.u, Wn)
+        if _tighten_will_run:
+            ll = jnp.full(lb.shape, -jnp.inf, dtype=lb.dtype)
+            ul = jnp.full(ub.shape,  jnp.inf, dtype=ub.dtype)
+        else:
+            ul = dot(x.u, Wp) + dot(x.l, Wn)
+            ll = dot(x.l, Wp) + dot(x.u, Wn)
         return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=ll, u=ul)
 
     elif not isinstance(x, LinearBound) and isinstance(y, LinearBound):
@@ -387,8 +587,12 @@ def _linbp_dot_general_p(x, y, *, relu_mode, dimension_numbers, **kwargs):
         lA = lax.dot_general(Wp, y.lA, dim_nums) + lax.dot_general(Wn, y.uA, dim_nums)
         ub = lax.dot_general(Wp, y.ub, dim_nums) + lax.dot_general(Wn, y.lb, dim_nums)
         lb = lax.dot_general(Wp, y.lb, dim_nums) + lax.dot_general(Wn, y.ub, dim_nums)
-        ul = lax.dot_general(Wp, y.u, dim_nums) + lax.dot_general(Wn, y.l, dim_nums)
-        ll = lax.dot_general(Wp, y.l, dim_nums) + lax.dot_general(Wn, y.u, dim_nums)
+        if _tighten_will_run:
+            ll = jnp.full(lb.shape, -jnp.inf, dtype=lb.dtype)
+            ul = jnp.full(ub.shape,  jnp.inf, dtype=ub.dtype)
+        else:
+            ul = lax.dot_general(Wp, y.u, dim_nums) + lax.dot_general(Wn, y.l, dim_nums)
+            ll = lax.dot_general(Wp, y.l, dim_nums) + lax.dot_general(Wn, y.u, dim_nums)
         return LinearBound(lA=lA, lb=lb, uA=uA, ub=ub, l=ll, u=ul)
 
     else:
@@ -2271,7 +2475,23 @@ backward_registry[lax.sin_p] = _bw_sin
 backward_registry[lax.cos_p] = _bw_cos
 
 
-def _bw_jit(eqn, out_bds_out, env, *, relu_mode):
+def _inner_forward(forward_mode, inner_jaxpr, inner_consts, *args, relu_mode):
+    """Dispatch the inner forward sweep for recursive backward handlers."""
+    if forward_mode == "linbp":
+        return _linbp_jaxpr(
+            inner_jaxpr, inner_consts, *args, relu_mode=relu_mode,
+            tighten_bounds=True, return_env=True,
+        )
+    elif forward_mode == "ibp":
+        return _ibp_jaxpr(
+            inner_jaxpr, inner_consts, *args, relu_mode=relu_mode,
+            return_env=True,
+        )
+    else:
+        raise ValueError(f"forward_mode must be 'linbp' or 'ibp', got {forward_mode!r}")
+
+
+def _bw_jit(eqn, out_bds_out, env, *, relu_mode, forward_mode="linbp"):
     """Recurse into jit_p call_jaxpr."""
     bind_params = dict(eqn.params)
     inner = bind_params["jaxpr"]
@@ -2282,24 +2502,24 @@ def _bw_jit(eqn, out_bds_out, env, *, relu_mode):
         inner_consts = []
         inner_jaxpr = inner
     # Map outer outvars' BackwardBounds to inner outvars (parallel).
-    # Run a forward linbp on the inner jaxpr to populate an inner env, then
+    # Run the forward sweep on the inner jaxpr to populate an inner env, then
     # backward-walk it.
     args = [env[v] if isinstance(env.get(v), LinearBound) else
             (v.val if isinstance(v, Literal) else env.get(v))
             for v in eqn.invars]
-    _, inner_env = _linbp_jaxpr(
-        inner_jaxpr, inner_consts, *args, relu_mode=relu_mode,
-        tighten_bounds=True, return_env=True,
+    _, inner_env = _inner_forward(
+        forward_mode, inner_jaxpr, inner_consts, *args, relu_mode=relu_mode,
     )
     inner_bw = {}
     for ov_outer, ov_inner in zip(eqn.outvars, inner_jaxpr.outvars):
         inner_bw[ov_inner] = out_bds_out[ov_outer]
-    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode)
+    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode,
+             forward_mode=forward_mode)
     # Map back: invars
     return [inner_bw.get(iv) for iv in inner_jaxpr.invars]
 
 
-def _bw_custom_jvp_call(eqn, out_bds_out, env, *, relu_mode):
+def _bw_custom_jvp_call(eqn, out_bds_out, env, *, relu_mode, forward_mode="linbp"):
     """Recurse into custom_jvp_call primal jaxpr (ignore jvp branch)."""
     bind_params = dict(eqn.params)
     call_jaxpr = bind_params["call_jaxpr"]
@@ -2318,14 +2538,15 @@ def _bw_custom_jvp_call(eqn, out_bds_out, env, *, relu_mode):
     args = [env[v] if isinstance(env.get(v), LinearBound) else
             (v.val if isinstance(v, Literal) else env.get(v))
             for v in actual_invars]
-    _, inner_env = _linbp_jaxpr(
-        inner_jaxpr, inner_consts + extra_consts, *args, relu_mode=relu_mode,
-        tighten_bounds=True, return_env=True,
+    _, inner_env = _inner_forward(
+        forward_mode, inner_jaxpr, inner_consts + extra_consts, *args,
+        relu_mode=relu_mode,
     )
     inner_bw = {}
     for ov_outer, ov_inner in zip(eqn.outvars, inner_jaxpr.outvars):
         inner_bw[ov_inner] = out_bds_out[ov_outer]
-    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode)
+    _bw_walk(inner_jaxpr, inner_env, inner_bw, relu_mode=relu_mode,
+             forward_mode=forward_mode)
     out = [None] * len(eqn.invars)
     for j, iv_inner in enumerate(inner_jaxpr.invars):
         out[num_consts + j] = inner_bw.get(iv_inner)
@@ -2340,7 +2561,8 @@ if _custom_jvp_call_p is not None:
     _bw_recursive_prims.add(_custom_jvp_call_p)
 
 
-def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str):
+def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str,
+             forward_mode: str = "linbp"):
     """Walk jaxpr.eqns in reverse, propagating BackwardBounds through bw_env."""
     for eqn in reversed(jaxpr.eqns):
         # Collect output bounds for this eqn's outvars
@@ -2354,7 +2576,8 @@ def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str):
             )
         if eqn.primitive in _bw_recursive_prims:
             out_bds_map = {ov: bw_env[ov] for ov in eqn.outvars if ov in bw_env}
-            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode)
+            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode,
+                             forward_mode=forward_mode)
         else:
             out_bd = bw_env[eqn.outvars[0]]
             in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
@@ -2372,7 +2595,8 @@ def _bw_walk(jaxpr: Jaxpr, env: dict, bw_env: dict, *, relu_mode: str):
                 bw_env[v] = bd
 
 
-def _backward_to_concrete(jaxpr, env, target_var, target_idx, x_lb, x_ub, relu_mode):
+def _backward_to_concrete(jaxpr, env, target_var, target_idx, x_lb, x_ub,
+                          relu_mode, forward_mode: str = "linbp"):
     """Run a backward CROWN sweep treating ``target_var`` as the output.
 
     Walks ``jaxpr.eqns`` from ``target_idx`` down to 0, using the slopes
@@ -2397,7 +2621,8 @@ def _backward_to_concrete(jaxpr, env, target_var, target_idx, x_lb, x_ub, relu_m
             )
         if eqn.primitive in _bw_recursive_prims:
             out_bds_map = {ov: bw_env[ov] for ov in eqn.outvars if ov in bw_env}
-            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode)
+            in_bds = handler(eqn, out_bds_map, env, relu_mode=relu_mode,
+                             forward_mode=forward_mode)
         else:
             out_bd = bw_env[eqn.outvars[0]]
             in_bds = handler(eqn, out_bd, env, relu_mode=relu_mode)
@@ -2433,21 +2658,39 @@ def _linbp_backward_jaxpr(
     tighten_bounds: bool = True,
     x_lb=None, x_ub=None,
     iterated_bw: bool = False,
+    forward_mode: str = "linbp",
 ):
-    """Forward linbp to capture env, then backward sweep with sign-conditioned slopes.
+    """Forward sweep to capture env, then backward sweep with sign-conditioned slopes.
 
-    With ``iterated_bw=True``, the forward sweep additionally runs a backward
-    CROWN pass at each activation / wrapper to tighten the pre-activation
-    ``l, u`` before the slope is picked (pure backward CROWN).
+    ``forward_mode`` selects the forward sweep:
+      - ``'linbp'`` (default): linear-bound propagation, optionally tightened
+        with IBP via ``tighten_bounds``. With ``iterated_bw=True`` this gives
+        "pure backward CROWN".
+      - ``'ibp'``: pure interval-arithmetic propagation. With
+        ``iterated_bw=False`` this is standard **IBP+CROWN**; with
+        ``iterated_bw=True`` it is standard **CROWN** (each pre-activation
+        re-derived by backward sweep from the input). ``tighten_bounds`` has
+        no effect under ``'ibp'``.
 
     Returns a list of BackwardBound, one per jaxpr.outvar, expressed as a linear
     function of the input variable (jaxpr.invars[0]).
     """
-    outs, env = _linbp_jaxpr(
-        jaxpr, consts, *args, relu_mode=relu_mode,
-        tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
-        return_env=True, iterated_bw=iterated_bw,
-    )
+    if forward_mode == "linbp":
+        outs, env = _linbp_jaxpr(
+            jaxpr, consts, *args, relu_mode=relu_mode,
+            tighten_bounds=tighten_bounds, x_lb=x_lb, x_ub=x_ub,
+            return_env=True, iterated_bw=iterated_bw,
+        )
+    elif forward_mode == "ibp":
+        outs, env = _ibp_jaxpr(
+            jaxpr, consts, *args, relu_mode=relu_mode,
+            x_lb=x_lb, x_ub=x_ub,
+            return_env=True, iterated_bw=iterated_bw,
+        )
+    else:
+        raise ValueError(
+            f"forward_mode must be 'linbp' or 'ibp', got {forward_mode!r}"
+        )
     bw_env = {}
     import math
     for ov in jaxpr.outvars:
@@ -2456,14 +2699,25 @@ def _linbp_backward_jaxpr(
         # Initialise with identity coefficient: A has shape (n_out, *S)
         I = jnp.eye(n_out).reshape((n_out,) + S)
         bw_env[ov] = BackwardBound(I, jnp.zeros(n_out), I, jnp.zeros(n_out))
-    _bw_walk(jaxpr, env, bw_env, relu_mode=relu_mode)
+    _bw_walk(jaxpr, env, bw_env, relu_mode=relu_mode, forward_mode=forward_mode)
     return [bw_env[v] for v in jaxpr.invars]
 
 
 def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
-                   iterated_bw: bool = False):
+                   iterated_bw: bool = False, forward_mode: str = "linbp"):
     """Backward CROWN: like ``linbp`` but with sign-conditioned per-(output,
     neuron) slope picking at each ReLU.
+
+    Parameters
+    ----------
+    forward_mode : {"linbp", "ibp"}
+        Forward sweep used to populate per-variable concrete ``l, u`` consumed
+        by the backward CROWN sweep. ``'linbp'`` (default) uses linear-bound
+        propagation; combined with ``iterated_bw=True`` this is "pure backward
+        CROWN". ``'ibp'`` uses pure interval arithmetic: combined with
+        ``iterated_bw=False`` this is **IBP+CROWN**, and combined with
+        ``iterated_bw=True`` this is **standard CROWN**. ``tighten_bounds`` is
+        ignored when ``forward_mode='ibp'``.
 
     Returns a callable mapping an ``Interval`` to a ``LinearBound``.  Shapes
     match the forward :func:`linbp` convention: ``lA, uA`` are ``(*S_out, *S_in)``
@@ -2477,6 +2731,7 @@ def linbp_backward(f, relu_mode: str = "adaptive", tighten_bounds: bool = True,
             closed_jaxpr.jaxpr, closed_jaxpr.literals, lb_init,
             relu_mode=relu_mode, tighten_bounds=tighten_bounds,
             x_lb=x_lb, x_ub=x_ub, iterated_bw=iterated_bw,
+            forward_mode=forward_mode,
         )
         if len(in_bds) != 1:
             raise NotImplementedError("backward CROWN: multi-input functions not supported yet")

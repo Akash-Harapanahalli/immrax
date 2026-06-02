@@ -6,6 +6,11 @@ Verifies that:
 - ``crown(net, iterated=True)`` (pure backward CROWN with re-derived
   pre-activation bounds at each ReLU) also produces sound overapproximations.
 - Same for ``fastlin(net)`` and ``fastlin(net, iterated=True)``.
+- The two ``forward_mode`` paths (``'linbp'`` — affine forward, and ``'ibp'`` —
+  pure interval forward) both yield sound bounds across every iterated /
+  same-slope combination. With ``iterated=False`` this is the IBP+CROWN vs
+  linbp+CROWN comparison; with ``iterated=True`` the bounds should agree
+  modulo float noise since pre-activations are re-derived backward either way.
 - One-pass backward bounds are no looser than forward-only ``linbp`` bounds
   on the sample mean width across a battery of random nets — strict
   monotonicity isn't required for a single network (slope choice at
@@ -70,6 +75,11 @@ _INPUT_INTERVAL_PARAMS = [
     pytest.param('asym',  id="asym-box"),
 ]
 
+_FORWARD_MODE_PARAMS = [
+    pytest.param('linbp', id="fwd=linbp"),
+    pytest.param('ibp',   id="fwd=ibp"),
+]
+
 
 def _make_interval(kind, n_in):
     if kind == 'unit':
@@ -97,6 +107,11 @@ def input_kind(request):
     return request.param
 
 
+@pytest.fixture(params=_FORWARD_MODE_PARAMS)
+def forward_mode(request):
+    return request.param
+
+
 @pytest.fixture
 def net_and_ix(arch_act, net_key, input_kind):
     arch, activation = arch_act
@@ -108,40 +123,40 @@ def net_and_ix(arch_act, net_key, input_kind):
 # Shape / type sanity for backward variants
 # ---------------------------------------------------------------------------
 
-def test_backward_crown_shapes(arch_act, net_key):
+def test_backward_crown_shapes(arch_act, net_key, forward_mode):
     arch, activation = arch_act
     net = _build_net(arch, activation, jax.random.PRNGKey(net_key))
     n_in, n_out = arch[0], arch[-1]
     ix = _make_interval('unit', n_in)
 
-    cr = crown(net, backward=True)(ix)
+    cr = crown(net, backward=True, forward_mode=forward_mode)(ix)
     assert cr.lC.shape == (n_out, n_in)
     assert cr.uC.shape == (n_out, n_in)
     assert cr.ld.shape == (n_out,)
     assert cr.ud.shape == (n_out,)
 
 
-def test_iterated_crown_shapes(arch_act, net_key):
+def test_iterated_crown_shapes(arch_act, net_key, forward_mode):
     arch, activation = arch_act
     net = _build_net(arch, activation, jax.random.PRNGKey(net_key))
     n_in, n_out = arch[0], arch[-1]
     ix = _make_interval('unit', n_in)
 
-    cr = crown(net, iterated=True)(ix)
+    cr = crown(net, iterated=True, forward_mode=forward_mode)(ix)
     assert cr.lC.shape == (n_out, n_in)
     assert cr.uC.shape == (n_out, n_in)
     assert cr.ld.shape == (n_out,)
     assert cr.ud.shape == (n_out,)
 
 
-def test_backward_fastlin_single_C(arch_act, net_key):
+def test_backward_fastlin_single_C(arch_act, net_key, forward_mode):
     """FastLin (same-slope) backward must yield a single coefficient matrix
     (lA == uA in the underlying LinearBound)."""
     arch, activation = arch_act
     net = _build_net(arch, activation, jax.random.PRNGKey(net_key))
     ix = _make_interval('unit', arch[0])
 
-    fl = fastlin(net, backward=True)(ix)
+    fl = fastlin(net, backward=True, forward_mode=forward_mode)(ix)
     n_in, n_out = arch[0], arch[-1]
     assert fl.C.shape  == (n_out, n_in)
     assert fl.ld.shape == (n_out,)
@@ -167,42 +182,42 @@ def _assert_contains(out_interval, outputs, label):
     )
 
 
-def test_backward_crown_contains_output(net_and_ix):
+def test_backward_crown_contains_output(net_and_ix, forward_mode):
     net, ix = net_and_ix
-    out = crown(net, backward=True)(ix)(ix)
+    out = crown(net, backward=True, forward_mode=forward_mode)(ix)(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(42))
     outputs = jax.vmap(net)(samples)
-    _assert_contains(out, outputs, "backward crown")
+    _assert_contains(out, outputs, f"backward crown / {forward_mode}")
 
 
-def test_iterated_crown_contains_output(net_and_ix):
+def test_iterated_crown_contains_output(net_and_ix, forward_mode):
     net, ix = net_and_ix
-    out = crown(net, iterated=True)(ix)(ix)
+    out = crown(net, iterated=True, forward_mode=forward_mode)(ix)(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(43))
     outputs = jax.vmap(net)(samples)
-    _assert_contains(out, outputs, "iterated crown")
+    _assert_contains(out, outputs, f"iterated crown / {forward_mode}")
 
 
-def test_backward_fastlin_contains_output(net_and_ix):
+def test_backward_fastlin_contains_output(net_and_ix, forward_mode):
     net, ix = net_and_ix
-    out = fastlin(net, backward=True)(ix)(ix)
+    out = fastlin(net, backward=True, forward_mode=forward_mode)(ix)(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(44))
     outputs = jax.vmap(net)(samples)
-    _assert_contains(out, outputs, "backward fastlin")
+    _assert_contains(out, outputs, f"backward fastlin / {forward_mode}")
 
 
-def test_iterated_fastlin_contains_output(net_and_ix):
+def test_iterated_fastlin_contains_output(net_and_ix, forward_mode):
     net, ix = net_and_ix
-    out = fastlin(net, iterated=True)(ix)(ix)
+    out = fastlin(net, iterated=True, forward_mode=forward_mode)(ix)(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(45))
     outputs = jax.vmap(net)(samples)
-    _assert_contains(out, outputs, "iterated fastlin")
+    _assert_contains(out, outputs, f"iterated fastlin / {forward_mode}")
 
 
-def test_backward_crown_pointwise(net_and_ix):
+def test_backward_crown_pointwise(net_and_ix, forward_mode):
     """Per-sample containment (not just min/max across the sample cloud)."""
     net, ix = net_and_ix
-    cr = crown(net, backward=True)(ix)
+    cr = crown(net, backward=True, forward_mode=forward_mode)(ix)
     out = cr(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(99))
 
@@ -212,12 +227,15 @@ def test_backward_crown_pointwise(net_and_ix):
 
     results = jax.vmap(ok)(samples)
     n_failed = int(jnp.sum(~results))
-    assert n_failed == 0, f"{n_failed}/{N_SAMPLES} samples fell outside backward-CROWN bounds"
+    assert n_failed == 0, (
+        f"{n_failed}/{N_SAMPLES} samples fell outside backward-CROWN bounds "
+        f"(forward_mode={forward_mode})"
+    )
 
 
-def test_iterated_crown_pointwise(net_and_ix):
+def test_iterated_crown_pointwise(net_and_ix, forward_mode):
     net, ix = net_and_ix
-    cr = crown(net, iterated=True)(ix)
+    cr = crown(net, iterated=True, forward_mode=forward_mode)(ix)
     out = cr(ix)
     samples = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(100))
 
@@ -227,7 +245,10 @@ def test_iterated_crown_pointwise(net_and_ix):
 
     results = jax.vmap(ok)(samples)
     n_failed = int(jnp.sum(~results))
-    assert n_failed == 0, f"{n_failed}/{N_SAMPLES} samples fell outside iterated-CROWN bounds"
+    assert n_failed == 0, (
+        f"{n_failed}/{N_SAMPLES} samples fell outside iterated-CROWN bounds "
+        f"(forward_mode={forward_mode})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +300,12 @@ def test_backward_strictly_tighter_on_deep_relu():
 # Direct linbp_backward smoke tests
 # ---------------------------------------------------------------------------
 
-def test_linbp_backward_returns_linearbound(arch_act, net_key):
+def test_linbp_backward_returns_linearbound(arch_act, net_key, forward_mode):
     arch, activation = arch_act
     net = _build_net(arch, activation, jax.random.PRNGKey(net_key))
     ix = _make_interval('small', arch[0])
 
-    lb = linbp_backward(net, relu_mode='adaptive')(ix)
+    lb = linbp_backward(net, relu_mode='adaptive', forward_mode=forward_mode)(ix)
     n_in, n_out = arch[0], arch[-1]
     assert lb.lA.shape == (n_out, n_in)
     assert lb.uA.shape == (n_out, n_in)
@@ -293,27 +314,29 @@ def test_linbp_backward_returns_linearbound(arch_act, net_key):
     assert jnp.all(lb.l <= lb.u)
 
 
-def test_linbp_backward_same_slope_lA_equals_uA(arch_act, net_key):
+def test_linbp_backward_same_slope_lA_equals_uA(arch_act, net_key, forward_mode):
     """With ``same-slope`` and a function whose output is built only via
     monotone-positive-slope activations (ReLU/sigmoid/tanh), backward should
     keep ``lA == uA`` throughout, so the resulting bound has a single C."""
     arch, activation = arch_act
     net = _build_net(arch, activation, jax.random.PRNGKey(net_key))
     ix = _make_interval('small', arch[0])
-    lb = linbp_backward(net, relu_mode='same-slope')(ix)
-    assert jnp.allclose(lb.lA, lb.uA), "same-slope backward must have lA == uA"
+    lb = linbp_backward(net, relu_mode='same-slope', forward_mode=forward_mode)(ix)
+    assert jnp.allclose(lb.lA, lb.uA), (
+        f"same-slope backward must have lA == uA (forward_mode={forward_mode})"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Backward CROWN dot_general(LinearBound, LinearBound): bilinear concretization
 # ---------------------------------------------------------------------------
 
-def test_backward_dot_general_lb_lb_zero_amatrices():
+def test_backward_dot_general_lb_lb_zero_amatrices(forward_mode):
     """Bilinear ``y = x @ x`` has no exact linear bound in x; the backward
     handler must concretize, yielding ``lA = uA = 0`` and a constant interval."""
     n_in = 4
     ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
-    lb = linbp_backward(lambda x: jnp.dot(x, x))(ix)
+    lb = linbp_backward(lambda x: jnp.dot(x, x), forward_mode=forward_mode)(ix)
     # backward CROWN follows the forward (*S_out, *S_in) convention; scalar
     # output ⇒ S_out = (), so lA/uA shape == (n_in,).
     assert lb.lA.shape == (n_in,)
@@ -322,18 +345,18 @@ def test_backward_dot_general_lb_lb_zero_amatrices():
     assert jnp.allclose(lb.uA, jnp.zeros_like(lb.uA))
 
 
-def test_backward_dot_general_lb_lb_soundness():
+def test_backward_dot_general_lb_lb_soundness(forward_mode):
     """Concretized bound on ``y = x @ x`` must contain all sampled outputs."""
     n_in = 4
     ix = irx.icentpert(jnp.array([1.0, -0.5, 2.0, 0.0]), 0.5)
-    lb = linbp_backward(lambda x: jnp.dot(x, x))(ix)
+    lb = linbp_backward(lambda x: jnp.dot(x, x), forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(11))
     ys = jax.vmap(lambda x: jnp.dot(x, x))(xs)
     assert jnp.all(ys >= lb.l - TOL)
     assert jnp.all(ys <= lb.u + TOL)
 
 
-def test_backward_dot_general_lb_lb_quadratic_form_soundness():
+def test_backward_dot_general_lb_lb_quadratic_form_soundness(forward_mode):
     """Bilinear ``y = (Wx) @ x`` after a linear layer must still be sound."""
     n_in = 3
     key = jax.random.PRNGKey(2)
@@ -343,7 +366,7 @@ def test_backward_dot_general_lb_lb_quadratic_form_soundness():
     def f(x):
         return jnp.dot(W @ x, x)
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(3))
     ys = jax.vmap(f)(xs)
     assert jnp.all(ys >= lb.l - TOL)
@@ -357,7 +380,7 @@ def test_backward_dot_general_lb_lb_quadratic_form_soundness():
 # Backward CROWN split: multi-output linear primitive
 # ---------------------------------------------------------------------------
 
-def test_backward_split_identity():
+def test_backward_split_identity(forward_mode):
     """``concat(split(x)) == x``: backward CROWN of this should give an exact
     affine identity (lA = uA = I, biases zero, l = x_lb, u = x_ub)."""
     n_in = 5
@@ -367,14 +390,14 @@ def test_backward_split_identity():
         a, b = jnp.split(x, [2])
         return jnp.concatenate([a, b])
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     assert jnp.allclose(lb.lA, jnp.eye(n_in), atol=1e-6)
     assert jnp.allclose(lb.uA, jnp.eye(n_in), atol=1e-6)
     assert jnp.allclose(lb.lb, jnp.zeros(n_in), atol=1e-6)
     assert jnp.allclose(lb.ub, jnp.zeros(n_in), atol=1e-6)
 
 
-def test_backward_split_then_linear_soundness():
+def test_backward_split_then_linear_soundness(forward_mode):
     """``y = W_a @ a + W_b @ b`` where ``a, b = split(x, ...)``. Sound bounds."""
     n_in = 6
     split_idx = 2
@@ -390,7 +413,7 @@ def test_backward_split_then_linear_soundness():
         a, b = jnp.split(x, [split_idx])
         return Wa @ a + Wb @ b
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     assert lb.lA.shape == (n_out, n_in)
     assert lb.uA.shape == (n_out, n_in)
 
@@ -400,7 +423,7 @@ def test_backward_split_then_linear_soundness():
     assert jnp.all(ys <= lb.u + TOL)
 
 
-def test_backward_split_three_chunks_soundness():
+def test_backward_split_three_chunks_soundness(forward_mode):
     """``split(x, [2, 5])`` yields three chunks; each contributes to a vector
     output through its own linear / nonlinear pipeline."""
     n_in = 8
@@ -414,7 +437,7 @@ def test_backward_split_three_chunks_soundness():
         # Mix of activations through each chunk; avoid LB*LB (separate handler).
         return Wa @ jax.nn.relu(a) + Wb @ jax.nn.relu(-b) + Wc @ jax.nn.relu(c)
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     assert lb.lA.shape == (2, n_in)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(2))
     ys = jax.vmap(f)(xs)
@@ -422,7 +445,7 @@ def test_backward_split_three_chunks_soundness():
     assert jnp.all(ys <= lb.u + TOL), f"upper violated: ys.max={ys.max(0)} u={lb.u}"
 
 
-def test_backward_split_only_one_chunk_used():
+def test_backward_split_only_one_chunk_used(forward_mode):
     """Use only the first chunk; the second's BackwardBound is never created.
     The handler must zero-fill the missing outvar's cotangent."""
     n_in = 6
@@ -435,7 +458,7 @@ def test_backward_split_only_one_chunk_used():
         a, _b = jnp.split(x, [split_idx])
         return w @ a  # linear; depends only on first chunk
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(3))
     ys = jax.vmap(f)(xs)
     assert jnp.all(ys >= lb.l - TOL)
@@ -452,7 +475,7 @@ def test_backward_split_only_one_chunk_used():
 # Backward CROWN add_any: produced by JAX autodiff (vjp/grad)
 # ---------------------------------------------------------------------------
 
-def test_backward_add_any_direct_injection():
+def test_backward_add_any_direct_injection(forward_mode):
     """``add_any_p`` is semantically identical to ``add_p`` and should pass
     through the same backward handler. Inject one directly via the primitive."""
     from jax._src import ad_util
@@ -472,7 +495,7 @@ def test_backward_add_any_direct_injection():
     prims = {eqn.primitive.name for eqn in closed.jaxpr.eqns}
     assert "add_any" in prims, f"expected add_any in jaxpr; got {prims}"
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(0))
     ys = jax.vmap(f)(xs)
     assert jnp.all(ys >= lb.l - TOL)
@@ -482,7 +505,7 @@ def test_backward_add_any_direct_injection():
     assert jnp.allclose(lb.lA, 1.5 * W, atol=1e-6)
 
 
-def test_backward_neg_soundness_after_nonlinear_path():
+def test_backward_neg_soundness_after_nonlinear_path(forward_mode):
     """``y = neg(x)`` must propagate biases unchanged (not swap lo↔hi).
     Regression: prior implementation swapped A_lo/A_hi and negated biases,
     which was silently OK when lA == uA (linear-only paths) but produced
@@ -494,14 +517,14 @@ def test_backward_neg_soundness_after_nonlinear_path():
     def f(x):
         return jax.jacfwd(lambda y: -y[0] * jnp.sin(y[1]))(x)
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(0))
     ys = jax.vmap(f)(xs)
     assert jnp.all(ys >= lb.l - TOL), f"lower violated: ys.min={ys.min(0)} l={lb.l}"
     assert jnp.all(ys <= lb.u + TOL), f"upper violated: ys.max={ys.max(0)} u={lb.u}"
 
 
-def test_backward_add_any_both_lb_operands():
+def test_backward_add_any_both_lb_operands(forward_mode):
     """``add_any(a, b)`` with both ``a, b`` LinearBounds. Both must receive
     a BackwardBound; bias attributed to first only to avoid double counting."""
     from jax._src import ad_util
@@ -520,14 +543,14 @@ def test_backward_add_any_both_lb_operands():
     prims = {eqn.primitive.name for eqn in closed.jaxpr.eqns}
     assert "add_any" in prims, f"expected add_any in jaxpr; got {prims}"
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(1))
     ys = jax.vmap(f)(xs)
     assert jnp.all(ys >= lb.l - TOL)
     assert jnp.all(ys <= lb.u + TOL)
 
 
-def test_backward_dot_general_lb_lb_vector_output_soundness():
+def test_backward_dot_general_lb_lb_vector_output_soundness(forward_mode):
     """Vector-output bilinear: y[i] = (W_i @ x) @ x for n_out output rows.
     Exercises backward CROWN through dot_general(LB, LB) with n_out > 1."""
     n_in, n_out = 3, 4
@@ -539,7 +562,7 @@ def test_backward_dot_general_lb_lb_vector_output_soundness():
         # For each row i, compute (W_i @ x) @ x — bilinear in x.
         return jax.vmap(lambda W: (W @ x) @ x)(Ws)
 
-    lb = linbp_backward(f)(ix)
+    lb = linbp_backward(f, forward_mode=forward_mode)(ix)
     assert lb.lA.shape == (n_out, n_in)
     assert lb.uA.shape == (n_out, n_in)
     xs = _sample_in_interval(ix, N_SAMPLES, jax.random.PRNGKey(6))

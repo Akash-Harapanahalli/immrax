@@ -203,7 +203,8 @@ class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
 
 def crown(
     f: Callable[..., jax.Array], out_len: int = None,
-    *, backward: bool = True, iterated: bool = True,
+    *, backward: bool = True, iterated: bool = False,
+    forward_mode: str = "linbp",
 ) -> Callable[..., CROWNResult]:
     """Backward CROWN by default (sign-conditioned slope at each ReLU).
 
@@ -211,9 +212,16 @@ def crown(
     Pass ``iterated=True`` for *pure* backward CROWN: at each ReLU the
     pre-activation l, u are re-derived by a backward CROWN pass to the input
     rather than using the forward-IBP-tightened values.
+
+    ``forward_mode`` selects the forward sweep used to populate pre-activation
+    ``l, u`` for the backward CROWN pass (ignored when ``backward=False``):
+      - ``'linbp'`` (default): linear-bound propagation + optional IBP tightening.
+      - ``'ibp'``: pure interval arithmetic. With ``iterated=False`` this is
+        textbook **IBP+CROWN**; with ``iterated=True`` it is standard **CROWN**.
     """
     if backward:
-        lb_fn = linbp_backward(f, relu_mode="adaptive", iterated_bw=iterated)
+        lb_fn = linbp_backward(f, relu_mode="adaptive", iterated_bw=iterated,
+                               forward_mode=forward_mode)
     else:
         lb_fn = linbp(f, relu_mode="adaptive")
 
@@ -245,12 +253,17 @@ class FastlinResult(namedtuple("FastlinResult", ["C", "ld", "ud"])):
 
 def fastlin(
     f: Callable[..., jax.Array], out_len: int = None,
-    *, backward: bool = True, iterated: bool = True,
+    *, backward: bool = True, iterated: bool = False,
+    forward_mode: str = "linbp",
 ) -> Callable[..., FastlinResult]:
     """Backward same-slope (FastLin) by default. ``iterated=True`` re-derives
-    pre-activation ``l, u`` via backward CROWN at each ReLU (pure backward)."""
+    pre-activation ``l, u`` via backward CROWN at each ReLU (pure backward).
+
+    ``forward_mode='ibp'`` switches the forward sweep to pure interval
+    arithmetic (textbook IBP+CROWN slope-picking)."""
     if backward:
-        lb_fn = linbp_backward(f, relu_mode="same-slope", iterated_bw=iterated)
+        lb_fn = linbp_backward(f, relu_mode="same-slope", iterated_bw=iterated,
+                               forward_mode=forward_mode)
     else:
         lb_fn = linbp(f, relu_mode="same-slope")
 
