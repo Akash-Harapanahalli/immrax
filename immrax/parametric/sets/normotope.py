@@ -8,14 +8,13 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
-from ...inclusion import Interval, interval, icentpert, i2centpert, mjacM
+from ...inclusion import Interval, interval, icentpert, i2centpert, mjacM, get_corners
 from ..parametope import Parametope
 from ..embedding import ParametricEmbedding
 from .polytope import Polytope
 from .ellipsoid import Ellipsoid
-from ...utils import get_rohn_corners, get_corners, get_sparse_corners
+from ...utils import get_sparse_corners
 
-from functools import partial
 from math import sqrt
 from itertools import product
 
@@ -125,12 +124,13 @@ class NormotopeEmbedding(ParametricEmbedding):
     ----------
     sys : System
         The system to embed.
-    gsc : Callable[[Interval], list], optional
-        Corner-selection strategy for the log-norm contraction bound. If ``None``
-        (default), resolved in :meth:`_initialize`: ``get_rohn_corners`` for an
-        :class:`L2Normotope` (exact), else :func:`get_sparse_corners`. Pass a
-        callable to override (e.g. :func:`get_corners`, since the sparse pattern
-        can't be built under ``jit``).
+    gsc : Callable[[Interval], Array], optional
+        Corner-selection strategy for the log-norm contraction bound: maps the
+        interval Jacobian ``[Mx]`` to a stacked ``(num_corners, n, n)`` array of
+        point matrices. If ``None`` (default), resolved in :meth:`_initialize` to
+        :func:`get_sparse_corners` built from the static sparsity pattern of
+        ``[Mx]`` (only the non-constant entries vary -> ``2**k`` corners). Pass a
+        callable to override (e.g. :func:`get_corners`).
     kappa : float, optional
         Strength of the soft ``y``-clamp toward an external box ``ix``. When
         ``ix`` is supplied to :meth:`_dynamics`, ``-kappa * relu(y - y_box)`` is
@@ -146,15 +146,13 @@ class NormotopeEmbedding(ParametricEmbedding):
     def _initialize(self, nt0: Normotope) -> ArrayLike:
         if not isinstance(nt0, Normotope):
             raise ValueError(f"{nt0=} is not a Normotope needed for NormotopeEmbedding")
-        # Resolve gsc once (rohn for L2, sparse otherwise); object.__setattr__
+        # Resolve gsc once: sparse corners of the interval Jacobian, built from its
+        # static sparsity pattern (which entries actually vary). object.__setattr__
         # because the static field is otherwise frozen. No aux state to evolve.
         if self.gsc is None:
-            if isinstance(nt0, L2Normotope):
-                gsc = partial(get_rohn_corners, sign="+")
-            else:
-                ix0 = nt0.iover()
-                M = mjacM(self.sys.f)(0.0, ix0, center=(jnp.zeros(1), nt0.ox))[1]
-                gsc = get_sparse_corners(interval(M))
+            ix0 = nt0.iover()
+            M = mjacM(self.sys.f)(0.0, ix0, center=(jnp.zeros(1), nt0.ox))[1]
+            gsc = get_sparse_corners(interval(M))
             object.__setattr__(self, "gsc", gsc)
         return None
 
@@ -196,10 +194,17 @@ class NormotopeEmbedding(ParametricEmbedding):
         MM = mjacM(self.sys.f)(
             t, box, center=(jnp.zeros(1), nt.ox), permutation=perm
         )
-        Mx = MM[1]
+        Mx = interval(MM[1])
 
-        mus = [nt.mu(H_dot @ Hp + H @ M @ Hp) for M in self.gsc(interval(Mx))]
-        c = jnp.max(jnp.asarray(mus))
+        # Exact contraction bound: corner the interval Jacobian [Mx] itself with
+        # sparse corners (point matrices Mi), then form H_dot @ Hp + H @ Mi @ Hp as
+        # an *exact* product (no interval matrix-product wrapping). Since
+        # mu(H_dot Hp + H M Hp) is convex and affine in M and Mx = conv(corners),
+        # the max over corners is the exact sup over [Mx] -- the tightest bound.
+        # gsc returns a stacked (num_corners, n, n) array; vmap mu over the corners.
+        Ms = self.gsc(Mx)
+        mus = jax.vmap(lambda Mi: nt.mu(H_dot @ Hp + H @ Mi @ Hp))(Ms)
+        c = jnp.max(mus)
         y_dot = c * y
 
         # Soft clamp of y toward the tightened box (see kappa). The box corners

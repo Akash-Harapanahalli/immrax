@@ -2,6 +2,7 @@ import abc
 from functools import partial
 from typing import Any, Callable, Literal, Union
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Float, Integer, Bool, Array
@@ -82,8 +83,8 @@ class InclusionEmbedding(EmbeddingSystem):
     """
 
     sys: System
-    F: Callable[..., Interval]
-    Fi: Callable[..., Interval]
+    F: Callable[..., Interval] = eqx.field(static=True)
+    Fi: Callable[..., Interval] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -99,8 +100,16 @@ class InclusionEmbedding(EmbeddingSystem):
         """
         self.sys = sys
         self.F = F
+        self.Fi = Fi
         self.evolution = sys.evolution
         self.xlen = sys.xlen * 2
+
+    def _inclusion(self) -> Callable[..., Interval]:
+        """The ``(t, x_interval, *args) -> Interval`` inclusion function for the
+        dynamics. Subclasses that build it from a transform derive it from
+        ``self.sys`` here so nothing freezes a captured copy of the system in a
+        static field (which would desync under jit/vmap/grad of ``self.sys``)."""
+        return self.F
 
     def E(
         self,
@@ -110,15 +119,15 @@ class InclusionEmbedding(EmbeddingSystem):
         refine: Callable[[Interval], Interval] | None = None,
         **kwargs,
     ) -> jax.Array:
+        F = self._inclusion()
         t = interval(t)
-        # jax.debug.print("isnan: {0}", jnp.isnan(x).any())
 
         if refine is not None:
             convert = lambda x: refine(ut2i(x))
-            Fkwargs = lambda t, x, *args: self.F(t, refine(x), *args, **kwargs)
+            Fkwargs = lambda t, x, *args: F(t, refine(x), *args, **kwargs)
         else:
             convert = ut2i
-            Fkwargs = partial(self.F, **kwargs)
+            Fkwargs = partial(F, **kwargs)
 
         x_int = convert(x)
         # jax.debug.print(
@@ -151,7 +160,7 @@ class InclusionEmbedding(EmbeddingSystem):
 
         elif self.evolution == "discrete":
             # Convert x from ut to i, compute through F, convert back to ut.
-            return i2ut(self.F(interval(t), x_int, *args, **kwargs))
+            return i2ut(F(interval(t), x_int, *args, **kwargs))
         else:
             raise Exception("evolution needs to be 'continuous' or 'discrete'")
 
@@ -244,23 +253,35 @@ def get_faces(ix: Interval) -> tuple[Interval, Interval]:
 
 
 class TransformEmbedding(InclusionEmbedding):
-    def __init__(self, sys: System, if_transform=natif) -> None:
-        """Initialize an EmbeddingSystem using a System and an inclusion function transform.
+    """Embeds a System by applying an inclusion-function transform (``natif``,
+    ``jacif``, ``mjacif``) to its dynamics.
 
+    The transform itself is parameter-free and held statically; the inclusion
+    function is rebuilt from ``self.sys.f`` on each use (see :meth:`_inclusion`),
+    so the embedding stays consistent under jit/vmap/grad of ``self.sys`` instead
+    of freezing a captured copy of the system in a static field.
+    """
+
+    if_transform: Callable = eqx.field(static=True)
+
+    def __init__(self, sys: System, if_transform=natif) -> None:
+        """
         Parameters
         ----------
         sys : System
-            _description_
+            System to embed.
         if_transform : IFTransform
-            _description_. Defaults to natif.
-
-        Returns
-        -------
-
+            Inclusion-function transform to apply to ``sys.f``. Defaults to ``natif``.
         """
-        F = if_transform(sys.f)
-        # Fi = [if_transform(sys.fi[i]) for i in range(sys.xlen)]
-        super().__init__(sys, F)
+        self.sys = sys
+        self.if_transform = if_transform
+        self.F = None
+        self.Fi = None
+        self.evolution = sys.evolution
+        self.xlen = sys.xlen * 2
+
+    def _inclusion(self) -> Callable[..., Interval]:
+        return self.if_transform(self.sys.f)
 
 
 def natemb(sys: System):

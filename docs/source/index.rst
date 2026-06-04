@@ -10,6 +10,7 @@ Inclusion function transformations are composable with existing JAX transformati
    :caption: Contents:
 
    gettingstarted
+   walkthrough
    examples
    api
 

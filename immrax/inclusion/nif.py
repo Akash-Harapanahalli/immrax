@@ -1,5 +1,5 @@
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import equinox as eqx
 import jax
@@ -28,6 +28,7 @@ from immrax.inclusion.interval import (
     widen,
     _get_rigorous,
     _set_rigorous,
+    _resolve_rigorous,
 )
 from functools import partial
 
@@ -40,7 +41,7 @@ inclusion_registry = {}
 
 def natif(
     f: Callable[..., jax.Array],
-    rigorous: bool = True,
+    rigorous: Optional[bool] = None,
 ) -> Callable[..., Interval]:
     """Creates a Natural Inclusion Function of f.
 
@@ -52,12 +53,13 @@ def natif(
     ----------
     f : Callable[..., jax.Array]
         Function to construct Natural Inclusion Function from.
-    rigorous : bool
-        When ``True`` (default), every inclusion-registry handler whose
-        ``.n_ulps`` attribute is > 0 will have its output widened by
-        that many ULPs, ensuring that computed interval bounds
-        rigorously enclose the true mathematical result despite
-        floating-point rounding.
+    rigorous : bool, optional
+        Whether to widen each inclusion-registry handler's output by its
+        ``.n_ulps`` so the computed bounds rigorously enclose the true
+        mathematical result despite floating-point rounding. ``None`` (the
+        default) resolves in order of precedence: explicit kwarg, then any
+        active :class:`rigorous`/:class:`non_rigorous` context manager, then the
+        global default set by :func:`set_rigorous` (itself ``False`` by default).
 
     Returns
     -------
@@ -127,9 +129,10 @@ def natif_jaxpr(
     jaxpr: Jaxpr,
     consts,
     *args,
-    rigorous: bool = True,
+    rigorous: Optional[bool] = None,
     propagate_source_info: bool = True,
 ) -> list[Any]:
+    rigorous = _resolve_rigorous(rigorous)
     old_rigorous = _set_rigorous(rigorous)
 
     def read(v: Atom) -> Any:

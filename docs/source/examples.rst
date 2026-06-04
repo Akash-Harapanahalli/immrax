@@ -1,9 +1,16 @@
 .. _examples:
+
 Examples
 ========
 
-.. toctree::
-   :maxdepth: 1
+Worked examples, organized by the ``examples/`` folder hierarchy. Each notebook
+is paired (via `jupytext <https://jupytext.readthedocs.io>`_) with a runnable
+``.py`` script of the same name in its folder.
 
-   examples/vehicle/vehicle
-   examples/pendulum/pendulum
+.. toctree::
+   :maxdepth: 2
+
+   examples_arch
+   examples_ilqr
+   examples_aux
+   examples_standalone

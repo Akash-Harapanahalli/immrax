@@ -251,11 +251,38 @@ def get_corner(M: Interval, c: Corner):
 
 
 def get_corners(M: Interval, cs: Tuple[Corner] | None = None):
-    """Gets the corners of the interval M specified by the Corners cs. Defaults to all corners if None."""
+    """Gets the corners of the interval ``M`` as a stacked ``(num_corners, *M.shape)``
+    array. Each corner independently selects the lower (``0``) or upper (``1``) bound
+    of *every* entry, so the default (``cs=None``) returns all ``2**M.size`` corners.
+
+    This is the dense counterpart of :func:`~immrax.utils.get_sparse_corners`, which
+    varies only the non-constant entries -- ``get_corners`` is the same without the
+    sparsity. Fully vectorized via bit extraction (cf. :func:`~immrax.utils.get_rohn_corners`).
+
+    Parameters
+    ----------
+    M : Interval
+        Interval whose corners to enumerate.
+    cs : Tuple[Corner], optional
+        Specific corners to select; defaults to all ``2**M.size`` corners.
+
+    Returns
+    -------
+    Array
+        Stacked ``(num_corners, *M.shape)`` array of corner points.
+    """
+    sh = M.shape
+    n = M.size
+    lo = M.lower.reshape(-1)
+    up = M.upper.reshape(-1)
     if cs is None:
-        cs = all_corners(M.size)
-    return [get_corner(M, c) for c in cs]
-    # return [(Mc := get_corner(M, c)) for c in cs if not jnp.allclose(Mc, 0)]
+        # All 2**n corners via bit extraction (n = M.size is static): bit j of
+        # corner i selects upper (1) / lower (0) for entry j.
+        codes = np.arange(2**n)
+        bits = jnp.asarray((codes[:, None] >> np.arange(n)) & 1)  # (2**n, n)
+    else:
+        bits = jnp.asarray([list(c) for c in cs])  # (num, n)
+    return jnp.where(bits == 1, up, lo).reshape((bits.shape[0], *sh))
 
 
 def mjacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable:

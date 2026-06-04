@@ -8,10 +8,10 @@ from jax._src.util import wraps
 import jax.numpy as jnp
 import numpy as onp
 
-from immrax.inclusion import interval, Corner, Interval, all_corners, i2lu, i2ut, ut2i
+from immrax.inclusion import interval, Corner, Interval, i2lu, i2ut, ut2i
+from immrax.inclusion import get_corners as get_corners  # re-export: corner-utility family
 from immrax.system import Trajectory
 
-from itertools import product
 from functools import partial
 
 # ================================================================================
@@ -297,74 +297,57 @@ def set_columns_from_corner(corner: Corner, A: Interval):
     return _Jx, J_x
 
 
-def get_corners(x: Interval, corners: Tuple[Corner] | None = None):
-    """Gets the specified corners of the interval x. Returns all corners if None."""
-    corners = all_corners(len(x)) if corners is None else corners
-    xut = i2ut(x)
-    return jnp.array(
-        [
-            jnp.array([x.lower[i] if c[i] == 0 else x.upper[i] for i in range(len(x))])
-            for c in corners
-        ]
-    )
-
-
 def get_sparse_corners(x: Interval, verbose=False, **kwargs):
-    """Returns a function returning the sparse corners of the interval
+    """Returns a function returning the sparse corners of the interval.
+
+    Only the entries that are non-constant in the template ``x`` are varied, so an
+    interval with ``k`` non-constant entries yields ``2**k`` corners. The sparsity
+    pattern is detected once from the (static) template; the returned ``gsc`` is
+    fully vectorized over the ``2**k`` corners via the same bit-extraction trick as
+    :func:`get_rohn_corners` -- no Python-level loop over corners or entries.
 
     Parameters
     ----------
     x : Interval
-        Interval object to model the gsc off of---value of x should be static
+        Template interval used to find the sparsity pattern---its bounds must be
+        static (``onp.isclose`` cannot run under ``jit``).
+    verbose : bool
+        Print the corner / non-constant-entry counts.
     **kwargs : dict
-        Additional keyword arguments to pass to jnp.isclose
+        Additional keyword arguments forwarded to ``numpy.isclose``.
 
     Returns
     -------
-    function
-        A function that takes an Interval object and returns the sparse corners based on
-        the entries that are not constant in the test x
+    Callable[[Interval], Array]
+        ``gsc(x)`` returning a stacked ``(2**k, *x.shape)`` array of corner points.
     """
     sh = x.shape
+    n = int(onp.prod(sh)) if sh else 1
 
-    # Static value usage here.
-    ic = onp.isclose(x.lower.reshape(-1), x.upper.reshape(-1), **kwargs)
-    cs = [
-        Corner(p) for p in product(*[(0,) if ic[i] else (0, 1) for i in range(len(ic))])
-    ]
+    # Static: positions of the non-constant (free) entries.
+    free = ~onp.isclose(
+        onp.asarray(x.lower).reshape(-1), onp.asarray(x.upper).reshape(-1), **kwargs
+    )
+    free_idx = jnp.asarray(onp.nonzero(free)[0])  # (k,)
+    k = int(free.sum())
     if verbose:
-        print(
-            f"Found {len(cs)} corners, from {jnp.sum(jnp.logical_not(ic))} nonconstant entries."
-        )
+        print(f"Found {2**k} corners, from {k} nonconstant entries.")
+
+    # Static (2**k, k) bit table: bit j of corner i selects upper (1) / lower (0).
+    codes = onp.arange(2**k)
+    bits = jnp.asarray((codes[:, None] >> onp.arange(k)) & 1)  # (2**k, k)
 
     @jax.jit
     def gsc(x: Interval):
-        x = x.reshape(-1)
-        return [
-            jnp.array(
-                [x.lower[i] if ci == 0 else x.upper[i] for i, ci in enumerate(c)]
-            ).reshape(sh)
-            for c in cs
-        ]
+        lo = x.lower.reshape(-1)
+        up = x.upper.reshape(-1)
+        # Every corner starts at the lower bound (constant entries stay fixed),
+        # then the free entries are overwritten with upper where the bit is set.
+        corners = jnp.broadcast_to(lo, (2**k, n))  # (2**k, n)
+        free_vals = jnp.where(bits == 1, up[free_idx], lo[free_idx])  # (2**k, k)
+        return corners.at[:, free_idx].set(free_vals).reshape((2**k, *sh))
 
     return gsc
-
-@api_boundary
-@partial(jax.jit, static_argnums=(1,))
-def get_rohn_corners (A: Interval, sign: Literal['+', '-'] = '+') :
-    """Gets the 2^n corners of [A] which upper or lower bound x^T A x depending on the chosen sign (+/-)"""
-    if A.shape[0] != A.shape[1] or len(A.shape) != 2 :
-        raise Exception(f'A should be a square matrix, got {A.shape}')
-    n = A.shape[0]
-    Ac = A.center
-    Ap = A.pert
-
-    if sign == '+' :
-        return jnp.asarray([Ac + jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s)) for s in product(*[[-1, +1] for i in range(n)])])
-    elif sign == '-' :
-        return jnp.asarray([Ac - jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s)) for s in product(*[[-1, +1] for i in range(n)])])
-    else :
-        raise Exception("pm should be '+' or '-'.")
 
 
 @api_boundary

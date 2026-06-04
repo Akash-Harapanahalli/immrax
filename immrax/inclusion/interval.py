@@ -43,7 +43,7 @@ def set_rigorous(val: bool) -> None:
     Parameters
     ----------
     val : bool
-        ``True`` to enable widening (the default), ``False`` to disable.
+        ``True`` to enable widening, ``False`` to disable (the default).
     """
     global _rigorous
     _rigorous = val

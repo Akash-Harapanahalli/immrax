@@ -27,7 +27,10 @@ extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = []
+exclude_patterns = [
+    "**/README.md",  # repo READMEs, not doc pages
+    "examples/auxillary_vars/platoon.ipynb",  # marked non-functional in the notebook
+]
 
 autoclass_content = "both"
 

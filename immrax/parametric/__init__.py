@@ -30,6 +30,14 @@ from .sets.normotope import (
     NormotopeEmbedding,
 )
 
+from .sets.polynomial_normotope import (
+    PolynomialNormotope,
+    L2PolynomialNormotope,
+    L1PolynomialNormotope,
+    LinfPolynomialNormotope,
+    PolynomialNormotopeEmbedding,
+)
+
 from .reach_ilqr import (
     ReachiLQR,
     IterateResult,
@@ -54,6 +62,11 @@ __all__ = [
     "L1Normotope",
     "L2Normotope",
     "NormotopeEmbedding",
+    "PolynomialNormotope",
+    "L2PolynomialNormotope",
+    "L1PolynomialNormotope",
+    "LinfPolynomialNormotope",
+    "PolynomialNormotopeEmbedding",
     "ReachiLQR",
     "IterateResult",
     "RunResult",

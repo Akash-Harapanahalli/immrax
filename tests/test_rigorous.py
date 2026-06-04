@@ -81,21 +81,25 @@ class TestWiden:
 class TestRigorousKwarg:
     """Test that natif(f, rigorous=...) controls widening."""
 
-    def test_rigorous_default_true(self):
-        """natif should be rigorous by default."""
+    def test_rigorous_default_follows_global(self):
+        """natif's default (rigorous=None) resolves to the global flag, which is
+        False by default: the default matches rigorous=False, and an explicit
+        rigorous=True widens."""
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
 
         def f(a):
             return a + a
 
-        rigorous = natif(f)(x)
+        default = natif(f)(x)
         non_rigorous = natif(f, rigorous=False)(x)
+        explicit = natif(f, rigorous=True)(x)
 
-        # Default (rigorous=True) should produce wider bounds
-        assert jnp.all(rigorous.lower <= non_rigorous.lower)
-        assert jnp.all(rigorous.upper >= non_rigorous.upper)
-        assert jnp.any(rigorous.lower < non_rigorous.lower)
-        assert jnp.any(rigorous.upper > non_rigorous.upper)
+        # Default == non-rigorous (the global default is False)
+        assert jnp.all(default.lower == non_rigorous.lower)
+        assert jnp.all(default.upper == non_rigorous.upper)
+        # Explicit rigorous=True still widens
+        assert jnp.any(explicit.lower < non_rigorous.lower)
+        assert jnp.any(explicit.upper > non_rigorous.upper)
 
     def test_rigorous_widens_add(self):
         """natif(f, rigorous=True) should produce wider bounds than rigorous=False for addition."""
@@ -121,7 +125,7 @@ class TestRigorousKwarg:
             return a * a
 
         normal = natif(f, rigorous=False)(x)
-        rigorous = natif(f)(x)
+        rigorous = natif(f, rigorous=True)(x)
 
         assert jnp.all(rigorous.lower <= normal.lower)
         assert jnp.all(rigorous.upper >= normal.upper)
@@ -131,7 +135,7 @@ class TestRigorousKwarg:
         x = icentpert(jnp.array([1.0, 2.0]), 0.1)
 
         normal = natif(jnp.sin, rigorous=False)(x)
-        rigorous = natif(jnp.sin)(x)
+        rigorous = natif(jnp.sin, rigorous=True)(x)
 
         assert jnp.all(rigorous.lower <= normal.lower)
         assert jnp.all(rigorous.upper >= normal.upper)
@@ -157,9 +161,9 @@ class TestRigorousKwarg:
             return -a
 
         normal = natif(f, rigorous=False)(x)
-        rigorous = natif(f)(x)
+        rigorous = natif(f, rigorous=True)(x)
 
-        # neg has n_ulps=0, so bounds should be identical
+        # neg has n_ulps=0, so bounds should be identical even when rigorous
         assert jnp.allclose(rigorous.lower, normal.lower)
         assert jnp.allclose(rigorous.upper, normal.upper)
 
