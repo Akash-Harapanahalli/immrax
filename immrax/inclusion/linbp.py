@@ -1665,7 +1665,7 @@ def _bw_dot_general(eqn, out_bd, env, **_):
         var = v0
         var_shape = var.aval.shape
         primal = lambda x: lax.dot_general(x, W, dim_nums)
-    dummy = jnp.zeros(var_shape, dtype=jnp.result_type(jnp.float32))
+    dummy = jnp.zeros(var_shape, dtype=out_bd.A_lo.dtype)
 
     def transpose_one(cov):
         (tr,) = jax.linear_transpose(primal, dummy)(cov)
@@ -1892,7 +1892,7 @@ def _bw_structural(eqn, out_bd, env, **_):
         full = list(fixed)
         full[var_idx] = x
         return eqn.primitive.bind(*subfuns, *full, **bind_params)
-    dummy = jnp.zeros(var_shape, dtype=jnp.float32)
+    dummy = jnp.zeros(var_shape, dtype=out_bd.A_lo.dtype)
 
     def transpose_one(cov):
         (tr,) = jax.linear_transpose(primal, dummy)(cov)
@@ -2081,8 +2081,8 @@ def _bw_scatter(eqn, out_bd, env, **_):
 
     op_shape = operand_var.aval.shape
     up_shape = updates_var.aval.shape
-    op_dummy = jnp.zeros(op_shape, dtype=jnp.float32)
-    up_dummy = jnp.zeros(up_shape, dtype=jnp.float32)
+    op_dummy = jnp.zeros(op_shape, dtype=out_bd.A_lo.dtype)
+    up_dummy = jnp.zeros(up_shape, dtype=out_bd.A_lo.dtype)
 
     T = jax.linear_transpose(primal, op_dummy, up_dummy)
 
@@ -2466,6 +2466,56 @@ def _bw_cos(eqn, out_bd, env, **_):
     return [_bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)]
 
 
+def _bw_intpow_apply(out_bd, l, u, n):
+    """Backward through x^n: single-slope relaxation matching _linbp_integer_pow_p."""
+    if n == 0:
+        return _bw_monotone_positive_slope(out_bd, jnp.zeros_like(l), jnp.ones_like(l), jnp.ones_like(l))
+    if n == 1:
+        return _bw_monotone_positive_slope(out_bd, jnp.ones_like(l), jnp.zeros_like(l), jnp.zeros_like(l))
+    pow_l = l ** n
+    pow_u = u ** n
+    if n < 0:
+        f_l = jnp.minimum(pow_l, pow_u)
+        f_u = jnp.maximum(pow_l, pow_u)
+        return _bw_monotone_positive_slope(out_bd, jnp.zeros_like(l), f_l, f_u)
+    degenerate = jnp.abs(u - l) < _degenerate_threshold(l)
+    safe_denom = jnp.where(degenerate, 1.0, u - l)
+    alpha = jnp.where(
+        degenerate,
+        jnp.array(n, dtype=l.dtype) * l ** (n - 1),
+        (pow_u - pow_l) / safe_denom,
+    )
+    chord_beta = pow_l - alpha * l
+    if n % 2 == 0:
+        safe_alpha_n = alpha / n
+        x0 = jnp.sign(safe_alpha_n) * jnp.abs(safe_alpha_n) ** (1.0 / (n - 1))
+        beta_l_crit = x0 ** n - alpha * x0
+        in_range = (l <= x0) & (x0 <= u)
+        beta_u = chord_beta
+        beta_l = jnp.where(in_range, beta_l_crit, chord_beta)
+    else:
+        safe_alpha_n = jnp.maximum(alpha / n, 0.0)
+        x_upper = safe_alpha_n ** (1.0 / (n - 1))
+        f_x_upper = x_upper ** n
+        beta_at_x_lower = -f_x_upper + alpha * x_upper
+        beta_at_x_upper = f_x_upper - alpha * x_upper
+        beta_u = jnp.where(-x_upper >= l, beta_at_x_lower, chord_beta)
+        beta_l = jnp.where(x_upper <= u, beta_at_x_upper, chord_beta)
+    return _bw_monotone_positive_slope(out_bd, alpha, beta_l, beta_u)
+
+
+def _bw_integer_pow(eqn, out_bd, env, **_):
+    (var,) = eqn.invars
+    lb_in = env[var]
+    return [_bw_intpow_apply(out_bd, lb_in.l, lb_in.u, int(eqn.params["y"]))]
+
+
+def _bw_square(eqn, out_bd, env, **_):
+    (var,) = eqn.invars
+    lb_in = env[var]
+    return [_bw_intpow_apply(out_bd, lb_in.l, lb_in.u, 2)]
+
+
 backward_registry[lax.logistic_p] = _bw_logistic
 backward_registry[lax.tanh_p] = _bw_tanh
 backward_registry[lax.exp_p] = _bw_exp
@@ -2473,6 +2523,9 @@ backward_registry[lax.log1p_p] = _bw_log1p
 backward_registry[lax.sqrt_p] = _bw_sqrt
 backward_registry[lax.sin_p] = _bw_sin
 backward_registry[lax.cos_p] = _bw_cos
+backward_registry[lax.integer_pow_p] = _bw_integer_pow
+backward_registry[lax.square_p] = _bw_square
+backward_registry[lax.reduce_sum_p] = _bw_structural  # linear: transpose = broadcast
 
 
 def _inner_forward(forward_mode, inner_jaxpr, inner_consts, *args, relu_mode):
