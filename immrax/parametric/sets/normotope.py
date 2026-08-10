@@ -160,7 +160,9 @@ class NormotopeEmbedding(ParametricEmbedding):
         # The control is added to H_dot (the shaping-matrix derivative).
         return nt0.alpha.shape
 
-    def _dynamics(self, t, state, *args, U=None, perm=None, adjoint=True, ix=None):
+    def _dynamics(
+        self, t, state, *args, U=None, perm=None, adjoint=True, ix=None, alpha_dot=None
+    ):
         r"""Normotope embedding dynamics.
 
         Parameters
@@ -170,6 +172,9 @@ class NormotopeEmbedding(ParametricEmbedding):
             mixed-Jacobian evaluation; tighter ``ix`` only reduces conservatism.
             Defaults to ``None`` (plain ``nt.iover()``). With ``kappa > 0`` it
             also enables the soft ``y``-clamp (see ``kappa``).
+        alpha_dot : ArrayLike, optional
+            Externally supplied ``H_dot`` (e.g. the discrete rate from
+            :meth:`_symplectic_step`); replaces the continuous ``-H A + U``.
         """
         nt, aux = state
         Ut = U.reshape(nt.alpha.shape) if U is not None else jnp.zeros_like(nt.alpha)
@@ -178,11 +183,12 @@ class NormotopeEmbedding(ParametricEmbedding):
         Hp = nt.alpha_inv
         y = nt.y
 
-        # Derived at call time (not frozen in __init__) so vmap/jit over the
-        # system's parameters thread through.
-        A = jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
-
-        if adjoint:
+        if alpha_dot is not None:
+            H_dot = alpha_dot
+        elif adjoint:
+            # Derived at call time (not frozen in __init__) so vmap/jit over the
+            # system's parameters thread through.
+            A = jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
             H_dot = -H @ A + Ut
         else:
             H_dot = Ut
@@ -216,6 +222,26 @@ class NormotopeEmbedding(ParametricEmbedding):
             y_dot = y_dot - self.kappa * jnp.maximum(y - y_box, 0.0)
 
         return nt.__class__(self.sys.f(0.0, nt.ox), H_dot, y_dot), None
+
+    def _symplectic_step(
+        self, t, dt, state, *args, U=None, perm=None, adjoint=True, ix=None
+    ):
+        nt, _aux = state
+        H, ox, y = nt.alpha, nt.ox, nt.y
+        Ut = U.reshape(H.shape) if U is not None else jnp.zeros_like(H)
+        if adjoint:
+            A = jax.jacfwd(self.sys.f, 1)(0.0, ox)
+            B = jnp.eye(A.shape[0], dtype=H.dtype) + dt * A
+            # H_next (I + dt A) = H + dt Ut: exact discrete adjoint of the Euler
+            # state map. (Exact alpha_inv update when U=0: (I + dt A) @ alpha_inv.)
+            H_next = jnp.linalg.solve(B.T, (H + dt * Ut).T).T
+        else:
+            H_next = H + dt * Ut
+        alpha_dot = (H_next - H) / dt
+        nt_dot, _ = self._dynamics(
+            t, state, *args, U=U, perm=perm, adjoint=adjoint, ix=ix, alpha_dot=alpha_dot
+        )
+        return nt.__class__(ox + dt * nt_dot.ox, H_next, y + dt * nt_dot.y), None
 
 
 @register_pytree_node_class

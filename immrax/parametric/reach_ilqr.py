@@ -1,11 +1,11 @@
 """Iterative LQR / DDP for norm-based reachable-set synthesis over a ParametricEmbedding.
 
 :class:`ReachiLQR` operates on any :class:`ParametricEmbedding`, drives both the
-forward state sweep and backward costate sweep with a fixed-step Euler
-``jax.lax.scan`` (the backward pass integrates the costate and emits per-step
-gains in one fused scan), supports iLQR (Gauss-Newton) and DDP (full
-second-order) modes, and threads R as a runtime argument so the outer R-schedule
-does not recompile. The backward sweep linearizes at the perturbed trajectory
+forward state sweep and backward costate sweep with a fixed-step ``jax.lax.scan``
+(explicit Euler or the embedding's semi-implicit ``_symplectic_step``; the
+backward pass integrates the costate and emits per-step gains in one fused
+scan), supports iLQR (Gauss-Newton) and DDP (full second-order) modes, and
+threads R as a runtime argument so the outer R-schedule does not recompile. The backward sweep linearizes at the perturbed trajectory
 (next iteration's nominal) under the nominal control.
 """
 
@@ -37,6 +37,10 @@ class IterateResult(NamedTuple):
     # each grid point (an Interval of shape (N+1, n)); passes through unchanged
     # when track_iover=False.
     iover: Interval
+    # t0 costate s(0) = d(terminal_cost)/dx0 propagated along the trajectory under
+    # the current control. Enables a free-initial-state gradient step on x0
+    # (x0 <- x0 - beta * (costate0 + grad_initial_cost(x0))) by the caller.
+    costate0: Array
 
 
 class RunResult(NamedTuple):
@@ -111,7 +115,13 @@ class ReachiLQR:
     DDP
         If True, include second-order ``s' @ fxx`` terms (DDP); else iLQR.
     solver
-        Only ``"euler"`` is supported; the fused fixed-step scan requires it.
+        ``"symplectic"`` (default) or ``"euler"``. Symplectic rolls the forward
+        sweep with ``embedding._symplectic_step`` (semi-implicit adjoint step)
+        and linearizes the backward sweep at the discrete-equivalent rate
+        ``(step(x, U) - x) / dt``, so the gains match the map the rollout
+        actually follows. Requires the embedding to implement
+        ``_symplectic_step``; pass ``solver="euler"`` for embeddings without one
+        (e.g. GramNormotopeEmbedding).
     dt
         Retained for API compatibility; the scan uses ``dt_ctl``.
     """
@@ -127,15 +137,24 @@ class ReachiLQR:
         N: int,
         *,
         DDP: bool = False,
-        solver: str = "euler",
+        solver: str = "symplectic",
         dt: float = 0.01,
         track_iover: bool = True,
         f_kwargs: immutabledict = immutabledict({}),
     ):
-        if solver != "euler":
+        if solver not in ("euler", "symplectic"):
             raise NotImplementedError(
-                f"ReachiLQR only supports solver='euler' (got {solver!r}); the "
-                "fused fixed-step scan requires a fixed Euler step."
+                f"ReachiLQR only supports solver='euler' or 'symplectic' (got "
+                f"{solver!r}); the fused fixed-step scan requires a fixed step."
+            )
+        if (
+            solver == "symplectic"
+            and type(embedding)._symplectic_step
+            is ParametricEmbedding._symplectic_step
+        ):
+            raise NotImplementedError(
+                f"{type(embedding).__name__} does not implement _symplectic_step; "
+                "use solver='euler'."
             )
         self.embedding = embedding
         self.terminal_cost = terminal_cost
@@ -194,6 +213,17 @@ class ReachiLQR:
         dpt_daux = self.embedding._dynamics(t, (pt, aux), U=U, **kw)
         return self._flatten(dpt_daux)
 
+    def _step_flat(self, t: Float, x_flat: Array, U_flat: Array, ix=None) -> Array:
+        """Flat-vector wrapper around ``embedding._symplectic_step`` with
+        ``dt = dt_ctl``: the discrete map ``x_k -> x_{k+1}``."""
+        pt, aux = self._unflatten(x_flat)
+        U = U_flat.reshape(self.hypercontrol_shape)
+        kw = dict(self.f_kwargs)
+        if ix is not None:
+            kw["ix"] = ix
+        nxt = self.embedding._symplectic_step(t, self.dt_ctl, (pt, aux), U=U, **kw)
+        return self._flatten(nxt)
+
     def _iover_box(self, x_flat: Array) -> Interval:
         """Interval hull of the reachable set from a flat ``(pt, aux)`` state.
 
@@ -224,6 +254,7 @@ class ReachiLQR:
         gamma: Float,
         Jmax: Float,
         iover_in: Interval,
+        x0_flat: Array,
     ) -> IterateResult:
         Xlen = self.Xlen
         Ulen = self.Ulen
@@ -242,7 +273,9 @@ class ReachiLQR:
                 & jnp.all(jnp.isfinite(y_flat))
             )
 
-        # ---- forward sweep: fixed-step Euler scan, dt == dt_ctl ----
+        # ---- forward sweep: fixed-step scan, dt == dt_ctl ----
+        symplectic = self.solver == "symplectic"
+
         def forward_step(y_flat, k):
             t = self.ts_grid[k]
             idx = jnp.minimum(k, N - 1)
@@ -252,17 +285,28 @@ class ReachiLQR:
             ix_k = iover_in[k] if track else None
             # lax.cond (not where) skips both dynamics evals once the set blows up;
             # most steps are dead on early iterations, which is the runtime win.
-            deriv = jax.lax.cond(
-                alive_fn(y_flat),
-                lambda: self._join(
-                    self._f_flat(t, x_pert, U_pert, ix_k),
-                    self._f_flat(t, x_nom, U_nom, ix_k),
-                ),
-                lambda: jnp.zeros_like(y_flat),
-            )
-            return y_flat + dt * deriv, y_flat
+            if symplectic:
+                y_next = jax.lax.cond(
+                    alive_fn(y_flat),
+                    lambda: self._join(
+                        self._step_flat(t, x_pert, U_pert, ix_k),
+                        self._step_flat(t, x_nom, U_nom, ix_k),
+                    ),
+                    lambda: y_flat,
+                )
+            else:
+                deriv = jax.lax.cond(
+                    alive_fn(y_flat),
+                    lambda: self._join(
+                        self._f_flat(t, x_pert, U_pert, ix_k),
+                        self._f_flat(t, x_nom, U_nom, ix_k),
+                    ),
+                    lambda: jnp.zeros_like(y_flat),
+                )
+                y_next = y_flat + dt * deriv
+            return y_next, y_flat
 
-        y0 = self._join(self.x0_flat, self.x0_flat)
+        y0 = self._join(x0_flat, x0_flat)
         y_last, ys_part = jax.lax.scan(forward_step, y0, jnp.arange(N))
         sol_ys = jnp.concatenate([ys_part, y_last[None]], axis=0)  # (N+1, 2*Xlen)
 
@@ -317,7 +361,12 @@ class ReachiLQR:
 
             # No intersection box here: the gains must match the dynamics the
             # rollout actually follows, not the tightened forward contraction.
-            f_flat_bwd = lambda t_, x_, u_: self._f_flat(t_, x_, u_)
+            # Symplectic: linearize the discrete-equivalent rate (step(x,U) - x)/dt,
+            # so fx/fu (and DDP terms) are exact for the map the rollout follows.
+            if symplectic:
+                f_flat_bwd = lambda t_, x_, u_: (self._step_flat(t_, x_, u_) - x_) / dt
+            else:
+                f_flat_bwd = lambda t_, x_, u_: self._f_flat(t_, x_, u_)
 
             # lax.cond skips the expensive fx/fu Jacobians on masked steps (past
             # ifinal); most of the horizon is masked early on.
@@ -366,7 +415,9 @@ class ReachiLQR:
                 i - 1,
             ), (jnp.nan_to_num(l_i), jnp.nan_to_num(K_i))
 
-        (_, _, _, _), (l_new, K_new) = jax.lax.scan(
+        # The final reverse-scan carry's costate is s(0) = d(terminal_cost)/dx0
+        # propagated to t0 (used for a free-initial-state update by the caller).
+        (_, costate0, _, _), (l_new, K_new) = jax.lax.scan(
             backward_step, (sig_T, s_T, S_T, N), Us, length=N, reverse=True
         )
 
@@ -382,6 +433,7 @@ class ReachiLQR:
             Us_new=Us_new,
             cost_final=cost_final,
             iover=iover_out,
+            costate0=costate0,
         )
 
     # --------------------------------------------------------- public surface
@@ -430,6 +482,7 @@ class ReachiLQR:
         gamma: Float = 1.0,
         Jmax: Float = jnp.inf,
         iover: Interval | None = None,
+        x0: Array | None = None,
     ) -> IterateResult:
         """Run one outer iLQR/DDP iteration.
 
@@ -437,9 +490,16 @@ class ReachiLQR:
         (from the returned :class:`IterateResult`) to accumulate the running
         cross-iteration intersection box; if omitted, the box is (re)initialized
         to ``[-inf, +inf]``.
+
+        ``x0`` (flat ``(pt, aux)`` state) overrides the initial condition for the
+        forward sweep; defaults to the fixed ``pt0`` from construction. Pass the
+        running value to co-optimize the initial set via a free-initial-state step
+        using the returned :attr:`IterateResult.costate0`.
         """
         if iover is None:
             iover = self.initial_iover()
+        if x0 is None:
+            x0 = self.x0_flat
         return self._iterate_jit(
             Us,
             l_traj,
@@ -448,6 +508,7 @@ class ReachiLQR:
             jnp.asarray(gamma),
             jnp.asarray(Jmax),
             iover,
+            x0,
         )
 
     def run(

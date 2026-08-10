@@ -3,7 +3,7 @@ from .parametope import (
     g_parametope,
 )
 
-from .embedding import ParametricEmbedding, ParametopeEmbedding
+from .embedding import ParametricEmbedding, ParametopeEmbedding, ReachsetSolution
 
 from .sets.affine import (
     AffineParametope,
@@ -38,6 +38,11 @@ from .sets.polynomial_normotope import (
     PolynomialNormotopeEmbedding,
 )
 
+from .sets.gram_normotope import (
+    GramNormotope,
+    GramNormotopeEmbedding,
+)
+
 from .reach_ilqr import (
     ReachiLQR,
     IterateResult,
@@ -51,6 +56,7 @@ __all__ = [
     "g_parametope",
     "ParametopeEmbedding",
     "ParametricEmbedding",
+    "ReachsetSolution",
     "AffineParametope",
     "hParametope",
     "AdjointEmbedding",
@@ -67,6 +73,8 @@ __all__ = [
     "L1PolynomialNormotope",
     "LinfPolynomialNormotope",
     "PolynomialNormotopeEmbedding",
+    "GramNormotope",
+    "GramNormotopeEmbedding",
     "ReachiLQR",
     "IterateResult",
     "RunResult",

@@ -1,6 +1,7 @@
 import jax
+import jax.numpy as jnp
 from jaxtyping import Integer, Float, ArrayLike
-from typing import Union, List, Callable, Literal
+from typing import Any, Union, List, Callable, Literal
 from abc import abstractmethod
 import equinox as eqx
 from ..system import System
@@ -9,6 +10,17 @@ from .parametope import Parametope
 from immutabledict import immutabledict
 from diffrax import AbstractSolver, ODETerm, Euler, Dopri5, Tsit5, SaveAt, diffeqsolve
 import warnings
+
+
+class ReachsetSolution(eqx.Module):
+    """Fixed-step scan solution mirroring the diffrax ``Solution`` fields callers use.
+
+    ``ts`` is all-finite with length ``N+1``; ``ys`` is the ``(pt, aux)`` pytree
+    with a leading step axis (``ys[0].alpha[k]`` etc.).
+    """
+
+    ts: jax.Array
+    ys: Any
 
 
 class ParametricEmbedding(LegacyAttrModule):
@@ -51,6 +63,17 @@ class ParametricEmbedding(LegacyAttrModule):
     def _dynamics(self, t, state, *args):
         """Embedding right-hand side: the dynamics of ``(parametope, aux)``."""
 
+    def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
+        """One semi-implicit (symplectic) Euler step ``state_k -> state_{k+1}``.
+
+        ``args`` are per-step input values already evaluated at ``(t, state)``;
+        ``U`` is a constant hypercontrol; extra kwargs forward to ``_dynamics``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support solver='symplectic'; "
+            "pass a diffrax solver instead, e.g. solver='tsit5' or 'euler'."
+        )
+
     def hypercontrol_shape(self, pt0: Parametope) -> tuple:
         """Shape of the control input :meth:`_dynamics` accepts for ``pt0``.
 
@@ -86,10 +109,57 @@ class ParametricEmbedding(LegacyAttrModule):
         inputs: List[Callable[[int, jax.Array], jax.Array]] = [],
         dt: float = 0.01,
         *,
-        solver: Union[Literal["euler", "rk45", "tsit5"], AbstractSolver] = "tsit5",
+        solver: Union[
+            Literal["symplectic", "euler", "rk45", "tsit5"], AbstractSolver
+        ] = "symplectic",
         f_kwargs: immutabledict = immutabledict({}),
         **kwargs,
     ):
+        """Flow the embedding from ``pt0`` over ``[t0, tf]``.
+
+        The default ``solver="symplectic"`` runs a fixed-step semi-implicit
+        Euler scan: explicit Euler on the center, an implicit adjoint step
+        ``alpha_{k+1} (I + dt A_k) = alpha_k + dt U_k`` with ``A_k`` at the old
+        center (the exact discrete adjoint of the Euler state map, so the
+        alpha/state pairing is preserved — machine-exact for linear systems),
+        and the offset bound evaluated with the discrete rate
+        ``(alpha_{k+1} - alpha_k)/dt``. It requires concrete ``t0, tf, dt``
+        (grid ``N = round((tf-t0)/dt)`` hits ``tf`` exactly; effective step may
+        differ slightly from ``dt``) and returns a :class:`ReachsetSolution`
+        with all-finite ``ts`` of length ``N+1``. Embeddings without a
+        ``_symplectic_step`` (Gram/Polynomial) raise ``NotImplementedError``;
+        pass a diffrax solver there. Diffrax solvers return the diffrax
+        ``Solution`` with inf-padded ``ts`` as before.
+        """
+        aux0 = self._initialize(pt0)
+
+        if solver == "symplectic":
+            if kwargs:
+                raise TypeError(
+                    f"solver='symplectic' does not accept diffrax kwargs: {sorted(kwargs)}"
+                )
+            try:
+                t0_, tf_, dt_ = float(t0), float(tf), float(dt)
+            except TypeError as e:
+                raise TypeError(
+                    "solver='symplectic' requires concrete (non-traced) t0, tf, dt"
+                ) from e
+            N = max(1, int(round((tf_ - t0_) / dt_)))
+            h = (tf_ - t0_) / N
+            ts = t0_ + h * jnp.arange(N + 1)
+            state0 = jax.tree.map(jnp.asarray, (pt0, aux0))
+
+            def body(state, tk):
+                args = [u(tk, state) for u in inputs]
+                new = self._symplectic_step(tk, h, state, *args, **f_kwargs)
+                return new, new
+
+            _, tail = jax.lax.scan(body, state0, ts[:-1])
+            ys = jax.tree.map(
+                lambda x0, xs: jnp.concatenate([x0[None], xs], axis=0), state0, tail
+            )
+            return ReachsetSolution(ts=ts, ys=ys)
+
         def func(t, x, args):
             return self._dynamics(t, x, *[u(t, x) for u in inputs], **f_kwargs)
 
@@ -104,8 +174,6 @@ class ParametricEmbedding(LegacyAttrModule):
             pass
         else:
             raise Exception(f"{solver=} is not a valid solver")
-
-        aux0 = self._initialize(pt0)
 
         saveat = SaveAt(t0=True, t1=True, steps=True)
         return diffeqsolve(

@@ -120,7 +120,10 @@ class AdjointEmbedding(ParametricEmbedding):
         iz = _refine_N(pt.hinv(pt.y), N)
         return interval(alpha_p) @ iz + pt.ox
 
-    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, U=None, **kwargs):
+    def _dynamics(
+        self, t, state: Tuple[hParametope, ArrayLike], *args,
+        U=None, alpha_dot=None, **kwargs,
+    ):
         pt, aux = state
         ox = pt.ox
 
@@ -197,6 +200,11 @@ class AdjointEmbedding(ParametricEmbedding):
         # sound. Fold it into ustar so every use of ustar accounts for it.
         Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
         ustar = ustar + Uctrl
+
+        if alpha_dot is not None:
+            # Symplectic path: H_dot == alpha_dot below, and the offset bound
+            # sees alpha@(Mx - J) + ustar == alpha@Mx + alpha_dot.
+            ustar = alpha_dot - u0
 
         ## Offset Dynamics given ustar
 
@@ -313,6 +321,77 @@ class AdjointEmbedding(ParametricEmbedding):
 
         return (pt_dot, (alpha_p_dot, N_dot))
 
+    def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
+        pt, (alpha_p, N) = state
+        alpha, ox, y = pt.alpha, pt.ox, pt.y
+
+        centers = (jnp.array([t]), ox) + tuple(arg.center for arg in args)
+        J = self.Jf_x(*centers)
+        A = jnp.zeros_like(J) if self.disable_adjoint else J
+        # PENALTY == 0 in _dynamics => the CBF part of ustar is identically zero;
+        # only the hypercontrol is explicit forcing. If PENALTY is ever
+        # re-enabled there, replicate the CBF term here.
+        ustar = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
+
+        B = jnp.eye(A.shape[0], dtype=alpha.dtype) + dt * A
+        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * ustar).T).T
+        alpha_dot = (alpha_next - alpha) / dt
+
+        pt_dot, _ = self._dynamics(t, state, *args, U=U, alpha_dot=alpha_dot, **kwargs)
+
+        if U is None:
+            # ustar == 0: alpha_next = alpha @ B^{-1}, so these are exact.
+            alpha_p_next = B @ alpha_p
+            N_next = N
+        else:
+            # Exact updates preserving alpha_p @ alpha = I and N @ alpha = 0.
+            # inv (LU) when square: cheaper and better-behaved derivatives than
+            # SVD-pinv under the iLQR backward pass.
+            forced = alpha + dt * ustar
+            Mh = (
+                jnp.linalg.inv(forced)
+                if forced.shape[0] == forced.shape[1]
+                else jnp.linalg.pinv(forced)
+            )
+            alpha_p_next = B @ Mh
+            N_next = N - dt * (N @ ustar) @ Mh
+
+        pt_next = pt.from_parametope(
+            hParametope(ox + dt * pt_dot.ox, alpha_next, y + dt * pt_dot.y)
+        )
+        return pt_next, (alpha_p_next, N_next)
+
+
+def _licq_ustar(alpha, u0, kap):
+    """LICQ CBF-QP alpha forcing; zeros when kap is None."""
+    if kap is None:
+        return jnp.zeros_like(u0)
+
+    u0flat = u0.reshape(-1)
+
+    def barrier_LICQ(alpha):
+        # return jax.jit(jnp.linalg.det, backend='cpu')(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))
+        return jnp.linalg.det(
+            alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True)
+        )
+        # return jnp.linalg.slogdet(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))[1]
+
+    balpha = barrier_LICQ(alpha)
+    k = kap * balpha**3
+
+    pLfh, Lfh = jax.jvp(barrier_LICQ, (alpha,), (u0,))
+    unroll = lambda v: jax.jvp(
+        barrier_LICQ, (alpha,), (v.reshape(alpha.shape),)
+    )
+    pLgh, Lgh = jax.vmap(unroll)(jnp.eye(alpha.size))
+
+    # Solution to QP
+    return jnp.where(
+        Lfh + Lgh @ u0flat + k >= 0.0,
+        jnp.zeros_like(u0flat),  # constraint inactive
+        -(Lfh + Lgh @ u0flat + k) * Lgh.T / (Lgh @ Lgh.T),
+    ).reshape(alpha.shape)
+
 
 class FastlinAdjointEmbedding(ParametricEmbedding):
     def __init__(
@@ -358,7 +437,30 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         iz = _refine_N(pt.hinv(pt.y), N)
         return interval(alpha_p) @ iz + pt.ox
 
-    def _dynamics(self, t, state: Tuple[hParametope, ArrayLike], *args, U=None, **kwargs):
+    def _fastlin_terms(self, pt, alpha_p):
+        """CROWN/fastlin pass over the control lifted to z-coordinates."""
+        big_iz = pt.hinv(pt.y)
+
+        def lifted_net(z):
+            return self.sys.control(alpha_p @ z)
+
+        lifted_net.out_len = self.sys.control.out_len
+        lifted_net.u = lambda t, y: lifted_net(y)
+
+        # fastlin_res = fastlin(self.sys.control)(interval(alpha_p)@(big_iz + alpha@ox))
+        fastlin_res = fastlin(
+            lifted_net, iterated=self.iterated, forward_mode=self.forward_mode,
+        )(big_iz + pt.alpha @ pt.ox)
+        C = fastlin_res.C
+        # C = jax.jacfwd(lifted_net)(alpha@ox)
+
+        big_iu = fastlin_res(big_iz + pt.alpha @ pt.ox)
+        return big_iz, fastlin_res, C, big_iu
+
+    def _dynamics(
+        self, t, state: Tuple[hParametope, ArrayLike], *args,
+        U=None, alpha_dot=None, **kwargs,
+    ):
         pt, aux = state
         ox = pt.ox
 
@@ -372,23 +474,8 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
 
         # Global fastlin
 
-        big_iz = pt.hinv(pt.y)
         Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
-
-        def lifted_net(z):
-            return self.sys.control(alpha_p @ z)
-
-        lifted_net.out_len = self.sys.control.out_len
-        lifted_net.u = lambda t, y: lifted_net(y)
-
-        # fastlin_res = fastlin(self.sys.control)(interval(alpha_p)@(big_iz + alpha@ox))
-        fastlin_res = fastlin(
-            lifted_net, iterated=self.iterated, forward_mode=self.forward_mode,
-        )(big_iz + alpha @ ox)
-        C = fastlin_res.C
-        # C = jax.jacfwd(lifted_net)(alpha@ox)
-
-        big_iu = fastlin_res(big_iz + alpha @ ox)
+        big_iz, fastlin_res, C, big_iu = self._fastlin_terms(pt, alpha_p)
         CHox = C @ alpha @ ox
         ou = self.sys.control(ox)
 
@@ -401,41 +488,19 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         J_u = self.Jf_u(*centers)
         # u0 = -alpha@(J_x@alpha_p + J_u@C)
         u0 = -alpha @ (J_x + J_u @ C @ alpha)
-        u0flat = u0.reshape(-1)
 
-        if self.kap is None:
-            ustar = jnp.zeros_like(u0)
-
-        else:
-
-            def barrier_LICQ(alpha):
-                # return jax.jit(jnp.linalg.det, backend='cpu')(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))
-                return jnp.linalg.det(
-                    alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True)
-                )
-                # return jnp.linalg.slogdet(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))[1]
-
-            balpha = barrier_LICQ(alpha)
-            k = self.kap * balpha**3
-
-            pLfh, Lfh = jax.jvp(barrier_LICQ, (alpha,), (u0,))
-            unroll = lambda v: jax.jvp(
-                barrier_LICQ, (alpha,), (v.reshape(alpha.shape),)
-            )
-            pLgh, Lgh = jax.vmap(unroll)(jnp.eye(alpha.size))
-
-            # Solution to QP
-            ustar = jnp.where(
-                Lfh + Lgh @ u0flat + k >= 0.0,
-                jnp.zeros_like(u0flat),  # constraint inactive
-                -(Lfh + Lgh @ u0flat + k) * Lgh.T / (Lgh @ Lgh.T),
-            ).reshape(alpha.shape)
+        ustar = _licq_ustar(alpha, u0, self.kap)
 
         # Hypercontrol enters exactly like the CBF term ustar: it perturbs H_dot
         # AND must appear in the offset-growth bound below, so the enclosure stays
         # sound. Fold it into ustar so every use of ustar accounts for it.
         Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
         ustar = ustar + Uctrl
+
+        if alpha_dot is not None:
+            # Symplectic path: H_dot == alpha_dot below, and the offset bound
+            # sees alpha@(Mx + Mu@C@alpha) + alpha_dot.
+            ustar = alpha_dot - u0
 
         ## Offset Dynamics given ustar
 
@@ -502,6 +567,52 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         N_dot = -N @ H_dot @ alpha_p
 
         return (pt_dot, (alpha_p_dot, N_dot))
+
+    def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
+        pt, (alpha_p, N) = state
+        alpha, ox, y = pt.alpha, pt.ox, pt.y
+
+        _big_iz, _flr, C, _big_iu = self._fastlin_terms(pt, alpha_p)
+        ou = self.sys.control(ox)
+        centers = (jnp.array([t]), ox, ou) + tuple(arg.center for arg in args)
+        J_x = self.Jf_x(*centers)
+        J_u = self.Jf_u(*centers)
+
+        # Closed-loop adjoint matrix with C@alpha FROZEN at the old point:
+        # linearizes the alpha-dependence so the implicit step stays a linear solve.
+        A = J_x + J_u @ C @ alpha
+        u0 = -alpha @ A
+        ustar = _licq_ustar(alpha, u0, self.kap)
+        if U is not None:
+            ustar = ustar + jnp.asarray(U).reshape(alpha.shape)
+
+        B = jnp.eye(A.shape[0], dtype=alpha.dtype) + dt * A
+        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * ustar).T).T
+        alpha_dot = (alpha_next - alpha) / dt
+
+        pt_dot, _ = self._dynamics(t, state, *args, U=U, alpha_dot=alpha_dot, **kwargs)
+
+        if U is None and self.kap is None:
+            # ustar == 0: alpha_next = alpha @ B^{-1}, so these are exact.
+            alpha_p_next = B @ alpha_p
+            N_next = N
+        else:
+            # Exact updates preserving alpha_p @ alpha = I and N @ alpha = 0.
+            # inv (LU) when square: cheaper and better-behaved derivatives than
+            # SVD-pinv under the iLQR backward pass.
+            forced = alpha + dt * ustar
+            Mh = (
+                jnp.linalg.inv(forced)
+                if forced.shape[0] == forced.shape[1]
+                else jnp.linalg.pinv(forced)
+            )
+            alpha_p_next = B @ Mh
+            N_next = N - dt * (N @ ustar) @ Mh
+
+        pt_next = pt.from_parametope(
+            hParametope(ox + dt * pt_dot.ox, alpha_next, y + dt * pt_dot.y)
+        )
+        return pt_next, (alpha_p_next, N_next)
 
 
 def _refine_N(y: Interval, N) -> Interval:
