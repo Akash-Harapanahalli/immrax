@@ -60,10 +60,11 @@ LABEL_TMAX = 3.0  # sets past this are too small near the origin to label
 WMAX = 20.0  # a set wider than this is treated as blown up
 
 
-def time_ms(f, *args):
-    """Steady-state jitted runtime (ms): 6 runs, drop the compile call."""
+def timings(f, *args):
+    """(steady-state runtime, JIT time) in seconds; run 0 carries the compile."""
     _, ts = irx.utils.run_times(6, f, *args)
-    return float(jnp.mean(ts[1:])) * 1e3
+    t_run = float(jnp.mean(ts[1:]))
+    return t_run, float(ts[0]) - t_run
 
 
 def shoelace(V):
@@ -108,13 +109,13 @@ reach_box = jax.jit(
     lambda z: natemb.compute_trajectory(0.0, tf, z, dt=dt, solver="euler").ys
 )
 box_ys = onp.asarray(reach_box(z0))
-t_box = time_ms(reach_box, z0)
+t_box = timings(reach_box, z0)
 
 # ---------------------------------------------------------------- 2. polytope
 pt0 = Polytope.from_interval(ix0)
 emb_poly = AdjointEmbedding(sys, jnp.linalg.pinv(pt0.alpha), jnp.zeros((0, 2)))
 rs_poly = emb_poly.compute_reachset(0.0, tf, pt0, dt=dt)
-t_poly = time_ms(lambda p: emb_poly.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, pt0)
+t_poly = timings(lambda p: emb_poly.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, pt0)
 
 # ------------------------------------------------------- 3/4. L2 normotopes
 nt0 = irx.L2Normotope.from_interval(ix0)
@@ -123,17 +124,17 @@ emb_l2._initialize(nt0)  # resolve gsc outside jit
 noadj = immutabledict({"adjoint": False})
 rs_l2n = emb_l2.compute_reachset(0.0, tf, nt0, dt=dt, f_kwargs=noadj)
 rs_l2a = emb_l2.compute_reachset(0.0, tf, nt0, dt=dt)
-t_l2n = time_ms(
+t_l2n = timings(
     lambda p: emb_l2.compute_reachset(0.0, tf, p, dt=dt, f_kwargs=noadj).ys[0].y, nt0
 )
-t_l2a = time_ms(lambda p: emb_l2.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, nt0)
+t_l2a = timings(lambda p: emb_l2.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, nt0)
 
 # ---------------------------------------------------------- 5. Chebyshev m=3
 cpt0 = irx.ChebyshevNormotope.from_interval(ix0, m=3)
 emb_ch = irx.ChebyshevNormotopeEmbedding(sys, drift="interval")
 emb_ch._initialize(cpt0)  # resolve deg_f outside jit
 rs_ch = emb_ch.compute_reachset(0.0, tf, cpt0, dt=dt)
-t_ch = time_ms(lambda p: emb_ch.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, cpt0)
+t_ch = timings(lambda p: emb_ch.compute_reachset(0.0, tf, p, dt=dt).ys[0].y, cpt0)
 
 
 # ------------------------------------------------------------- set accessors
@@ -203,38 +204,58 @@ kf = int(round(T_AREA / dt))
 # Each method's bloat is measured against the MC truth for ITS OWN initial
 # set: box flow for interval/polytope, ellipsoid flow for L2/Chebyshev.
 truth = {"box": shoelace(mc_box[:, kf, :]), "ell": shoelace(mc_ell[:, kf, :])}
+# (plain name, LaTeX name, (runtime, jit), iover_at, area_at, truth key)
 methods = [
-    ("Interval (natural embedding)", t_box, box_iover_at,
+    ("Interval (natural embedding)", "Interval (natural embedding)",
+     t_box, box_iover_at,
      lambda k: float(onp.prod(box_ys[k, 2:] - box_ys[k, :2])), "box"),
-    ("Polytope + adjoint", t_poly, poly_iover_at,
+    ("Polytope + adjoint", "Polytope + adjoint", t_poly, poly_iover_at,
      lambda k: shoelace(poly_at(k).get_vertices()), "box"),
-    ("L2 normotope (log-norm, no adjoint)", t_l2n, lambda k: l2_at(rs_l2n, k).iover(),
+    ("L2 normotope (log-norm, no adjoint)", "L2 normotope (log-norm, no adjoint)",
+     t_l2n, lambda k: l2_at(rs_l2n, k).iover(),
      lambda k: onp.pi * float(l2_at(rs_l2n, k).y) ** 2
      / abs(onp.linalg.det(onp.asarray(l2_at(rs_l2n, k).alpha))), "ell"),
-    ("L2 normotope (log-norm + adjoint)", t_l2a, lambda k: l2_at(rs_l2a, k).iover(),
+    ("L2 normotope (log-norm + adjoint)", "L2 normotope (log-norm + adjoint)",
+     t_l2a, lambda k: l2_at(rs_l2a, k).iover(),
      lambda k: onp.pi * float(l2_at(rs_l2a, k).y) ** 2
      / abs(onp.linalg.det(onp.asarray(l2_at(rs_l2a, k).alpha))), "ell"),
-    ("Chebyshev normotope $m=3$ (adjoint + interval drift)", t_ch,
-     lambda k: cheb_at(k).iover(), lambda k: cheb_area(cheb_at(k)), "ell"),
+    ("Chebyshev normotope m=3 (adjoint + interval drift)",
+     "Chebyshev normotope $m=3$ (adjoint + interval drift)",
+     t_ch, lambda k: cheb_at(k).iover(), lambda k: cheb_area(cheb_at(k)), "ell"),
 ]
+
+headers = ["Method", "Runtime s (JIT s)", f"Area at t={T_AREA:g}", "Bloat"]
+headers_tex = ["Method", "Runtime s (JIT s)", f"Area at $t={T_AREA:g}$", "Bloat"]
+rows, rows_tex = [], []
+for name, name_tex, (t_run, t_jit), iover_at, area_at, ref in methods:
+    rt = f"{t_run:.3f} ({t_jit:.0f})"
+    td = death_time(iover_at)
+    if td is not None and td <= T_AREA:
+        a_s, b_s = f"inf (blows up t ~ {td:.2f})", "--"
+        a_tex, b_tex = f"$\\infty$ (blows up $t \\approx {td:.2f}$)", "--"
+    else:
+        a = area_at(kf)
+        bloat = 100.0 * (a / truth[ref] - 1.0)
+        a_s = a_tex = f"{a:.3e}"
+        b_s, b_tex = f"{bloat:+.1f}%", f"{bloat:+.1f}\\%"
+    rows.append([name, rt, a_s, b_s])
+    rows_tex.append([name_tex, rt, a_tex, b_tex])
 
 print(f"\n% reverse VDP, box (1.10, 0.55) +- 0.12 / circumscribed ellipsoid, "
       f"dt={dt}, tf={tf}; area and bloat vs own-initial-set MC truth at t={T_AREA:g}")
-print("\\begin{tabular}{lrrr}")
-print("\\toprule")
-print(f"Method & Runtime (ms) & Area at $t={T_AREA:g}$ & Bloat \\\\")
-print("\\midrule")
-for name, t, iover_at, area_at, ref in methods:
-    td = death_time(iover_at)
-    if td is not None and td <= T_AREA:
-        astr, bstr = f"$\\infty$ (blows up $t \\approx {td:.2f}$)", "--"
-    else:
-        a = area_at(kf)
-        astr = f"{a:.3e}"
-        bstr = f"{100.0 * (a / truth[ref] - 1.0):+.1f}\\%"
-    print(f"{name} & {t:.2f} & {astr} & {bstr} \\\\")
-print("\\bottomrule")
-print("\\end{tabular}\n")
+try:
+    from tabulate import tabulate
+except ImportError:  # optional dependency; fall back to a hand-built table
+    print(" & ".join(headers_tex) + " \\\\")
+    for r in rows_tex:
+        print(" & ".join(r) + " \\\\")
+else:
+    print(tabulate(rows, headers=headers, tablefmt="simple"))
+    print()
+    # latex_raw, not latex_booktabs: the cells carry math ($\infty$, $m=3$, \%)
+    # and booktabs escapes it.
+    print(tabulate(rows_tex, headers=headers_tex, tablefmt="latex_raw"))
+print()
 
 # ---------------------------------------------------------------------- plot
 fig, ax = plt.subplots(figsize=(7, 7))

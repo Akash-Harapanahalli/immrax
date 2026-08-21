@@ -1,4 +1,4 @@
-"""Nonholonomic (Dubins-like) platoon reachability, symplectic adjoint embedding.
+"""Unicycle platoon reachability, symplectic adjoint embedding.
 
 Each vehicle is a unicycle with a speed state -- 4 states [px, py, theta, v],
 2 inputs [a (thrust), omega]:
@@ -14,48 +14,48 @@ heading-alignment term; own-heading trig dominates the nonlinearity:
     a_i = ka (v_pred - v_i) + k1 ex
     omega_i = k2 ey + k3 sin(th_pred - thi)
 
-The heading term propagates turns down the chain immediately (cross-track
-error alone integrates too slowly -- followers drive straight through the
-obstacle without it). The LEADER runs the same law against a virtual
-predecessor: its own precomputed nominal state trajectory (not a broadcast --
-it is the leader's own mission plan); this caps the seed width of the whole
-chain (an open-loop leader's position tube grows to ~0.16 and poisons every
-follower's drift bound). Gains are soft because the certificate's drift pays
-cond(alpha) x trig curvature and cond(alpha) grows with the loop contraction
-rate (stiff gains -> cond ~1e4, certificate dies mid-horizon).
+The heading term propagates turns down the chain immediately; cross-track
+error alone integrates too slowly and followers drive through the obstacle.
+The leader runs the same law against a virtual predecessor -- its own
+precomputed nominal state trajectory, not a broadcast -- which caps the seed
+width of the chain.
 
-Certified depth: the mean-value wrap is width-dependent and grows with the
-loop gains; with the soft gains below, n = 12 (48 states) certifies to tf
-with the FULL 1e-2 box on every state. Deeper chains need a smaller initial
-box (the wrap is subcritical below a width threshold) -- re-validate any
-such run against the corrected mjacM pairing (2026-08 fix).
+The leader nominal ships as ``us_unicycle.npy``; regenerate with
+``python platoon_unicycle.py --regenerate`` (requires casadi + ipopt).
 
-String stability is the price of decentralization: under acceleration each
-link lags a/ka in speed and the chain stretches, so followers cut inside the
-leader's path. The scenario sits at the feasibility frontier of that
-trade-off: the initial heading (238 deg) is inside the obstacle's collision
-cone (bearing 217, half-angle 27 -- a straight-line platoon would hit it),
-and the leader's modest extra berth (padding 1.7) absorbs the followers'
-corner cut, leaving min center clearance 2.29 > 2.25.
-
-The leader nominal ships as ``us_dubins.npy``; regenerate with
-``python platoon_dubins.py --regenerate`` (requires casadi + ipopt).
-
-Outputs: platoon_dubins_grid.{pdf,svg}, platoon_dubins_overview.{pdf,svg}
+Outputs: platoon_unicycle_grid.{pdf,svg}, platoon_unicycle_overview.{pdf,svg}
 (for SHOW_AGENTS vehicles), and a LaTeX runtime table on stdout.
 """
 
-# ruff: noqa: E402  (x64 flag must be set before jax.numpy is imported)
+# ruff: noqa: E402  (backend/x64 flags must be set before jax.numpy is imported)
 import argparse
+import os
 import pathlib
+import shlex
+import time
 from typing import ClassVar
+
+# Parsed before JAX is imported: the flags below must be set before the first
+# array is created, or they are silently ignored.
+_ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+_ap.add_argument("--regenerate", action="store_true", help="re-solve the leader MPC")
+_ap.add_argument("--platform", choices=("auto", "gpu", "cpu"), default="auto", help="JAX backend")
+_ap.add_argument("--no-show", action="store_true", help="save figures without opening a window")
+_ap.add_argument("--precision", choices=("32", "64"), default="32", help="float width")
+# When imported rather than run, take flags from $PLATOON_ARGS.
+args = (
+    _ap.parse_args()
+    if __name__ == "__main__"
+    else _ap.parse_args(shlex.split(os.environ.get("PLATOON_ARGS", "")))
+)
+
+if args.platform != "auto":
+    os.environ["JAX_PLATFORMS"] = args.platform
 
 import equinox as eqx
 import jax
 
-# The adjoint of the contracting follower chain is exponentially conditioned;
-# float32 destroys the certificate. Run in x64.
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", args.precision == "64")
 
 import jax.numpy as jnp
 import matplotlib.patches as patches
@@ -68,7 +68,7 @@ from immrax.parametric import AdjointEmbedding, Polytope
 plt.rcParams.update({"text.usetex": True, "font.family": "serif"})  # Computer Modern
 
 HERE = pathlib.Path(__file__).parent
-US_FILE = HERE / "us_dubins.npy"
+US_FILE = HERE / "us_unicycle.npy"
 
 # ---------------------------------------------------------------- parameters
 t0, tf = 0.0, 3.0
@@ -85,14 +85,11 @@ obstacle_center = (4, 4)
 obstacle_radius = 2.25
 obstacle_padding = 1.7  # modest extra berth for the followers' corner cut
 
-# AGENTS = [3, 6, 9, 12, 15, 18, 21]
 # (n, pert scale) pairs for the sweep.
-AGENTS = [(6, 1.0), (12, 1.0)]
-SHOW_AGENTS = 6
-# Full initial box on every state of every vehicle. (An earlier version
-# perturbed only px and theta -- a leftover of the holonomic example's
-# px/vx pattern, not a deliberate choice.)
-PERT_VEHICLE = jnp.array([1e-2, 1e-2, 1e-2, 1e-2])
+AGENTS = [(3, 1.0), (9, 1.0), (15, 1.0), (25, 1.0), (50, 1.0), (125, 1.0), (250, 1.0)]
+SHOW_AGENTS = 9
+# Uniform initial box on every state of every vehicle.
+PERT_VEHICLE = jnp.array([5e-3, 5e-3, 5e-3, 5e-3])
 
 
 # ------------------------------------------------ leader nominal (a, omega)
@@ -180,17 +177,12 @@ def nominal_state(ao):
 
 
 # ------------------------------------------------------------------- system
-class DubinsPlatoon(irx.System):
+class UnicyclePlatoon(irx.System):
     """Unicycles with speed state; decentralized predecessor-only followers."""
 
     num_agents: int = eqx.field(static=True)
     states_per_vehicle: ClassVar[int] = 4
     d: ClassVar[float] = follow_dist
-    # Soft gains: the certified drift pays cond(alpha) x trig curvature, and
-    # cond(alpha) grows with EVERY loop contraction rate -- stiffer gains (and
-    # even pure linear damping, e.g. a time-headway term) shorten the
-    # certificate's life. These values certify n = 12 with the full 1e-2 box;
-    # k3 = 0.8 already sits on a cliff (extents x75). k3 carries the turn.
     ka: ClassVar[float] = 0.35  # thrust from predecessor speed error
     k1: ClassVar[float] = 0.15  # thrust from along-track gap error
     k2: ClassVar[float] = 0.3  # omega from cross-track error
@@ -203,27 +195,34 @@ class DubinsPlatoon(irx.System):
     def f(self, t, x, u, w):
         # u = [a_nom, om_nom, pxn, pyn, thn, vn]: nominal inputs + nominal
         # state; the leader tracks its nominal as a virtual predecessor.
+        # Vectorized over vehicles (predecessor == shifted slice), so the
+        # traced graph is the same size for every n.
         sv = self.states_per_vehicle
-        th0, v0 = x[2], x[3]
-        dx0 = u[2] - x[0]
-        dy0 = u[3] - x[1]
+        X = x.reshape(self.num_agents, sv)
+        W = w.reshape(self.num_agents, 2)
+
+        th0, v0 = X[0, 2], X[0, 3]
+        dx0 = u[2] - X[0, 0]
+        dy0 = u[3] - X[0, 1]
         ex0 = jnp.cos(th0) * dx0 + jnp.sin(th0) * dy0
         ey0 = -jnp.sin(th0) * dx0 + jnp.cos(th0) * dy0
-        a0 = u[0] + self.ka * (u[5] - v0) + self.k1 * ex0 + w[0]
-        om0 = u[1] + self.k2 * ey0 + self.k3 * jnp.sin(u[4] - th0) + w[1]
-        dyn = [jnp.array([v0 * jnp.cos(th0), v0 * jnp.sin(th0), om0, a0])]
-        for i in range(1, self.num_agents):
-            pr = x[(i - 1) * sv : i * sv]
-            me = x[i * sv : (i + 1) * sv]
-            thp, thi, vi, vp = pr[2], me[2], me[3], pr[3]
-            dx = pr[0] - me[0]
-            dy = pr[1] - me[1]
-            ex = jnp.cos(thi) * dx + jnp.sin(thi) * dy - self.d
-            ey = -jnp.sin(thi) * dx + jnp.cos(thi) * dy
-            ai = self.ka * (vp - vi) + self.k1 * ex + w[2 * i]
-            omi = self.k2 * ey + self.k3 * jnp.sin(thp - thi) + w[2 * i + 1]
-            dyn.append(jnp.array([vi * jnp.cos(thi), vi * jnp.sin(thi), omi, ai]))
-        return jnp.concatenate(dyn)
+        a0 = u[0] + self.ka * (u[5] - v0) + self.k1 * ex0 + W[0, 0]
+        om0 = u[1] + self.k2 * ey0 + self.k3 * jnp.sin(u[4] - th0) + W[0, 1]
+        leader = jnp.stack([v0 * jnp.cos(th0), v0 * jnp.sin(th0), om0, a0])
+
+        pr, me, Wf = X[:-1], X[1:], W[1:]
+        thp, vp = pr[:, 2], pr[:, 3]
+        thi, vi = me[:, 2], me[:, 3]
+        dx = pr[:, 0] - me[:, 0]
+        dy = pr[:, 1] - me[:, 1]
+        ex = jnp.cos(thi) * dx + jnp.sin(thi) * dy - self.d
+        ey = -jnp.sin(thi) * dx + jnp.cos(thi) * dy
+        ai = self.ka * (vp - vi) + self.k1 * ex + Wf[:, 0]
+        omi = self.k2 * ey + self.k3 * jnp.sin(thp - thi) + Wf[:, 1]
+        followers = jnp.stack(
+            [vi * jnp.cos(thi), vi * jnp.sin(thi), omi, ai], axis=-1
+        )
+        return jnp.concatenate([leader, followers.reshape(-1)])
 
 
 # ------------------------------------------------------------- reachability
@@ -251,7 +250,7 @@ def mjac_permutation(n):
 
 
 def reach(n, ao, xn, pert_scale=1.0):
-    platoon = DubinsPlatoon(n)
+    platoon = UnicyclePlatoon(n)
     x0 = platoon_x0(n)
     pt0 = Polytope.from_interval(irx.icentpert(x0, jnp.tile(PERT_VEHICLE * pert_scale, n)))
     w_bounds = irx.icentpert(jnp.zeros(2 * n), jnp.zeros(2 * n))
@@ -264,8 +263,16 @@ def reach(n, ao, xn, pert_scale=1.0):
                            permutation=mjac_permutation(n))
     run = jax.jit(lambda p: emb.compute_reachset(t0, tf, p, (iu, iw), dt=dt))
     reps = 6 if n <= 6 else 2  # large runs: one timed repeat after compile
-    rs, times = irx.utils.run_times(reps, run, pt0)
-    return rs, float(jnp.mean(times[1:]))
+    # Not irx.utils.run_times: it holds the previous result while the next call
+    # allocates, which doubles peak device memory (OOM at n=250).
+    times, rs = [], None
+    for _ in range(reps):
+        rs = None  # free the previous reachset before allocating the next
+        t = time.perf_counter()
+        rs = jax.block_until_ready(run(pt0))
+        times.append(time.perf_counter() - t)
+    t_run = float(onp.mean(times[1:]))
+    return rs, t_run, times[0] - t_run  # times[0] is compile + one run
 
 
 def draw_box(ax, b2, **kw):
@@ -289,9 +296,8 @@ def boxes(rs, n):
 
 # --------------------------------------------------------------------- main
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--regenerate", action="store_true", help="re-solve the leader MPC")
-    args = ap.parse_args()
+    dev = jax.devices()[0]
+    print(f"backend: {jax.default_backend()} ({dev.device_kind}), x64={jax.config.jax_enable_x64}")
     if args.regenerate or not US_FILE.exists():
         onp.save(US_FILE, make_nominal())
         print(f"saved {US_FILE}")
@@ -301,23 +307,39 @@ if __name__ == "__main__":
 
     results = {}
     for n, ps in AGENTS:
-        rs, t_run = reach(n, ao, xn, ps)
-        results[n] = (rs, t_run, ps)
-        print(f"  n={n} (pert x{ps:g}): {t_run * 1e3:.1f} ms")
+        rs, t_run, t_jit = reach(n, ao, xn, ps)
+        # Only SHOW_AGENTS is plotted; holding the rest would pin one
+        # (steps, 4n, 4n) adjoint per sweep entry in device memory.
+        results[n] = (rs if n == SHOW_AGENTS else None, t_run, t_jit, ps)
+        del rs
+        print(f"  n={n} (pert {float(PERT_VEHICLE[0]) * ps:g}): {t_run:.3f} s (JIT {t_jit:.0f} s)")
 
-    print(f"\n% Dubins platoon adjoint reachability (symplectic, dt={dt}, tf={tf})")
-    print("\\begin{tabular}{rrrr}")
-    print("\\toprule")
-    print("Vehicles & States & Init.\\ pert & Runtime (ms) \\\\")
-    print("\\midrule")
-    for n, ps in AGENTS:
-        print(f"{n} & {4 * n} & {1e-2 * ps:g} & {results[n][1] * 1e3:.1f} \\\\")
-    print("\\bottomrule")
-    print("\\end{tabular}\n")
+    caption = (
+        f"% unicycle platoon adjoint reachability (symplectic, dt={dt}, tf={tf}, "
+        f"fp{args.precision} on {jax.default_backend()}: {dev.device_kind})"
+    )
+    headers = ["Vehicles", "States", "Init. pert", "Runtime s (JIT s)"]
+    rows = [
+        [n, 4 * n, f"{float(PERT_VEHICLE[0]) * ps:g}", f"{results[n][1]:.3f} ({results[n][2]:.0f})"]
+        for n, ps in AGENTS
+    ]
+
+    print(f"\n{caption}")
+    try:
+        from tabulate import tabulate
+    except ImportError:  # optional dependency; fall back to a hand-built table
+        print(" & ".join(headers) + " \\\\")
+        for r in rows:
+            print(" & ".join(str(c) for c in r) + " \\\\")
+    else:
+        print(tabulate(rows, headers=headers, tablefmt="simple"))
+        print()
+        print(tabulate(rows, headers=headers, tablefmt="latex_booktabs"))
+    print()
 
     # ------------------------------------------------------------- figures
     n = SHOW_AGENTS
-    rs, _, _ = results[n]
+    rs, _, _, _ = results[n]
     yy = rs.ys[0]
     ix = boxes(rs, n)
     cmap = plt.get_cmap("tab20")
@@ -343,11 +365,11 @@ if __name__ == "__main__":
         ax.set_title(f"vehicle {j + 1}", fontsize=9)
     for j in range(n, len(axs)):
         axs[j].set_axis_off()
-    fig.suptitle(f"{n}-vehicle Dubins platoon, adjoint polytope reach sets (symplectic, dt={dt})")
+    fig.suptitle(f"{n}-vehicle unicycle platoon, adjoint polytope reach sets (symplectic, dt={dt})")
     fig.tight_layout()
     for ext in ["pdf", "svg"]:
-        fig.savefig(HERE / f"platoon_dubins_grid.{ext}")
-        print(f"saved {HERE}/platoon_dubins_grid.{ext}")
+        fig.savefig(HERE / f"platoon_unicycle_grid.{ext}")
+        print(f"saved {HERE}/platoon_unicycle_grid.{ext}")
 
     fig2, ax = plt.subplots(figsize=(6, 6))
     ax.add_patch(patches.Circle(obstacle_center, obstacle_radius, facecolor="salmon", label="obstacle"))
@@ -360,9 +382,10 @@ if __name__ == "__main__":
     ax.set_ylabel("$p_y$")
     ax.set_aspect("equal")
     ax.legend(fontsize=9)
-    ax.set_title(f"{n}-vehicle Dubins platoon reach tube")
+    ax.set_title(f"{n}-vehicle unicycle platoon reach tube")
     fig2.tight_layout()
     for ext in ["pdf", "svg"]:
-        fig2.savefig(HERE / f"platoon_dubins_overview.{ext}")
-        print(f"saved {HERE}/platoon_dubins_overview.{ext}")
-    plt.show()
+        fig2.savefig(HERE / f"platoon_unicycle_overview.{ext}")
+        print(f"saved {HERE}/platoon_unicycle_overview.{ext}")
+    if not args.no_show:
+        plt.show()

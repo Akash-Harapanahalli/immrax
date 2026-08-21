@@ -13,17 +13,34 @@ Outputs: platoon_grid.{pdf,svg}, platoon_overview.{pdf,svg} (for SHOW_AGENTS
 vehicles), and a LaTeX runtime table on stdout.
 """
 
-# ruff: noqa: E402  (x64 flag must be set before jax.numpy is imported)
+# ruff: noqa: E402  (backend/x64 flags must be set before jax.numpy is imported)
 import argparse
+import os
 import pathlib
+import shlex
 from typing import ClassVar
+
+# Parsed before JAX is imported: the flags below must be set before the first
+# array is created, or they are silently ignored.
+_ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+_ap.add_argument("--regenerate", action="store_true", help="re-solve the leader MPC")
+_ap.add_argument("--platform", choices=("auto", "gpu", "cpu"), default="auto", help="JAX backend")
+_ap.add_argument("--no-show", action="store_true", help="save figures without opening a window")
+_ap.add_argument("--precision", choices=("32", "64"), default="32", help="float width")
+# When imported rather than run, take flags from $PLATOON_ARGS.
+args = (
+    _ap.parse_args()
+    if __name__ == "__main__"
+    else _ap.parse_args(shlex.split(os.environ.get("PLATOON_ARGS", "")))
+)
+
+if args.platform != "auto":
+    os.environ["JAX_PLATFORMS"] = args.platform
 
 import equinox as eqx
 import jax
 
-# The adjoint alpha of this contracting platoon grows like e^{||J|| t}
-# (cond ~ 1e8 by tf); float32 destroys the certificate. Run in x64.
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", args.precision == "64")
 
 import jax.numpy as jnp
 import matplotlib.patches as patches
@@ -194,9 +211,8 @@ def boxes(rs, n):
 
 # --------------------------------------------------------------------- main
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--regenerate", action="store_true", help="re-solve the leader MPC")
-    args = ap.parse_args()
+    dev = jax.devices()[0]
+    print(f"backend: {jax.default_backend()} ({dev.device_kind}), x64={jax.config.jax_enable_x64}")
 
     if args.regenerate or not US_FILE.exists():
         us = make_nominal()
@@ -211,7 +227,10 @@ if __name__ == "__main__":
         results[n] = (rs, t_run)
         print(f"  n={n}: {t_run * 1e3:.1f} ms")
 
-    print(f"\n% platoon adjoint reachability (symplectic, dt={dt}, tf={tf})")
+    print(
+        f"\n% platoon adjoint reachability (symplectic, dt={dt}, tf={tf}, "
+        f"fp{args.precision} on {jax.default_backend()}: {dev.device_kind})"
+    )
     print("\\begin{tabular}{rrr}")
     print("\\toprule")
     print("Vehicles & States & Runtime (ms) \\\\")
@@ -273,4 +292,5 @@ if __name__ == "__main__":
     for ext in ["pdf", "svg"]:
         fig2.savefig(HERE / f"platoon_overview.{ext}")
         print(f"saved {HERE}/platoon_overview.{ext}")
-    plt.show()
+    if not args.no_show:
+        plt.show()
