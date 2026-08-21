@@ -56,11 +56,19 @@ def test_adjoint_pairing_linear():
     alpha_p = onp.asarray(sol.ys[1][0])
     assert alpha.shape[0] == N + 1
 
+    def rownorm(M):
+        return M / onp.linalg.norm(M, axis=1, keepdims=True)
+
+    # The step row-normalizes alpha each step (exact set identity), so the
+    # pairing alpha_k B^k = alpha_0 holds row-wise up to positive scale.
     B = onp.eye(2) + dt * A_LIN
     Bk = onp.eye(2)
     res_sym = 0.0
     for k in range(N + 1):
-        res_sym = max(res_sym, onp.max(onp.abs(alpha[k] @ Bk - onp.asarray(pt0.alpha))))
+        res_sym = max(
+            res_sym,
+            onp.max(onp.abs(rownorm(alpha[k] @ Bk) - rownorm(onp.asarray(pt0.alpha)))),
+        )
         assert onp.max(onp.abs(alpha_p[k] @ alpha[k] - onp.eye(2))) < 1e-4
         Bk = Bk @ B
 
@@ -75,7 +83,8 @@ def test_adjoint_pairing_linear():
             res_eul,
             onp.max(
                 onp.abs(
-                    alpha_e[k] @ onp.linalg.matrix_power(B, kk) - onp.asarray(pt0.alpha)
+                    rownorm(alpha_e[k] @ onp.linalg.matrix_power(B, kk))
+                    - rownorm(onp.asarray(pt0.alpha))
                 )
             ),
         )

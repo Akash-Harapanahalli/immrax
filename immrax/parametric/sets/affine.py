@@ -335,9 +335,6 @@ class AdjointEmbedding(ParametricEmbedding):
 
         B = jnp.eye(A.shape[0], dtype=alpha.dtype) + dt * A
         alpha_next = jnp.linalg.solve(B.T, (alpha + dt * ustar).T).T
-        alpha_dot = (alpha_next - alpha) / dt
-
-        pt_dot, _ = self._dynamics(t, state, *args, U=U, alpha_dot=alpha_dot, **kwargs)
 
         if U is None:
             # ustar == 0: alpha_next = alpha @ B^{-1}, so these are exact.
@@ -356,8 +353,35 @@ class AdjointEmbedding(ParametricEmbedding):
             alpha_p_next = B @ Mh
             N_next = N - dt * (N @ ustar) @ Mh
 
+        # Exact discrete pairing: alpha_next (I + dt A) = alpha + dt U gives
+        # z_next = z + dt (U (x-ox) + alpha_next r), r the mean-value residual,
+        # so the offset bound must pair the residual with alpha_NEXT. Passing
+        # alpha_dot through _dynamics instead leaves the bracket
+        # alpha Mx + alpha_dot = alpha_next (Mx - J) + dt alpha_next J Mx --
+        # an O(dt ||J||^2) leak that diverges on stiff couplings (platoon).
+        state_next = (
+            pt.from_parametope(hParametope(ox, alpha_next, y)),
+            (alpha_p_next, N_next),
+        )
+        pt_dot, _ = self._dynamics(t, state_next, *args, U=U, **kwargs)
+
+        y_next = y + dt * pt_dot.y
+
+        # Periodic row normalization (exact set identity): alpha_i^T z <= y_i
+        # and (c alpha_i)^T z <= c y_i are the same halfspace, so rescaling
+        # each row to unit norm changes nothing geometrically while stopping
+        # the exponential magnitude growth of the adjoint (and the resulting
+        # overflow of the interval remainder products). alpha_p and N get the
+        # exact inverse scaling to preserve alpha_p alpha = I and N alpha = 0.
+        d = jnp.linalg.norm(alpha_next, axis=1)
+        alpha_next = alpha_next / d[:, None]
+        K = y_next.shape[0] // 2
+        y_next = jnp.concatenate([y_next[:K] / d, y_next[K:] / d])
+        alpha_p_next = alpha_p_next * d[None, :]
+        N_next = N_next * d[None, :]
+
         pt_next = pt.from_parametope(
-            hParametope(ox + dt * pt_dot.ox, alpha_next, y + dt * pt_dot.y)
+            hParametope(ox + dt * pt_dot.ox, alpha_next, y_next)
         )
         return pt_next, (alpha_p_next, N_next)
 

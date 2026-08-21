@@ -1,0 +1,314 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ChebyshevNormotope — how every piece works</title>
+<style>
+:root {
+  --ground: #fafbfc; --panel: #ffffff; --ink: #1c2530; --muted: #5a6a7a;
+  --accent: #1f77b4; --line: #dde4ea; --card-line: #ccd5dd; --warn: #a35012;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --ground:#14181d; --panel:#1c2229; --ink:#e2e8ee; --muted:#93a3b2;
+          --accent:#64a9d8; --line:#2a323b; --card-line:#39434e; --warn:#d98b4a; }
+}
+html { background: var(--ground); }
+body {
+  font-family: Charter, "Bitstream Charter", Cambria, Georgia, serif;
+  color: var(--ink); line-height: 1.58; margin: 0; padding: 3rem 1.5rem 4rem;
+}
+main { max-width: 760px; margin: 0 auto; }
+.eyebrow {
+  font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.72rem;
+  letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); margin: 0 0 0.6rem;
+}
+h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 0.5rem; letter-spacing: -0.01em; text-wrap: balance; }
+h2 {
+  font-size: 1.25rem; margin: 2.6rem 0 0.7rem; letter-spacing: -0.005em;
+  border-bottom: 1px solid var(--line); padding-bottom: 0.35rem;
+}
+h2 .sec {
+  font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.72rem;
+  color: var(--muted); letter-spacing: 0.1em; margin-right: 0.6rem; vertical-align: 0.15em;
+}
+p { margin: 0.7rem 0; }
+.lede { color: var(--muted); max-width: 68ch; margin: 0 0 1.5rem; font-size: 1.02rem; }
+code, .m {
+  font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: 0.87em;
+}
+.eq {
+  background: var(--panel); border: 1px solid var(--card-line); border-radius: 6px;
+  padding: 0.7rem 1rem; margin: 0.9rem 0; overflow-x: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.88rem; line-height: 1.7;
+}
+table { border-collapse: collapse; font-size: 0.9rem; margin: 0.9rem 0; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 0.32rem 1.2rem 0.32rem 0; border-bottom: 1px solid var(--line); }
+th { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.75rem;
+     letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+td.num { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.84rem; }
+.callout {
+  border-left: 3px solid var(--accent); background: var(--panel);
+  padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 0 6px 6px 0;
+}
+.warnbox { border-left-color: var(--warn); }
+ul { margin: 0.5rem 0; padding-left: 1.3rem; }
+li { margin: 0.3rem 0; }
+.mono-h { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<main>
+<p class="eyebrow">immrax &middot; parametric reachability &middot; reference note</p>
+<h1>The ChebyshevNormotope, piece by piece</h1>
+<p class="lede">What the set is, why the basis is Chebyshev, what the Carleman lift and its residual
+look like, how a degree-m set is initialized from linear data and why the seeding scale is load-bearing,
+how the symplectic step and the refit work, and how the four offset bounds relate. File:
+<code>immrax/parametric/sets/chebyshev_normotope.py</code>; tests:
+<code>tests/test_chebyshev.py</code>.</p>
+
+<h2><span class="sec">1</span>The set</h2>
+<div class="eq">S = { ox + z : &#8214;&alpha; b(T z)&#8214;&#8322;&sup2; &le; y },&nbsp;&nbsp;&nbsp; w := T z &isin; [-1,1]&#8319;</div>
+<p>The shaping map is the composite &alpha; &#8728; b &#8728; T &mdash; directly analogous to the
+linear normotope&rsquo;s {x : &#8214;H(x &minus; ox)&#8214; &le; y}, with the fixed nonlinearity b
+sandwiched between two learned linear maps.</p>
+<ul>
+<li><b>b(w)</b> &mdash; the vector of multivariate Chebyshev products
+<span class="m">T_&beta;(w) = &prod;&#7522; T_{&beta;&#7522;}(w&#7522;)</span> over all multi-indices of
+<i>total degree</i> |&beta;| &le; m, <b>including the constant</b> T&#8320; = 1. Size
+|b| = C(n+m, m). Including T&#8320; matters: Chebyshev products generate constants
+(w&sup2; = (T&#8322;+T&#8320;)/2), and without T&#8320; those constants leak into the residual at
+O(L&sup2;) &mdash; a low-order error that never shrinks with lift order.</li>
+<li><b>T</b> &mdash; a full n&times;n <i>preconditioner</i> (not a per-axis scale): it maps the
+deviation z into scaled coordinates w = Tz where the basis is evaluated. The refit (&sect;6)
+updates T every step so the set&rsquo;s linear marginal is the unit ball &mdash; the frame follows
+the set&rsquo;s rotation and stretch, keeping the basis well-conditioned. (A diagonal-only scale
+could not follow rotation; cond(&alpha;) blew up and the flow diverged.)</li>
+<li><b>&alpha;</b> &mdash; dense |b|&times;|b|, invertible. Row i defines one &ldquo;certificate
+coordinate&rdquo; (a polynomial &alpha;&#7522;&#7601;b(w)); the set is the sublevel set of the sum of
+their squares.</li>
+<li><b>y</b> &mdash; the <b>squared</b> level (unlike the other normotopes, where
+&#8214;&middot;&#8214; &le; y). Consequence: the offset ODE has no 1/(2y) singularity as the set
+contracts &mdash; y can pass through 0 harmlessly.</li>
+</ul>
+
+<h2><span class="sec">2</span>Why Chebyshev at all</h2>
+<p>The monomial-basis sets (PolynomialNormotope, GramNormotope) all stumble on the same step:
+bounding a polynomial expression over the current set. Monomial interval arithmetic degrades with
+degree (z&#8305; ranges compound), so the drift bound is either loose (log-norm), grid-priced
+(partition), or solver-priced (SOS). On the fitted box every Chebyshev term obeys</p>
+<div class="eq">|T_&beta;(w)| &le; 1&nbsp;&nbsp; exactly, for every &beta;, every degree,</div>
+<p>so for any polynomial written in Chebyshev coefficients,
+<span class="m">sup&#8321;&#8331;&#8321;&#8321;&#8321;&#8331; p &le; c&#8320; + &Sigma;|c_&beta;|</span> &mdash; one abs-sum,
+degree-independent. Measured: this abs-sum is within ~10% of the <i>true</i> box range on our
+benchmarks. The catch (&sect;7): it is a <i>box</i> bound, and the drift sup lives on the
+<i>set</i>.</p>
+
+<h2><span class="sec">3</span>Computing the linearization A and the leftover C_H</h2>
+<p>In scaled coordinates a trajectory&rsquo;s deviation obeys
+<span class="m">&#7819; = T(f(ox + T&#8315;&sup1;w) &minus; f(ox))</span>, so by the chain rule each
+entry of the basis vector moves as</p>
+<div class="eq">d/dt&nbsp;b&#7522;(w) = (&part;b&#7522;/&part;w)&middot;&#7819; =: p&#7522;(w)</div>
+<p>For polynomial f, each <span class="m">p&#7522;</span> is just <i>some polynomial in w</i> of
+total degree &le; m + deg(f) &minus; 1, so it has a unique, exact, finite expansion in Chebyshev
+polynomials: <span class="m">p&#7522;(w) = &Sigma;_&beta; c&#7522;&beta; T_&beta;(w)</span>.
+<b>That is all A and C_H are</b>: the coefficient table of the lifted vector field in the
+Chebyshev basis, split at degree m &mdash; coefficients on terms of degree &le; m form row i of
+A (the part expressible in the basis we carry), coefficients on higher terms form row i of C_H
+(the leftover, which is what drives y).</p>
+<p>The only question is how to <i>compute</i> the numbers c&#7522;&beta;, since they depend on
+ox and T and are recomputed every step. The method is the classical evaluate-then-transform
+trick:</p>
+<ul>
+<li>A 1-D polynomial of degree &le; q&minus;1 is uniquely determined by its values at q points
+&mdash; the same way a parabola through 3 points <i>is</i> that parabola, exactly.</li>
+<li>If the q points are the roots of T_q (&ldquo;Chebyshev nodes&rdquo;,
+x&#11388; = cos(&pi;(2j+1)/2q)), the map from <i>values at the nodes</i> to <i>Chebyshev
+coefficients</i> has a closed form,
+<span class="m">c&#8342; = (2&minus;&delta;&#8342;&#8320;)/q &middot; &Sigma;&#11388; p(x&#11388;)cos(k&theta;&#11388;)</span>,
+because T&#8342;(cos&theta;) = cos(k&theta;) &mdash; Chebyshev polynomials sampled at these nodes
+are literally sampled cosines, and cosines of different frequencies are orthogonal over the
+nodes. This values&rarr;coefficients map is the Discrete Cosine Transform (the JPEG transform);
+at our sizes it is a small q&times;q matrix multiply.</li>
+<li>In n dimensions: evaluate p&#7522; on the tensor grid of q&#8319; node points, apply the 1-D
+matrix along each axis. Choosing q = m + deg f makes the uniqueness apply, so the recovered
+coefficients are <b>exact</b> &mdash; exact polynomial algebra carried out numerically, not a fit.
+</li>
+</ul>
+<p>Per step this is a few dozen function evaluations (autodiff supplies &part;b/&part;w) plus two
+small matrix multiplies. The alternatives are worse: symbolic product-formula expansion is
+per-step bookkeeping, and routing through the monomial basis reintroduces the 2&#7511;
+coefficient blow-ups this class exists to avoid. deg f is detected once by a Taylor probe
+(polynomial f only, for now &mdash; for general smooth f the expansion would need a certified
+truncation remainder).</p>
+<p><b>The structure of C_H that everything else relies on</b> (verified numerically): it is a
+ladder with almost all the error on the top rung. d/dt of a degree-k basis function under a
+degree-d field has degree &le; k+d&minus;1, which exceeds m only for k near the top &mdash; so
+H&#8342; = 0 for all low degrees; and where nonzero its size is
+<b>O(L<sup>m+1&minus;k</sup>)</b> (L = physical set size), because the field&rsquo;s degree-j
+terms in w carry L<sup>j&minus;1</sup>. Low rungs: ~L&#7512;, negligible. Top rung (k = m):
+~m&sup2;L, dominant.</p>
+
+<h2><span class="sec">4</span>Initialization: lifting a linear set to degree m</h2>
+<p>The initial data is linear: a center and a box/ellipsoid &mdash; degree-1 information. The
+class needs a full |b|&times;|b| invertible &alpha;&#8320;. The linear rows are dictated by the
+data (they encode &#8214;w&#8214;&sup2; &le; 1, the circumscribed ellipsoid). <b>Every other row
+is not determined by the set at all</b>: appending a row
+&epsilon;&middot;(basis function)&#7601; adds &epsilon;&sup2;T_&beta;(w)&sup2; to V, and
+compensating in y makes the represented set the same up to an O(&epsilon;&sup2;) inflation. The
+rows must be nonzero (&alpha;&#8315;&sup1; is needed by the refit and the hull), but their
+magnitudes are free. So initialization is really one question: <b>at what magnitudes do you seed
+the higher-degree rows of a representation whose data only specifies degree 1?</b> (This is the
+same freedom as choosing the regularizer blocks B&#8342; in PolynomialNormotope.)</p>
+<p><b>The seeding rule follows from the normalization of the basis.</b> In the refit coordinates
+every basis function is O(1) on the set, so the natural geometric grading &mdash; degree-k
+quantities are L&#7511;-small, which is what makes a truncation at degree m an
+O(L<sup>m+1</sup>) error in monomial coordinates &mdash; lives nowhere unless &alpha; carries
+it. Seed the degree-k rows at</p>
+<div class="eq">&epsilon;&#8342; = eps &middot; gamma<sup>k&minus;1</sup>,&nbsp;&nbsp;&nbsp;
+gamma &asymp; the effective expansion parameter (&asymp; set scale &times; field curvature)</div>
+<p>and the truncation error is priced at gamma<sup>2(m&minus;1)</sup>: raising m then behaves
+like raising the order of a Taylor model &mdash; pure accuracy, cost falling geometrically
+(measured drift rates 0.0045 &rarr; 0.0003 &rarr; &le;10&#8315;&#8309; for m = 2, 3, 4). The
+price is cond(&alpha;&#8320;) ~ gamma<sup>&minus;(m&minus;1)</sup>, which is mild.</p>
+<p><b>The naive seeding &mdash; all rows at the same &epsilon; &mdash; produces the same initial
+set but catastrophically different dynamics.</b> To see why, the whole mechanism fits in one
+1-D computation. Basis (1, w, T&#8322;), field &#7819; = c&#8322;w&sup2;, seeded
+&alpha; = diag(&epsilon;&#8320;, 1, &epsilon;&#8322;):</p>
+<div class="eq">d/dt T&#8320; = 0,&nbsp;&nbsp; d/dt T&#8321; = c&#8322;(T&#8322;+T&#8320;)/2
+&nbsp;&nbsp;&larr; representable, cancelled by the adjoint<br>
+d/dt T&#8322; = 3c&#8322;T&#8321; + <b>c&#8322;T&#8323;</b>
+&nbsp;&nbsp;&larr; T&#8323; is outside the basis: the only un-cancellable term<br>
+&rArr;&nbsp; V&#775;_uncancelled = 2&middot;[&epsilon;&#8322;T&#8322;]&middot;[&epsilon;&#8322;c&#8322;T&#8323;]
+&nbsp;&rArr;&nbsp; |V&#775;| &le; 2&epsilon;&#8322;&sup2;c&#8322;</div>
+<p>The seed of the degree-2 row multiplies the one error term &mdash; squared. Equal seeding
+(&epsilon;&#8322; = 0.3) prices it at 0.18c&#8322;; degree-scaled seeding
+(&epsilon;&#8322; = 0.06) at 0.007c&#8322;. And at each higher m the erroneous slot moves up one
+degree with a modestly larger derivative factor, so equal seeding makes the cost <i>grow</i>
+with m (measured: 0.11 &rarr; 0.22 &rarr; 0.60 &rarr; 2.46) while degree-scaled seeding shrinks
+it geometrically.</p>
+<table>
+<tr><th>quantity (reverse VDP, r=0.08)</th><th>m=2</th><th>m=3</th><th>m=4</th><th>m=5</th></tr>
+<tr><td>true drift rate, equal seeding (eps at all degrees)</td>
+<td class="num">0.11</td><td class="num">0.22</td><td class="num">0.60</td><td class="num">2.46</td></tr>
+<tr><td>true drift rate, degree-scaled seeding</td>
+<td class="num">0.0045</td><td class="num">0.0003</td><td class="num">&le;1e-5</td><td class="num">&le;1e-5</td></tr>
+<tr><td>cond(&alpha;&#8320;), degree-scaled</td>
+<td class="num">17</td><td class="num">82</td><td class="num">410</td><td class="num">2000</td></tr>
+</table>
+<div class="callout"><b>The constants.</b> The defaults eps = 0.3, gamma = 0.2
+(<code>from_interval(itvl, m, eps, gamma)</code>) are tuned, not derived. eps trades initial-set
+inflation O(eps&sup2;) against conditioning 1/eps. gamma should track the expansion parameter;
+too small is not free &mdash; cond(&alpha;) degrades the refit and bounds faster than the drift
+gain (measured: gamma = 0.05 diverges <i>earlier</i> than 0.2); 0.2 is near the empirical
+crossing point on the VDP benchmarks.</div>
+<div class="callout"><b>Loose ends.</b> (1) The seeded rows are not where nonconvexity comes
+from: rows evolve as row&middot;(I+dtA)&#8315;&sup1; and keep their &epsilon; scale; the set
+curves because the weight-1 row&rsquo;s polynomial picks up higher-degree components along the
+flow. (2) The whole choice is a gauge: a degree-scaled &alpha; in the unit-normalized basis
+equals an equal-weight &alpha; in an L-graded basis &mdash; the L-grading must live in the
+basis (monomial world, bad interval arithmetic), in the metric (this choice, mild cond cost), or
+nowhere (equal seeding, O(1)-priced truncation error).</div>
+
+<h2><span class="sec">5</span>The symplectic step and the exact telescoping</h2>
+<p>Per step of size h, with A evaluated at the old center and frame:</p>
+<div class="eq">&alpha;&#8330;(I + hA) = &alpha; + hU&nbsp;&nbsp;&nbsp;(implicit solve)<br>
+ox&#8330; = ox + h f(ox)</div>
+<p>Along the lifted Euler step <span class="m">b&#8330; = (I + hA)b + hC_H b_hi</span> the implicit
+choice telescopes <i>exactly</i>:</p>
+<div class="eq">&alpha;&#8330; b&#8330; = &alpha; b + h( U b + &alpha;&#8330; C_H b_hi )</div>
+<p>&mdash; the entire modeled transport cancels; only the hypercontrol U and the genuine residual
+drive the level. The y-update just bounds
+<span class="m">&#8214;&alpha;b + hG&#8214;&sup2;</span> over the set (&sect;7). Explicit Euler on
+the adjoint (&alpha;&#8330; = &alpha;(I &minus; hA)) instead leaves
+<span class="m">W = &minus;h&alpha;A&sup2;</span> in the bound: with &#8214;A&#8214; &asymp; 50 on
+the lift this is an O(h&#8214;A&#8214;&sup2;) tax per unit time &mdash; measured ~4&ndash;5%
+looser tubes at the same h, ~5&times; smaller h to match, and a compounding pairing leak on linear
+systems (report, Figure 5). Pre-grading, this same term caused immediate divergence.</p>
+
+<h2><span class="sec">6</span>The refit: recenter, reorient, renormalize (all exact)</h2>
+<p>At every step start, before anything else:</p>
+<ul>
+<li><b>Slice frame.</b> On the variety, b&#8320; &equiv; 1, so the set&rsquo;s linear marginal is
+the lifted ellipsoid <span class="m">{&#8214;&alpha;v&#8214;&sup2; &le; y}</span> intersected
+with the slice v&#8320; = 1 &mdash; an exact ellipsoid
+<span class="m">{&mu; + C&#8869;&xi; : &#8214;&xi;&#8214; &le; s}</span> with
+&mu; = Ca/&#8214;a&#8214;&sup2;, s&sup2; = y &minus; 1/&#8214;a&#8214;&sup2;
+(a, C = rows of &alpha;&#8315;&sup1;). Using the slice matters: the plain ellipsoid projection is
+wrecked by the spectator rows&rsquo; 1/&epsilon; entries in &alpha;&#8315;&sup1;.</li>
+<li><b>Frame change.</b> Map that marginal to the unit ball:
+M = sqrtm(s&sup2;C&#8869;C&#8869;&#7601;), then T &larr; M&#8315;&sup1;T, ox &larr; ox + T&#8315;&sup1;&mu;, and
+&alpha; &larr; &alpha;S where S is the exact change-of-basis matrix for
+b(&mu; + Mw) (an affine map preserves total degree, so S is computed exactly on the (m+1)-point
+grid). The set is unchanged; the basis now sees it centered, unit-scaled, and axis-aligned to its
+own geometry.</li>
+<li><b>Renormalization.</b> &alpha; &larr; &alpha;/c, y &larr; y/c&sup2; with
+c = &#8214;&alpha;&#8214;_F/&radic;|b| &mdash; same set, prevents scale drift over long
+horizons.</li>
+</ul>
+<p>All three are <i>set identities</i> &mdash; they change the description, never the certified
+set, so they can run every step. This is also why the embedding is symplectic-only: the refit is
+inherently a discrete jump; a continuous ODE solver cannot represent it.</p>
+
+<h2><span class="sec">7</span>The four offset bounds</h2>
+<p>All bound <span class="m">V&#8330; = &#8214;&alpha;b + hG&#8214;&sup2;</span>,
+G = Wb + &alpha;&#8330;C_H b_hi, over the set; y&#8330; is their minimum (each is individually
+sound). They differ in <i>where exact algebra hands over to the interval step</i>:</p>
+<table>
+<tr><th>bound</th><th>idea</th><th>uses the set?</th><th>cost/step</th></tr>
+<tr><td>Cauchy&ndash;Schwarz</td><td>(&radic;y + h&#8214;G&#8214;)&sup2;, rowabs per component</td>
+<td>via &#8214;&alpha;b&#8214;&le;&radic;y</td><td class="num">~0.01 ms</td></tr>
+<tr><td>bilinear</td><td>abs-sum of the quadratic-form matrices</td>
+<td>via V &le; y (partly)</td><td class="num">~0.01 ms</td></tr>
+<tr><td>scalar interpolation</td><td>expand 2(&alpha;b)&#7601;G itself in Chebyshev, abs-sum its
+coefficients &mdash; keeps all product cancellations, near-tight <i>box</i> bound</td>
+<td>no</td><td class="num">~0.05 ms</td></tr>
+<tr><td>partition (<code>drift="partition"</code>, G cells/axis)</td><td>Gram-style boundary
+cells on the <i>static</i> [-1,1]&#8319; box: prune cells whose natif(V) misses the level y,
+Lagrangian-projected mean-value bound on the rest</td>
+<td><b>yes &mdash; level set</b></td><td class="num">~3&ndash;9 ms</td></tr>
+</table>
+<p>The measured hierarchy: the first three are near-optimal <i>box</i> bounds, but the drift sup
+lives on the set, and box/set = 3&times;&hellip;40&times; growing with degree. With graded weights
+that gap multiplies a geometrically small number, so <b>interval-only suffices deep in the basin</b>
+(and runs at L2-log-norm speed, 0.05&ndash;0.2 ms/step). Near the basin frontier the budget
+tightens and <b>the partition is what completes the horizon</b> (report, Figure 3: interval m=3
+dies at t&asymp;1.1; partition survives t=14 while the L2 log-norm dies at t&asymp;5.4). The
+partition needs the gather-free basis evaluator (<code>_cheb_eval_safe</code>) because natif
+cannot interpret fancy indexing.</p>
+
+<h2><span class="sec">8</span>Where the current limits are</h2>
+<ul>
+<li><b>Forward VDP / relaxation jump</b>: near the jump |f&Prime;| is several times larger; the
+interval bounds start 50&ndash;100&times; over truth, the certificate inflates while the truth
+contracts, and past a point even the <i>exact</i> drift of the inflated set explodes. Partition is
+converged and still dies &mdash; not a bounding problem.</li>
+<li><b>Ultra-thin sets</b> (100:1 pancake): the bounds are provably exact there
+(partition = sampled truth), and the true drift itself blows up: y absorbs shape misfit measured
+in units of the thin direction, so aspect ratio multiplies the rate. Pure transport-misfit.</li>
+<li>Both point at the same missing piece: the <b>hypercontrol U</b> (already plumbed through every
+bound, including the partition&rsquo;s W term) or a transport law beyond the frozen Carleman
+adjoint &mdash; not more bounding.</li>
+</ul>
+
+<h2><span class="sec">9</span>Code map</h2>
+<table>
+<tr><th>piece</th><th>function / method</th></tr>
+<tr><td>basis table, linear-row index</td><td class="mono-h">cheb_indices(n, m)</td></tr>
+<tr><td>basis evaluation (fast / natif-safe)</td><td class="mono-h">cheb_eval / _cheb_eval_safe</td></tr>
+<tr><td>lift + residual by interpolation</td><td class="mono-h">chebyshev_lift &rarr; (A, C_H)</td></tr>
+<tr><td>exact affine change of basis</td><td class="mono-h">scale_matrix(mu, M, n, m)</td></tr>
+<tr><td>slice marginal ellipsoid</td><td class="mono-h">_slice_frame &rarr; (mu, E)</td></tr>
+<tr><td>set class (ox, T, &alpha;, y; squared g; iover)</td><td class="mono-h">ChebyshevNormotope</td></tr>
+<tr><td>graded initialization</td><td class="mono-h">ChebyshevNormotope.from_interval(itvl, m, eps, gamma)</td></tr>
+<tr><td>refit (recenter/reorient/renormalize)</td><td class="mono-h">ChebyshevNormotopeEmbedding._refit</td></tr>
+<tr><td>step (implicit adjoint + 4 bounds)</td><td class="mono-h">_symplectic_step</td></tr>
+<tr><td>box bounds / level-set bound</td><td class="mono-h">_scalar_boxbound / _partition_level_bound</td></tr>
+<tr><td>degree probe (polynomial f)</td><td class="mono-h">_probe_degree (pjet)</td></tr>
+</table>
+
+<p style="color:var(--muted); font-size:0.9rem; margin-top:2rem;">Companion results page with all
+five figures: <code>cheb_report.html</code>. Experiments reproducible from
+<code>cheb_compare.py</code> / <code>cheb_plots.py</code> in the same directory.</p>
+</main>
+</body>
+</html>

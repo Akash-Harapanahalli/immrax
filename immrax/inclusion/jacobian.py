@@ -312,7 +312,7 @@ def mjacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable:
         Function that returns a list of interval matrices, one per argument group.
         For multiple centers/permutations, vmap over the returned function.
     """
-    jac_fn = jax.jacfwd if mode == "fwd" else jax.jacrev
+    del mode  # columns are computed by one-hot JVPs; fwd/rev is moot
 
     @api_boundary
     def F(
@@ -344,7 +344,6 @@ def mjacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable:
         def z2arg(z):
             return jnp.split(z, cumsum[:-1], axis=-1)
 
-        df_func = [natif(jac_fn(partial(f, **kwargs), i)) for i in range(nargs)]
         _z = arg2z(*[arg.lower for arg in args])
         z_ = arg2z(*[arg.upper for arg in args])
 
@@ -365,13 +364,29 @@ def mjacM(f: Callable[..., jax.Array], mode: str = "fwd") -> Callable:
         retc = []
         npsig = np.asarray(permutation)
 
+        # Column j of the mixed Jacobian is (df/dz_j) at that coordinate's own
+        # interval configuration: a single one-hot JVP. (Evaluating the full
+        # dense Jacobian per configuration and gathering one column costs a
+        # redundant factor of the input dimension.)
+        def fz(z):
+            return f(*z2arg(z), **kwargs)
+
+        jvp_col = natif(lambda z, v: jax.jvp(fz, (z,), (v,))[1])
+        # tangent dtype must match Z's (which promotes bounds with the center)
+        eye = interval(jnp.eye(leninputs, dtype=Z.lower.dtype))
+
+        # Pair each coordinate with the configuration at ITS OWN release
+        # position (rows of Z are indexed by permutation position). Pairing by
+        # within-group selection order instead is only correct when each
+        # group's coordinates appear in ascending order inside the permutation,
+        # and is UNSOUND otherwise (the column is evaluated with its own
+        # coordinate still pinned at the center).
+        pos_of = np.argsort(npsig)
+
         for i in range(nargs):
-            idx = np.logical_and(npsig >= _cumsum[i], npsig < _cumsum[i + 1])
-            iargs = natif(z2arg)(Z[idx]) if nargs > 1 else (Z[idx],)
-            Mi = jax.vmap(df_func[i])(*iargs)
-            retc.append(
-                Mi[np.arange(leninputsfull[i]), :, np.arange(leninputsfull[i])].T
-            )
+            rows = pos_of[_cumsum[i] : _cumsum[i + 1]]
+            cols = jax.vmap(jvp_col)(Z[rows], eye[_cumsum[i] : _cumsum[i + 1]])
+            retc.append(cols.T)
 
         return retc
 

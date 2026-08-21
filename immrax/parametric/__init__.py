@@ -43,6 +43,11 @@ from .sets.gram_normotope import (
     GramNormotopeEmbedding,
 )
 
+from .sets.chebyshev_normotope import (
+    ChebyshevNormotope,
+    ChebyshevNormotopeEmbedding,
+)
+
 from .reach_ilqr import (
     ReachiLQR,
     IterateResult,
@@ -75,6 +80,8 @@ __all__ = [
     "PolynomialNormotopeEmbedding",
     "GramNormotope",
     "GramNormotopeEmbedding",
+    "ChebyshevNormotope",
+    "ChebyshevNormotopeEmbedding",
     "ReachiLQR",
     "IterateResult",
     "RunResult",
