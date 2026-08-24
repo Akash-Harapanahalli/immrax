@@ -352,14 +352,14 @@ styles = {
     "Polytope + adjoint": ("tab:blue", "polytope + adjoint"),
     "L2 normotope (log-norm, no adjoint)": ("tab:olive", "L2 log-norm (no adjoint)"),
     "L2 normotope (log-norm + adjoint)": ("tab:green", "L2 log-norm + adjoint"),
-    "Chebyshev normotope $m=3$ (adjoint + interval drift)": ("tab:red", "Chebyshev m=3"),
+    "Chebyshev normotope m=3 (adjoint + interval drift)": ("tab:red", "Chebyshev m=3"),
 }
 truth_t = {
     "box": onp.array([shoelace(mc_box[:, k, :]) for k in plot_ks]),
     "ell": onp.array([shoelace(mc_ell[:, k, :]) for k in plot_ks]),
 }
 fig2, axb = plt.subplots(figsize=(6, 4.5))
-for name, t, iover_at, area_at, ref in methods:
+for name, _, t, iover_at, area_at, ref in methods:
     color, lab = styles[name]
     bl = []
     for i, k in enumerate(plot_ks):

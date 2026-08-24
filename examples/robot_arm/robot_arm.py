@@ -75,8 +75,14 @@ dt, tf = 0.01, 10.0
 N = int(round(tf / dt))
 snap_ts = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
 snap_ks = [int(round(t / dt)) for t in snap_ts]
-LABEL_TMAX = 4.0  # later sets pile up at the setpoint; the zoom panel shows them
 ZOOM_TMIN = 5.0  # the zoom panel shows the snapshots from this time on
+ZOOM_DT = 0.25  # ... sampled this finely; the tail is where the methods separate
+# A snapshot up to LABEL_TMAX is still big enough on the full view to carry its
+# t label inside the set; past it the sets are dots at the setpoint, so their
+# labels are fanned out around it on a connector.
+LABEL_TMAX = 5.0
+LABEL_ARC = (30.0, 100.0)  # degrees, fan for the off-to-the-side labels
+LABEL_R = (0.20, 0.30)  # fan radii, as fractions of the (x, y) axis span
 WMAX = 1.0  # a set wider than this is treated as blown up
 perm = irx.Permutation((0, 3, 4, 1, 2))  # velocities first (EMSOFT notebook)
 
@@ -303,9 +309,13 @@ else:
 print()
 
 # ---------------------------------------------------------------------- plot
-fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+XLIM0, YLIM0 = (1.4, 2.2), (0.9, 1.6)
+xspan, yspan = XLIM0[1] - XLIM0[0], YLIM0[1] - YLIM0[0]
 eq = onp.array([2.0, 1.0])  # closed-loop setpoint
-zoom_ks = [k for k in snap_ks if k * dt >= ZOOM_TMIN]
+zoom_ts = [ZOOM_TMIN + i * ZOOM_DT
+           for i in range(int(round((tf - ZOOM_TMIN) / ZOOM_DT)) + 1)]
+zoom_ks = [int(round(t / dt)) for t in zoom_ts]
+fig, axs = plt.subplots(1, 2, figsize=(12, 6))
 for ax, ks in [(axs[0], snap_ks), (axs[1], zoom_ks)]:
     for k in ks:
         hb = mc_box[ConvexHull(mc_box[:, k, :2]).vertices, k, :2]
@@ -314,19 +324,27 @@ for ax, ks in [(axs[0], snap_ks), (axs[1], zoom_ks)]:
         ax.fill(hb[:, 0], hb[:, 1], color="0.68", zorder=0.5)
 axs[0].fill([], [], color="0.85", label="true set (ellipsoid init)")
 axs[0].fill([], [], color="0.68", label="true set (box init $\\subset$ ellipsoid)")
+
+lbl_kw = dict(color="0.25", fontsize=9, ha="center", va="center",
+              bbox=dict(fc="white", ec="none", alpha=0.6, pad=1))
+far = []
 for k in snap_ks:
-    if k * dt > LABEL_TMAX:
-        continue
-    # labels fan out radially from the setpoint (snapshots crowd near it)
     cen = mc_ell[:, k, :2].mean(0)
-    u = cen - eq
-    nu = onp.linalg.norm(u)
-    u = u / nu if nu > 0.02 else onp.array([-0.8, 0.6])
-    axs[0].annotate(f"t={k * dt:g}", cen, xytext=cen + 0.05 * u,
-                    color="0.25", fontsize=9, ha="center", va="center", zorder=6,
-                    arrowprops=dict(arrowstyle="-", color="0.5", lw=0.5,
-                                    shrinkA=1, shrinkB=1),
-                    bbox=dict(fc="white", ec="none", alpha=0.6, pad=1))
+    if k * dt <= LABEL_TMAX:
+        # above the fan's connectors, which run out through this cluster
+        axs[0].annotate(f"t={k * dt:g}", cen, zorder=7, **lbl_kw)
+    else:
+        far.append((k, cen))
+# the late snapshots crowd into the setpoint: fan their labels around it
+for i, (k, cen) in enumerate(far):
+    th = onp.deg2rad(LABEL_ARC[0]
+                     + (LABEL_ARC[1] - LABEL_ARC[0]) * i / max(len(far) - 1, 1))
+    tip = eq + onp.array(LABEL_R) * onp.array([xspan * onp.cos(th),
+                                               yspan * onp.sin(th)])
+    axs[0].annotate(f"t={k * dt:g}", cen, xytext=tip,
+                    zorder=6, arrowprops=dict(arrowstyle="-", color="0.5",
+                                              lw=0.5, shrinkA=1, shrinkB=1),
+                    **lbl_kw)
 
 for ax, ks in [(axs[0], snap_ks), (axs[1], zoom_ks)]:
     for k in ks:
@@ -356,8 +374,8 @@ for ax, ks in [(axs[0], snap_ks), (axs[1], zoom_ks)]:
             ax.plot(B[:, 0], B[:, 1], color=color, lw=0.9, alpha=al,
                     label=lab if k == 0 and ax is axs[0] else None)
 
-axs[0].set_xlim(1.4, 2.2)
-axs[0].set_ylim(0.9, 1.6)
+axs[0].set_xlim(*XLIM0)
+axs[0].set_ylim(*YLIM0)
 # Zoom window: fit the alive adjoint certificates at the zoomed snapshots
 # (the diverging no-adjoint rings would dwarf everything; let them clip).
 zlo, zhi = [], []
@@ -371,15 +389,10 @@ zlo, zhi = onp.min(zlo, axis=0), onp.max(zhi, axis=0)
 zpad = 0.08 * (zhi - zlo).max()
 axs[1].set_xlim(zlo[0] - zpad, zhi[0] + zpad)
 axs[1].set_ylim(zlo[1] - zpad, zhi[1] + zpad)
-axs[1].set_title(f"zoom at the setpoint ($t \\geq {ZOOM_TMIN:g}$)")
 for ax in axs:
     ax.set_xlabel("$q_1$")
     ax.set_ylabel("$q_2$")
 axs[0].legend(loc="best", fontsize=9, framealpha=0.9)
-axs[0].set_title(
-    f"Robot arm, box $x_0 \\pm 0.03$ and its circumscribed ball (radius 0.06)\n"
-    f"(dt={dt}, snapshots to t={tf:g})"
-)
 fig.tight_layout()
 for ext in ["pdf", "svg"]:
     out = pathlib.Path(__file__).parent / f"robot_arm.{ext}"

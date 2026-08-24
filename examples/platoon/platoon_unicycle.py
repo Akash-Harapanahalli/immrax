@@ -65,7 +65,7 @@ import numpy as onp
 import immrax as irx
 from immrax.parametric import AdjointEmbedding, Polytope
 
-plt.rcParams.update({"text.usetex": True, "font.family": "serif"})  # Computer Modern
+plt.rcParams.update({"text.usetex": True, "font.family": "serif", "font.size": 12})
 
 HERE = pathlib.Path(__file__).parent
 US_FILE = HERE / "us_unicycle.npy"
@@ -249,7 +249,7 @@ def mjac_permutation(n):
     return irx.Permutation((0,) + perm_v + perm_p + perm_th + perm_u + perm_w)
 
 
-def reach(n, ao, xn, pert_scale=1.0):
+def reach(n, ao, xn, pert_scale=1.0, disable_adjoint=False):
     platoon = UnicyclePlatoon(n)
     x0 = platoon_x0(n)
     pt0 = Polytope.from_interval(irx.icentpert(x0, jnp.tile(PERT_VEHICLE * pert_scale, n)))
@@ -260,7 +260,8 @@ def reach(n, ao, xn, pert_scale=1.0):
     iw = lambda t, x: w_bounds
 
     emb = AdjointEmbedding(platoon, jnp.eye(4 * n), jnp.zeros((0, 4 * n)),
-                           permutation=mjac_permutation(n))
+                           permutation=mjac_permutation(n),
+                           disable_adjoint=disable_adjoint)
     run = jax.jit(lambda p: emb.compute_reachset(t0, tf, p, (iu, iw), dt=dt))
     reps = 6 if n <= 6 else 2  # large runs: one timed repeat after compile
     # Not irx.utils.run_times: it holds the previous result while the next call
@@ -284,14 +285,125 @@ def draw_box(ax, b2, **kw):
     irx.utils.draw_iarray(ax, irx.icentpert(jnp.asarray(c), jnp.asarray(pad)), **kw)
 
 
-def boxes(rs, n):
+def box_at(rs, k):
     yy, (alpha_p, _N) = rs.ys
     K = yy.y.shape[1] // 2
-    out = []
-    for k in range(yy.ox.shape[0]):
-        iy = irx.interval(-yy.y[k, :K], yy.y[k, K:])
-        out.append(irx.interval(alpha_p[k]) @ iy + yy.ox[k])
-    return out
+    iy = irx.interval(-yy.y[k, :K], yy.y[k, K:])
+    return irx.interval(alpha_p[k]) @ iy + yy.ox[k]
+
+
+def boxes(rs):
+    return [box_at(rs, k) for k in range(rs.ys[0].ox.shape[0])]
+
+
+def vehicle_vols(rs, n):
+    """Per-vehicle 4-D box volume at tf, in m^2 . rad . m/s."""
+    b = box_at(rs, -1)
+    w = onp.asarray(b.upper, onp.float64) - onp.asarray(b.lower, onp.float64)
+    return w.reshape(n, 4).prod(1)
+
+
+# --------------------------------------------------------------------- table
+HEADERS = ["N", "# States", "Runtime s (JIT s)", "Average vol", "Final vol"]
+HEADERS_TEX = ["$N$", "\\# States", "Runtime s (JIT s)", "Average vol", "Final vol"]
+# disable_numparse keeps the %.3e volume strings intact (tabulate would rewrite
+# 1.200e-05 as 1.2e-05), but it also left-aligns every column, hence colalign.
+ALIGN = ("right", "right", "left", "right", "right")
+
+
+def table_row(n, t_run, t_jit, v_avg, v_fin):
+    """(plain row, LaTeX row) for one sweep entry."""
+    rt = f"{t_run:.3f} ({t_jit:.0f})"
+    cells = [(f"{v:.3e}", f"{v:.3e}") if onp.isfinite(v) else ("inf", "$\\infty$")
+             for v in (v_avg, v_fin)]
+    return ([n, 4 * n, rt] + [c[0] for c in cells],
+            [n, 4 * n, rt] + [c[1] for c in cells])
+
+
+def print_table(rows, rows_tex, caption):
+    print(f"\n{caption}")
+    try:
+        from tabulate import tabulate
+    except ImportError:  # optional dependency; fall back to a hand-built table
+        print(" & ".join(HEADERS_TEX) + " \\\\")
+        for r in rows_tex:
+            print(" & ".join(str(c) for c in r) + " \\\\")
+    else:
+        print(tabulate(rows, headers=HEADERS, tablefmt="simple",
+                       disable_numparse=True, colalign=ALIGN))
+        print()
+        # latex_raw, not latex_booktabs: the headers carry math ($N$, \#) and
+        # booktabs escapes it. latex_booktabs_raw does not exist -- tabulate
+        # silently falls back to "simple" for an unknown format name.
+        print(tabulate(rows_tex, headers=HEADERS_TEX, tablefmt="latex_raw",
+                       disable_numparse=True, colalign=ALIGN))
+    print()
+
+
+# ------------------------------------------------------------------- figures
+def _colors(n):
+    cmap = plt.get_cmap("tab20")
+    return [cmap(i) for i in onp.linspace(0, 1, n)]
+
+
+def _frame(ax, x0s):
+    ax.set_xlim(0, x0s[-1, 0] + 0.5)
+    ax.set_ylim(-2, x0s[-1, 1] + 0.5)
+
+
+def _save(fig, stem):
+    for ext in ["pdf", "svg"]:
+        fig.savefig(HERE / f"{stem}.{ext}")
+        print(f"saved {HERE}/{stem}.{ext}")
+
+
+def grid_figure(rs, n, stem, ncols=3, every=5):
+    yy = rs.ys[0]
+    ix = boxes(rs)
+    colors = _colors(n)
+    x0s = onp.asarray(platoon_x0(n)).reshape(-1, 4)[:, :2]
+    nrows = -(-n // ncols)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+    axs = onp.atleast_1d(axs).reshape(-1)
+    for j in range(n):
+        ax = axs[j]
+        ax.add_patch(patches.Circle(obstacle_center, obstacle_radius, facecolor="salmon"))
+        for k in range(0, N + 1, every):
+            draw_box(ax, ix[k][4 * j : 4 * j + 2], ec=colors[j])
+        ax.plot(yy.ox[:, 4 * j], yy.ox[:, 4 * j + 1], color=colors[j], alpha=0.25)
+        others = onp.ones(n, bool)
+        others[j] = False
+        ax.scatter(x0s[others, 0], x0s[others, 1], color="k", s=5, alpha=0.1)
+        ax.scatter(x0s[j, 0], x0s[j, 1], color=colors[j], s=5)
+        _frame(ax, x0s)
+    for j in range(n, len(axs)):
+        axs[j].set_axis_off()
+    fig.tight_layout()
+    _save(fig, stem)
+    return fig
+
+
+def overview_figure(rs, n, stem, every=10):
+    yy = rs.ys[0]
+    ix = boxes(rs)
+    colors = _colors(n)
+    x0s = onp.asarray(platoon_x0(n)).reshape(-1, 4)[:, :2]
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.add_patch(patches.Circle(obstacle_center, obstacle_radius,
+                                facecolor="salmon", label="obstacle"))
+    for j in range(n):
+        for k in range(0, N + 1, every):
+            draw_box(ax, ix[k][4 * j : 4 * j + 2], ec=colors[j])
+        ax.plot(yy.ox[:, 4 * j], yy.ox[:, 4 * j + 1], color=colors[j], lw=0.8,
+                label="leader" if j == 0 else None)
+    ax.set_xlabel("$p_x$")
+    ax.set_ylabel("$p_y$")
+    ax.set_aspect("equal")
+    _frame(ax, x0s)
+    ax.legend()
+    fig.tight_layout()
+    _save(fig, stem)
+    return fig
 
 
 # --------------------------------------------------------------------- main
@@ -305,87 +417,28 @@ if __name__ == "__main__":
     ao = jnp.asarray(ao_np)
     xn = jnp.asarray(nominal_state(ao_np))
 
-    results = {}
+    results, rows, rows_tex = {}, [], []
     for n, ps in AGENTS:
         rs, t_run, t_jit = reach(n, ao, xn, ps)
+        vols = vehicle_vols(rs, n)
+        v_avg, v_fin = float(onp.mean(vols)), float(vols[-1])
         # Only SHOW_AGENTS is plotted; holding the rest would pin one
         # (steps, 4n, 4n) adjoint per sweep entry in device memory.
-        results[n] = (rs if n == SHOW_AGENTS else None, t_run, t_jit, ps)
+        results[n] = rs if n == SHOW_AGENTS else None
         del rs
-        print(f"  n={n} (pert {float(PERT_VEHICLE[0]) * ps:g}): {t_run:.3f} s (JIT {t_jit:.0f} s)")
+        r, r_tex = table_row(n, t_run, t_jit, v_avg, v_fin)
+        rows.append(r)
+        rows_tex.append(r_tex)
+        print(f"  n={n}: {t_run:.3f} s (JIT {t_jit:.0f} s)  "
+              f"avg vol {v_avg:.3e}  final vol {v_fin:.3e}")
 
-    caption = (
+    print_table(rows, rows_tex, (
         f"% unicycle platoon adjoint reachability (symplectic, dt={dt}, tf={tf}, "
-        f"fp{args.precision} on {jax.default_backend()}: {dev.device_kind})"
-    )
-    headers = ["Vehicles", "States", "Init. pert", "Runtime s (JIT s)"]
-    rows = [
-        [n, 4 * n, f"{float(PERT_VEHICLE[0]) * ps:g}", f"{results[n][1]:.3f} ({results[n][2]:.0f})"]
-        for n, ps in AGENTS
-    ]
+        f"pert {float(PERT_VEHICLE[0]):g}, fp{args.precision} on "
+        f"{jax.default_backend()}: {dev.device_kind})"))
 
-    print(f"\n{caption}")
-    try:
-        from tabulate import tabulate
-    except ImportError:  # optional dependency; fall back to a hand-built table
-        print(" & ".join(headers) + " \\\\")
-        for r in rows:
-            print(" & ".join(str(c) for c in r) + " \\\\")
-    else:
-        print(tabulate(rows, headers=headers, tablefmt="simple"))
-        print()
-        print(tabulate(rows, headers=headers, tablefmt="latex_booktabs"))
-    print()
-
-    # ------------------------------------------------------------- figures
     n = SHOW_AGENTS
-    rs, _, _, _ = results[n]
-    yy = rs.ys[0]
-    ix = boxes(rs, n)
-    cmap = plt.get_cmap("tab20")
-    colors = [cmap(i) for i in onp.linspace(0, 1, n)]
-    x0s = onp.asarray(platoon_x0(n)).reshape(-1, 4)[:, :2]
-
-    ncols = 3
-    nrows = -(-n // ncols)
-    fig, axs = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
-    axs = onp.atleast_1d(axs).reshape(-1)
-    for j in range(n):
-        ax = axs[j]
-        ax.add_patch(patches.Circle(obstacle_center, obstacle_radius, facecolor="salmon"))
-        for k in range(0, N + 1, 5):
-            draw_box(ax, ix[k][4 * j : 4 * j + 2], ec=colors[j])
-        ax.plot(yy.ox[:, 4 * j], yy.ox[:, 4 * j + 1], color=colors[j], alpha=0.25)
-        others = onp.ones(n, bool)
-        others[j] = False
-        ax.scatter(x0s[others, 0], x0s[others, 1], color="k", s=5, alpha=0.1)
-        ax.scatter(x0s[j, 0], x0s[j, 1], color=colors[j], s=5)
-        ax.set_xlim(0, x0s[-1, 0] + 0.5)
-        ax.set_ylim(-2, x0s[-1, 1] + 0.5)
-        ax.set_title(f"vehicle {j + 1}", fontsize=9)
-    for j in range(n, len(axs)):
-        axs[j].set_axis_off()
-    fig.suptitle(f"{n}-vehicle unicycle platoon, adjoint polytope reach sets (symplectic, dt={dt})")
-    fig.tight_layout()
-    for ext in ["pdf", "svg"]:
-        fig.savefig(HERE / f"platoon_unicycle_grid.{ext}")
-        print(f"saved {HERE}/platoon_unicycle_grid.{ext}")
-
-    fig2, ax = plt.subplots(figsize=(6, 6))
-    ax.add_patch(patches.Circle(obstacle_center, obstacle_radius, facecolor="salmon", label="obstacle"))
-    for j in range(n):
-        for k in range(0, N + 1, 10):
-            draw_box(ax, ix[k][4 * j : 4 * j + 2], ec=colors[j])
-        ax.plot(yy.ox[:, 4 * j], yy.ox[:, 4 * j + 1], color=colors[j], lw=0.8,
-                label="leader" if j == 0 else None)
-    ax.set_xlabel("$p_x$")
-    ax.set_ylabel("$p_y$")
-    ax.set_aspect("equal")
-    ax.legend(fontsize=9)
-    ax.set_title(f"{n}-vehicle unicycle platoon reach tube")
-    fig2.tight_layout()
-    for ext in ["pdf", "svg"]:
-        fig2.savefig(HERE / f"platoon_unicycle_overview.{ext}")
-        print(f"saved {HERE}/platoon_unicycle_overview.{ext}")
+    grid_figure(results[n], n, "platoon_unicycle_grid")
+    overview_figure(results[n], n, "platoon_unicycle_overview")
     if not args.no_show:
         plt.show()

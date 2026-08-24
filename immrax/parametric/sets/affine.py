@@ -1,3 +1,4 @@
+import math
 from typing import Tuple
 
 import jax
@@ -19,7 +20,7 @@ from ...inclusion import (
 )
 from ...neural import fastlin
 from ..parametope import Parametope
-from ..embedding import ParametricEmbedding
+from ..embedding import ParametricEmbedding, ReachsetSolution
 from functools import partial
 
 @register_pytree_node_class
@@ -84,6 +85,8 @@ class AdjointEmbedding(ParametricEmbedding):
         kap: float = 0.1,
         permutation=None,
         disable_adjoint=False,
+        reset_window=None,
+        reset_growth=1.02,
     ):
         #  refine_factory:Callable[[ArrayLike], Callable]=partial(SampleRefinement, num_samples=10)):
         super().__init__(sys)
@@ -95,6 +98,8 @@ class AdjointEmbedding(ParametricEmbedding):
         self.N0 = N0
         self.permutation = permutation
         self.disable_adjoint = disable_adjoint
+        self.reset_window = reset_window
+        self.reset_growth = reset_growth
 
     def _initialize(self, pt0: hParametope) -> ArrayLike:
         if not isinstance(pt0, hParametope):
@@ -119,6 +124,82 @@ class AdjointEmbedding(ParametricEmbedding):
         alpha_p, N = aux
         iz = _refine_N(pt.hinv(pt.y), N)
         return interval(alpha_p) @ iz + pt.ox
+
+    def _hull(self, state):
+        """Axis-aligned hull of the parametope, relative to its center."""
+        pt, (alpha_p, _) = state
+        K = pt.y.shape[0] // 2
+        return interval(alpha_p) @ interval(-pt.y[:K], pt.y[K:])
+
+    def _reset(self, state):
+        """Re-box onto the identity frame. Sound -- the new set is the interval
+        hull of the old one -- but it discards the anisotropy alpha had
+        accumulated, which is the entire cost of the operation."""
+        pt, (_, N) = state
+        hull = self._hull(state)
+        I = jnp.eye(pt.alpha.shape[1], dtype=pt.alpha.dtype)
+        y = jnp.concatenate([-hull.lower, hull.upper])
+        return pt.from_parametope(hParametope(pt.ox, I, y)), (I, N)
+
+    def compute_reachset(self, t0, tf, pt0, inputs=[], dt=0.01, **kwargs):
+        """With ``reset_window=C`` set, step the symplectic scan one step at a
+        time and watch the hull width over a sliding window of C steps. When its
+        per-step growth exceeds ``reset_growth``, roll back to the start of the
+        window, re-box there (:meth:`_reset`), and continue from that point.
+
+        The offset blows up doubly-exponentially but its growth *rate* ramps
+        smoothly, so the window sees it coming with steps to spare. Rolling back
+        means the re-box lands on the set as it was BEFORE the ramp, which is
+        much tighter than re-boxing at the moment of detection.
+
+        Width, not volume: the flow contracts hard along several directions, so
+        the volume can fall while the binding width grows.
+
+        The rollback target must strictly advance past the previous one. The
+        window straddling a reset gets re-checked, and re-boxing an already
+        axis-aligned set is a no-op, so without that guard it loops forever.
+        """
+        if self.reset_window is None or kwargs.get("solver", "symplectic") != "symplectic":
+            return super().compute_reachset(t0, tf, pt0, inputs, dt, **kwargs)
+
+        f_kwargs = kwargs.get("f_kwargs", {})
+        t0_, tf_, dt_ = float(t0), float(tf), float(dt)
+        N = max(1, int(round((tf_ - t0_) / dt_)))
+        h = (tf_ - t0_) / N
+        ts = t0_ + h * jnp.arange(N + 1)
+        C = int(self.reset_window)
+        thresh = C * math.log(self.reset_growth)
+
+        # Cache the traced step on the instance. Building the jit inside this
+        # method makes a fresh lambda per call, which misses the jit cache and
+        # recompiles the whole step every time (~12s at n=9, i.e. 160x the cost
+        # of the run itself).
+        key = (tuple(map(id, inputs)), h, f_kwargs)
+        cached = getattr(self, "_adaptive_step", None)
+        if cached is None or cached[0] != key:
+            cached = (key,
+                      jax.jit(lambda s, tk: self._symplectic_step(
+                          tk, h, s, *[u(tk, s) for u in inputs], **f_kwargs)),
+                      jax.jit(lambda s: jnp.log(jnp.max(self._hull(s).width))))
+            object.__setattr__(self, "_adaptive_step", cached)
+        _, step, logw = cached
+
+        states = [jax.tree.map(jnp.asarray, (pt0, self._initialize(pt0)))]
+        lw = [float(logw(states[0]))]
+        k, last = 0, -1
+        while k < N:
+            states.append(step(states[k], ts[k]))
+            lw.append(float(logw(states[k + 1])))
+            k += 1
+            # `not (... <= ...)`, so a non-finite width trips the rollback too.
+            if k - C > last and not (lw[k] - lw[k - C] <= thresh):
+                last = k = k - C
+                del states[k + 1:], lw[k + 1:]
+                states[k] = self._reset(states[k])
+                lw[k] = float(logw(states[k]))
+
+        return ReachsetSolution(ts=ts, ys=jax.tree.map(
+            lambda *xs: jnp.stack(xs), *states))
 
     def _dynamics(
         self, t, state: Tuple[hParametope, ArrayLike], *args,
@@ -363,7 +444,12 @@ class AdjointEmbedding(ParametricEmbedding):
             pt.from_parametope(hParametope(ox, alpha_next, y)),
             (alpha_p_next, N_next),
         )
-        pt_dot, _ = self._dynamics(t, state_next, *args, U=U, **kwargs)
+        # U=ustar (identical to U here, since ustar IS the reshaped hypercontrol):
+        # any forcing on alpha must also enter the offset bound, because the
+        # discrete pairing is z_next = z + dt (ustar (x-ox) + alpha_next (M-A)(x-ox)).
+        # Dropping it loses the ustar (x-ox) term and the enclosure stops
+        # containing the flow.
+        pt_dot, _ = self._dynamics(t, state_next, *args, U=ustar, **kwargs)
 
         y_next = y + dt * pt_dot.y
 
