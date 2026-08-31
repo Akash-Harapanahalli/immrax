@@ -9,6 +9,7 @@ from .sets.affine import (
     AffineParametope,
     hParametope,
     AdjointEmbedding,
+    StackedAdjointEmbedding,
     FastlinAdjointEmbedding,
 )
 

@@ -88,6 +88,16 @@ class Polytope(hParametope):
         cent, pert = i2centpert(interval(*args))
         return Polytope(cent, jnp.eye(len(cent)), jnp.concatenate((pert, pert)))
 
+    @classmethod
+    def stacked_from_interval(cls, *args):
+        """Stacked frame ``[I; I]`` for :class:`StackedAdjointEmbedding`: two
+        redundant copies of the same box, one rotated by the adjoint and one
+        held axis-aligned."""
+        cent, pert = i2centpert(interval(*args))
+        n = len(cent)
+        return Polytope(cent, jnp.vstack((jnp.eye(n), jnp.eye(n))),
+                        jnp.concatenate((pert, pert, pert, pert)))
+
     def add_rows(self, Haug, Hp):
         yaug = interval(Haug @ Hp) @ self.hinv(self.y)
         return Polytope(

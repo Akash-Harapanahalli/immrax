@@ -23,8 +23,8 @@ width of the chain.
 The leader nominal ships as ``us_unicycle.npy``; regenerate with
 ``python platoon_unicycle.py --regenerate`` (requires casadi + ipopt).
 
-Outputs: platoon_unicycle_grid.{pdf,svg}, platoon_unicycle_overview.{pdf,svg}
-(for SHOW_AGENTS vehicles), and a LaTeX runtime table on stdout.
+Outputs: platoon_unicycle_<method>_{grid,overview}.{pdf,svg} (for SHOW_AGENTS
+vehicles), and a LaTeX runtime table on stdout.
 """
 
 # ruff: noqa: E402  (backend/x64 flags must be set before jax.numpy is imported)
@@ -42,6 +42,8 @@ _ap.add_argument("--regenerate", action="store_true", help="re-solve the leader 
 _ap.add_argument("--platform", choices=("auto", "gpu", "cpu"), default="auto", help="JAX backend")
 _ap.add_argument("--no-show", action="store_true", help="save figures without opening a window")
 _ap.add_argument("--precision", choices=("32", "64"), default="32", help="float width")
+_ap.add_argument("--method", choices=("stacked", "adjoint", "interval"), default="stacked",
+                 help="stacked frame [A;I] (default), plain adjoint, or interval (alpha frozen)")
 # When imported rather than run, take flags from $PLATOON_ARGS.
 args = (
     _ap.parse_args()
@@ -63,7 +65,7 @@ import matplotlib.pyplot as plt
 import numpy as onp
 
 import immrax as irx
-from immrax.parametric import AdjointEmbedding, Polytope
+from immrax.parametric import AdjointEmbedding, Polytope, StackedAdjointEmbedding
 
 plt.rcParams.update({"text.usetex": True, "font.family": "serif", "font.size": 12})
 
@@ -249,19 +251,24 @@ def mjac_permutation(n):
     return irx.Permutation((0,) + perm_v + perm_p + perm_th + perm_u + perm_w)
 
 
-def reach(n, ao, xn, pert_scale=1.0, disable_adjoint=False):
+def reach(n, ao, xn, pert_scale=1.0, disable_adjoint=False, stacked=False):
     platoon = UnicyclePlatoon(n)
     x0 = platoon_x0(n)
-    pt0 = Polytope.from_interval(irx.icentpert(x0, jnp.tile(PERT_VEHICLE * pert_scale, n)))
+    ix0 = irx.icentpert(x0, jnp.tile(PERT_VEHICLE * pert_scale, n))
     w_bounds = irx.icentpert(jnp.zeros(2 * n), jnp.zeros(2 * n))
 
     iu = lambda t, x: irx.interval(jnp.concatenate(
         [ao[jnp.asarray(t / dt).astype(int)], xn[jnp.asarray(t / dt).astype(int)]]))
     iw = lambda t, x: w_bounds
 
-    emb = AdjointEmbedding(platoon, jnp.eye(4 * n), jnp.zeros((0, 4 * n)),
-                           permutation=mjac_permutation(n),
-                           disable_adjoint=disable_adjoint)
+    if stacked:
+        pt0 = Polytope.stacked_from_interval(ix0)
+        emb = StackedAdjointEmbedding(platoon, 4 * n, permutation=mjac_permutation(n))
+    else:
+        pt0 = Polytope.from_interval(ix0)
+        emb = AdjointEmbedding(platoon, jnp.eye(4 * n), jnp.zeros((0, 4 * n)),
+                               permutation=mjac_permutation(n),
+                               disable_adjoint=disable_adjoint)
     run = jax.jit(lambda p: emb.compute_reachset(t0, tf, p, (iu, iw), dt=dt))
     reps = 6 if n <= 6 else 2  # large runs: one timed repeat after compile
     # Not irx.utils.run_times: it holds the previous result while the next call
@@ -289,6 +296,12 @@ def box_at(rs, k):
     yy, (alpha_p, _N) = rs.ys
     K = yy.y.shape[1] // 2
     iy = irx.interval(-yy.y[k, :K], yy.y[k, K:])
+    d = yy.alpha.shape[2]
+    if yy.alpha.shape[1] == 2 * d:  # stacked frame: meet of the two blocks
+        b1 = irx.interval(alpha_p[k]) @ iy[:d]
+        b2 = iy[d:]
+        return irx.interval(jnp.maximum(b1.lower, b2.lower),
+                            jnp.minimum(b1.upper, b2.upper)) + yy.ox[k]
     return irx.interval(alpha_p[k]) @ iy + yy.ox[k]
 
 
@@ -419,7 +432,8 @@ if __name__ == "__main__":
 
     results, rows, rows_tex = {}, [], []
     for n, ps in AGENTS:
-        rs, t_run, t_jit = reach(n, ao, xn, ps)
+        rs, t_run, t_jit = reach(n, ao, xn, ps, stacked=args.method == "stacked",
+                                 disable_adjoint=args.method == "interval")
         vols = vehicle_vols(rs, n)
         v_avg, v_fin = float(onp.mean(vols)), float(vols[-1])
         # Only SHOW_AGENTS is plotted; holding the rest would pin one
@@ -433,12 +447,12 @@ if __name__ == "__main__":
               f"avg vol {v_avg:.3e}  final vol {v_fin:.3e}")
 
     print_table(rows, rows_tex, (
-        f"% unicycle platoon adjoint reachability (symplectic, dt={dt}, tf={tf}, "
+        f"% unicycle platoon {args.method} reachability (symplectic, dt={dt}, tf={tf}, "
         f"pert {float(PERT_VEHICLE[0]):g}, fp{args.precision} on "
         f"{jax.default_backend()}: {dev.device_kind})"))
 
     n = SHOW_AGENTS
-    grid_figure(results[n], n, "platoon_unicycle_grid")
-    overview_figure(results[n], n, "platoon_unicycle_overview")
+    grid_figure(results[n], n, f"platoon_unicycle_{args.method}_grid")
+    overview_figure(results[n], n, f"platoon_unicycle_{args.method}_overview")
     if not args.no_show:
         plt.show()

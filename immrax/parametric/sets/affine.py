@@ -1,4 +1,3 @@
-import math
 from typing import Tuple
 
 import jax
@@ -20,7 +19,7 @@ from ...inclusion import (
 )
 from ...neural import fastlin
 from ..parametope import Parametope
-from ..embedding import ParametricEmbedding, ReachsetSolution
+from ..embedding import ParametricEmbedding
 from functools import partial
 
 @register_pytree_node_class
@@ -85,8 +84,6 @@ class AdjointEmbedding(ParametricEmbedding):
         kap: float = 0.1,
         permutation=None,
         disable_adjoint=False,
-        reset_window=None,
-        reset_growth=1.02,
     ):
         #  refine_factory:Callable[[ArrayLike], Callable]=partial(SampleRefinement, num_samples=10)):
         super().__init__(sys)
@@ -98,8 +95,6 @@ class AdjointEmbedding(ParametricEmbedding):
         self.N0 = N0
         self.permutation = permutation
         self.disable_adjoint = disable_adjoint
-        self.reset_window = reset_window
-        self.reset_growth = reset_growth
 
     def _initialize(self, pt0: hParametope) -> ArrayLike:
         if not isinstance(pt0, hParametope):
@@ -124,82 +119,6 @@ class AdjointEmbedding(ParametricEmbedding):
         alpha_p, N = aux
         iz = _refine_N(pt.hinv(pt.y), N)
         return interval(alpha_p) @ iz + pt.ox
-
-    def _hull(self, state):
-        """Axis-aligned hull of the parametope, relative to its center."""
-        pt, (alpha_p, _) = state
-        K = pt.y.shape[0] // 2
-        return interval(alpha_p) @ interval(-pt.y[:K], pt.y[K:])
-
-    def _reset(self, state):
-        """Re-box onto the identity frame. Sound -- the new set is the interval
-        hull of the old one -- but it discards the anisotropy alpha had
-        accumulated, which is the entire cost of the operation."""
-        pt, (_, N) = state
-        hull = self._hull(state)
-        I = jnp.eye(pt.alpha.shape[1], dtype=pt.alpha.dtype)
-        y = jnp.concatenate([-hull.lower, hull.upper])
-        return pt.from_parametope(hParametope(pt.ox, I, y)), (I, N)
-
-    def compute_reachset(self, t0, tf, pt0, inputs=[], dt=0.01, **kwargs):
-        """With ``reset_window=C`` set, step the symplectic scan one step at a
-        time and watch the hull width over a sliding window of C steps. When its
-        per-step growth exceeds ``reset_growth``, roll back to the start of the
-        window, re-box there (:meth:`_reset`), and continue from that point.
-
-        The offset blows up doubly-exponentially but its growth *rate* ramps
-        smoothly, so the window sees it coming with steps to spare. Rolling back
-        means the re-box lands on the set as it was BEFORE the ramp, which is
-        much tighter than re-boxing at the moment of detection.
-
-        Width, not volume: the flow contracts hard along several directions, so
-        the volume can fall while the binding width grows.
-
-        The rollback target must strictly advance past the previous one. The
-        window straddling a reset gets re-checked, and re-boxing an already
-        axis-aligned set is a no-op, so without that guard it loops forever.
-        """
-        if self.reset_window is None or kwargs.get("solver", "symplectic") != "symplectic":
-            return super().compute_reachset(t0, tf, pt0, inputs, dt, **kwargs)
-
-        f_kwargs = kwargs.get("f_kwargs", {})
-        t0_, tf_, dt_ = float(t0), float(tf), float(dt)
-        N = max(1, int(round((tf_ - t0_) / dt_)))
-        h = (tf_ - t0_) / N
-        ts = t0_ + h * jnp.arange(N + 1)
-        C = int(self.reset_window)
-        thresh = C * math.log(self.reset_growth)
-
-        # Cache the traced step on the instance. Building the jit inside this
-        # method makes a fresh lambda per call, which misses the jit cache and
-        # recompiles the whole step every time (~12s at n=9, i.e. 160x the cost
-        # of the run itself).
-        key = (tuple(map(id, inputs)), h, f_kwargs)
-        cached = getattr(self, "_adaptive_step", None)
-        if cached is None or cached[0] != key:
-            cached = (key,
-                      jax.jit(lambda s, tk: self._symplectic_step(
-                          tk, h, s, *[u(tk, s) for u in inputs], **f_kwargs)),
-                      jax.jit(lambda s: jnp.log(jnp.max(self._hull(s).width))))
-            object.__setattr__(self, "_adaptive_step", cached)
-        _, step, logw = cached
-
-        states = [jax.tree.map(jnp.asarray, (pt0, self._initialize(pt0)))]
-        lw = [float(logw(states[0]))]
-        k, last = 0, -1
-        while k < N:
-            states.append(step(states[k], ts[k]))
-            lw.append(float(logw(states[k + 1])))
-            k += 1
-            # `not (... <= ...)`, so a non-finite width trips the rollback too.
-            if k - C > last and not (lw[k] - lw[k - C] <= thresh):
-                last = k = k - C
-                del states[k + 1:], lw[k + 1:]
-                states[k] = self._reset(states[k])
-                lw[k] = float(logw(states[k]))
-
-        return ReachsetSolution(ts=ts, ys=jax.tree.map(
-            lambda *xs: jnp.stack(xs), *states))
 
     def _dynamics(
         self, t, state: Tuple[hParametope, ArrayLike], *args,
@@ -470,6 +389,90 @@ class AdjointEmbedding(ParametricEmbedding):
             hParametope(ox + dt * pt_dot.ox, alpha_next, y_next)
         )
         return pt_next, (alpha_p_next, N_next)
+
+
+def _stacked_y(y, d):
+    """Offsets of a stacked frame, as (block-1 interval, block-2 interval)."""
+    m = y.shape[0] // 2
+    lo, up = -y[:m], y[m:]
+    return interval(lo[:d], up[:d]), interval(lo[d:], up[d:])
+
+
+def _join_y(b1, b2):
+    return jnp.concatenate([-b1.lower, -b2.lower, b1.upper, b2.upper])
+
+
+def _meet(a, b):
+    return interval(jnp.maximum(a.lower, b.lower), jnp.minimum(a.upper, b.upper))
+
+
+class StackedAdjointEmbedding(AdjointEmbedding):
+    r"""Adjoint embedding on a doubled frame :math:`\alpha = [A;\,I]`.
+
+    Block 1 follows the adjoint; block 2 is held at the identity. Freezing it is
+    a hypercontrol: the discrete pairing ``alpha_next (I + dt J) = alpha + dt
+    ustar`` forces ``ustar_2 = J``, and block 2's offset growth becomes
+    ``(I(Mx - J) + J) = Mx`` -- the plain interval bound.
+
+    Each step the blocks refine each other, and ``_dynamics`` is handed
+    ``[0 | I]`` so the hull it bounds the mean-value remainder over is their
+    *meet*: as tight as the adjoint's own frame normally, capped by the
+    axis-aligned bound once that frame's hull starts to run away. The cap is
+    what stops the offset blowup a plain adjoint suffers on wide initial sets.
+
+    Build the initial set with :meth:`~immrax.parametric.Polytope.stacked_from_interval`.
+    """
+
+    def __init__(self, sys, n, permutation=None, refine=True):
+        # aux carries ap1 = A^-1 alone (n x n). [ap1 | 0] would also be a valid
+        # left inverse of [A; I], but its zero block is stored at every step --
+        # 2.4 GB of zeros at n=250.
+        super().__init__(sys, jnp.eye(n), jnp.zeros((0, 2 * n)),
+                         permutation=permutation)
+        self.refine = refine
+
+    def iover(self, state):
+        pt, (ap1, _) = state
+        b1, b2 = _stacked_y(pt.y, pt.alpha.shape[1])
+        return _meet(interval(ap1) @ b1, b2) + pt.ox
+
+    def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
+        pt, (ap1, N) = state
+        alpha, ox, y = pt.alpha, pt.ox, pt.y
+        d = alpha.shape[1]
+        centers = (jnp.array([t]), ox) + tuple(a.center for a in args)
+        J = self.Jf_x(*centers)
+        I = jnp.eye(d, dtype=alpha.dtype)
+        B = I + dt * J
+
+        A_cur = alpha[:d]
+        A_next = jnp.linalg.solve(B.T, A_cur.T).T
+        ap1_next = B @ ap1      # exact inverse update; no O(d^3) solve per step
+        ustar = jnp.vstack([jnp.zeros_like(J), J])
+
+        if self.refine:
+            b1, b2 = _stacked_y(y, d)
+            b2 = _meet(b2, interval(ap1) @ b1)
+            b1 = _meet(b1, interval(A_cur) @ b2)
+            y = _join_y(b1, b2)
+
+        alpha_next = jnp.vstack([A_next, I])
+        state_next = (
+            pt.from_parametope(hParametope(ox, alpha_next, y)),
+            (jnp.hstack([jnp.zeros((d, d), alpha.dtype), I]), N),
+        )
+        pt_dot, _ = self._dynamics(t, state_next, *args, U=ustar, **kwargs)
+        y_next = y + dt * pt_dot.y
+
+        nrm = jnp.concatenate([jnp.linalg.norm(A_next, axis=1),
+                               jnp.ones(d, alpha.dtype)])
+        alpha_next = alpha_next / nrm[:, None]
+        m = y_next.shape[0] // 2
+        y_next = jnp.concatenate([y_next[:m] / nrm, y_next[m:] / nrm])
+        return (
+            pt.from_parametope(hParametope(ox + dt * pt_dot.ox, alpha_next, y_next)),
+            (ap1_next * nrm[:d][None, :], N),
+        )
 
 
 def _licq_ustar(alpha, u0, kap):
