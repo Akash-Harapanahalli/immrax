@@ -161,9 +161,19 @@ class NormotopeEmbedding(ParametricEmbedding):
         return nt0.alpha.shape
 
     def _dynamics(
-        self, t, state, *args, U=None, perm=None, adjoint=True, ix=None, alpha_dot=None
+        self, t, state, *args, U=None, perm=None, adjoint=True, ix=None, alpha_pair=None
     ):
         r"""Normotope embedding dynamics.
+
+        With ``A`` the Jacobian frozen at the center (zero when ``adjoint`` is
+        False), ``M`` its mixed-Jacobian enclosure over the set and ``U`` the
+        hypercontrol on ``H_dot = -H A + U``, the offset grows as
+
+            y_dot = max_{M} mu((H_pair (M - A) + U) H^+) y.
+
+        ``alpha_pair`` defaults to ``H``, where the bracket reduces to
+        ``H_dot + H M``; :meth:`_symplectic_step` passes ``H_next``, the
+        multiplier the exact discrete pairing requires.
 
         Parameters
         ----------
@@ -172,53 +182,43 @@ class NormotopeEmbedding(ParametricEmbedding):
             mixed-Jacobian evaluation; tighter ``ix`` only reduces conservatism.
             Defaults to ``None`` (plain ``nt.iover()``). With ``kappa > 0`` it
             also enables the soft ``y``-clamp (see ``kappa``).
-        alpha_dot : ArrayLike, optional
-            Externally supplied ``H_dot`` (e.g. the discrete rate from
-            :meth:`_symplectic_step`); replaces the continuous ``-H A + U``.
         """
         nt, aux = state
-        Ut = U.reshape(nt.alpha.shape) if U is not None else jnp.zeros_like(nt.alpha)
+        H, Hp, y = nt.alpha, nt.alpha_inv, nt.y
+        H_pair = H if alpha_pair is None else alpha_pair
+        Ut = U.reshape(H.shape) if U is not None else jnp.zeros_like(H)
 
-        H = nt.alpha
-        Hp = nt.alpha_inv
-        y = nt.y
-
-        if alpha_dot is not None:
-            H_dot = alpha_dot
-        elif adjoint:
-            # Derived at call time (not frozen in __init__) so vmap/jit over the
-            # system's parameters thread through.
-            A = jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
-            H_dot = -H @ A + Ut
-        else:
-            H_dot = Ut
+        # Derived at call time (not frozen in __init__) so vmap/jit over the
+        # system's parameters thread through.
+        A = (
+            jax.jacfwd(self.sys.f, 1)(0.0, nt.ox)
+            if adjoint
+            else jnp.zeros((H.shape[1],) * 2, H.dtype)
+        )
+        H_dot = -H @ A + Ut
 
         # Mixed Jacobian over the tightest valid enclosure: the normotope's own
         # hull, optionally intersected with an external box ix.
         box = nt.iover() if ix is None else (ix & nt.iover())
-
-        MM = mjacM(self.sys.f)(
+        Mx = interval(mjacM(self.sys.f)(
             t, box, center=(jnp.zeros(1), nt.ox), permutation=perm
-        )
-        Mx = interval(MM[1])
+        )[1])
 
         # Exact contraction bound: corner the interval Jacobian [Mx] itself with
-        # sparse corners (point matrices Mi), then form H_dot @ Hp + H @ Mi @ Hp as
-        # an *exact* product (no interval matrix-product wrapping). Since
-        # mu(H_dot Hp + H M Hp) is convex and affine in M and Mx = conv(corners),
-        # the max over corners is the exact sup over [Mx] -- the tightest bound.
-        # gsc returns a stacked (num_corners, n, n) array; vmap mu over the corners.
-        Ms = self.gsc(Mx)
-        mus = jax.vmap(lambda Mi: nt.mu(H_dot @ Hp + H @ Mi @ Hp))(Ms)
-        c = jnp.max(mus)
+        # sparse corners (point matrices Mi), then form the pairing matrix as an
+        # *exact* product (no interval matrix-product wrapping). Since mu is
+        # convex and affine in M and Mx = conv(corners), the max over corners is
+        # the exact sup over [Mx] -- the tightest bound.
+        c = jnp.max(jax.vmap(lambda Mi: nt.mu((H_pair @ (Mi - A) + Ut) @ Hp))(
+            self.gsc(Mx)
+        ))
         y_dot = c * y
 
         # Soft clamp of y toward the tightened box (see kappa). The box corners
         # are frozen certificate data, so gradients flow only through (H, ox), and
         # the pull is active only where the static enclosure already holds.
         if ix is not None and self.kappa != 0.0:
-            corners = get_corners(box)
-            y_box = jnp.max(jax.vmap(nt.g)(corners))
+            y_box = jnp.max(jax.vmap(nt.g)(get_corners(box)))
             y_dot = y_dot - self.kappa * jnp.maximum(y - y_box, 0.0)
 
         return nt.__class__(self.sys.f(0.0, nt.ox), H_dot, y_dot), None
@@ -232,14 +232,16 @@ class NormotopeEmbedding(ParametricEmbedding):
         if adjoint:
             A = jax.jacfwd(self.sys.f, 1)(0.0, ox)
             B = jnp.eye(A.shape[0], dtype=H.dtype) + dt * A
-            # H_next (I + dt A) = H + dt Ut: exact discrete adjoint of the Euler
-            # state map. (Exact alpha_inv update when U=0: (I + dt A) @ alpha_inv.)
+            # H_next (I + dt A) = H + dt U: exact discrete adjoint of the Euler
+            # state map, so z_next = z + dt (H_next (M - A) + U)(x - ox) -- the
+            # residual pairs with H_NEXT. Pairing it with H instead leaks
+            # dt H_dot M, first order in the set size and of either sign, so it
+            # under-approximates whenever that sign is negative.
             H_next = jnp.linalg.solve(B.T, (H + dt * Ut).T).T
         else:
             H_next = H + dt * Ut
-        alpha_dot = (H_next - H) / dt
         nt_dot, _ = self._dynamics(
-            t, state, *args, U=U, perm=perm, adjoint=adjoint, ix=ix, alpha_dot=alpha_dot
+            t, state, *args, U=U, perm=perm, adjoint=adjoint, ix=ix, alpha_pair=H_next
         )
         return nt.__class__(ox + dt * nt_dot.ox, H_next, y + dt * nt_dot.y), None
 

@@ -1,8 +1,5 @@
-from typing import Tuple
-
 import jax
 import jax.numpy as jnp
-from jax.experimental.jet import jet
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import ArrayLike
 
@@ -13,14 +10,13 @@ from ...inclusion import (
     icopy,
     i2ut,
     interval,
-    jacM,
     mjacM,
     natif,
 )
 from ...neural import fastlin
 from ..parametope import Parametope
 from ..embedding import ParametricEmbedding
-from functools import partial
+
 
 @register_pytree_node_class
 class AffineParametope(Parametope):
@@ -81,15 +77,13 @@ class AdjointEmbedding(ParametricEmbedding):
         sys,
         alpha_p0,
         N0,
-        kap: float = 0.1,
+        kap: float = None,
         permutation=None,
         disable_adjoint=False,
     ):
-        #  refine_factory:Callable[[ArrayLike], Callable]=partial(SampleRefinement, num_samples=10)):
         super().__init__(sys)
         self.Jf_x = jax.jacfwd(sys.f, 1)
         self.Mf = mjacM(sys.f)
-        self.Jf = jacM(sys.f)
         self.kap = kap
         self.alpha_p0 = alpha_p0
         self.N0 = N0
@@ -100,14 +94,6 @@ class AdjointEmbedding(ParametricEmbedding):
         if not isinstance(pt0, hParametope):
             raise ValueError(f"{pt0=} is not a hParametope needed for AdjointEmbedding")
 
-        # Setup refinement
-        alpha = pt0.alpha
-        # _id = lambda x : x
-        # self.refine = self.refine_factory(alpha).get_refine_func() if alpha.shape[0] > alpha.shape[1] else _id
-        # alpha_p = jnp.linalg.pinv(alpha)
-        # N = null_space(alpha.T)
-        # print(N@alpha)
-        # return (alpha_p, N)
         return (self.alpha_p0, self.N0)
 
     def hypercontrol_shape(self, pt0: hParametope) -> tuple:
@@ -120,206 +106,67 @@ class AdjointEmbedding(ParametricEmbedding):
         iz = _refine_N(pt.hinv(pt.y), N)
         return interval(alpha_p) @ iz + pt.ox
 
-    def _dynamics(
-        self, t, state: Tuple[hParametope, ArrayLike], *args,
-        U=None, alpha_dot=None, **kwargs,
-    ):
-        pt, aux = state
-        ox = pt.ox
+    def _dynamics(self, t, state, *args, U=None, alpha_pair=None, **kwargs):
+        r"""Offset dynamics for the frame ``pt.alpha``.
 
-        # jax.debug.print('args={args}', args=args)
+        With ``A`` the Jacobian frozen at the center, ``M`` its mixed-Jacobian
+        enclosure over the set, and ``U*`` the CBF plus hypercontrol forcing on
+        ``alpha_dot = -alpha A + U*``, the offsets grow along
 
-        K = len(pt.y) // 2
-        # ly = -pt.y[:K] # negative for lower bound
-        # uy = pt.y[K:]
-        # iy = lu2i(ly, uy)
-        y = pt.y
-        alpha = pt.alpha
-        alpha_p, N = aux
+            z_dot = W alpha^+ z,   W = alpha_pair (M - A) + U*.
 
-        # alpha_p = jnp.linalg.inv(alpha)
-
-        ## Adjoint dynamics + LICQ CBF
+        ``alpha_pair`` defaults to ``pt.alpha``; :meth:`_symplectic_step` passes
+        ``alpha_next``, the multiplier the exact discrete pairing requires.
+        """
+        pt, (alpha_p, N) = state
+        alpha, ox, y = pt.alpha, pt.ox, pt.y
+        alpha_pair = alpha if alpha_pair is None else alpha_pair
 
         args_centers = tuple(arg.center for arg in args)
         centers = (jnp.array([t]), ox) + args_centers
 
         J = self.Jf_x(*centers)
-        if not self.disable_adjoint:
-            u0 = -alpha @ J
-        else:
-            u0 = jnp.zeros_like(-alpha @ J)
+        A = jnp.zeros_like(J) if self.disable_adjoint else J
+        U0 = -alpha @ A
+        Ustar = _licq_Ustar(alpha, U0, self.kap) + _hyper(U, alpha)
 
-        u0flat = u0.reshape(-1)
+        if self.permutation is None:
+            self.permutation = Permutation(range(sum(len(c) for c in centers)))
 
-        # CBF: Enforce pairwise independence on the rows of alpha
+        big_iz = pt.hinv(y)
+        MM = self.Mf(
+            t,
+            interval(alpha_p) @ big_iz + ox,
+            *args,
+            center=centers,
+            permutation=self.permutation,
+        )
 
-        PENALTY = 0
+        # Disturbance arguments, bounded about their centers. Like the state
+        # residual, these pair with alpha_pair.
+        dist = interval(jnp.zeros_like(ox))
+        for M, arg, cent in zip(MM[2:], args, args_centers):
+            dist = dist + interval(M) @ (arg - cent)
+        dist = interval(alpha_pair) @ dist
 
-        if PENALTY == 0:
-            ustar = jnp.zeros_like(u0)
+        W = interval(alpha_pair) @ (MM[1] - A) + Ustar
 
-        elif PENALTY == 1:
-
-            def soft_overmax(x, eps=1e-5):
-                return jnp.max(jnp.exp(x) / jnp.sum(jnp.exp(x)))
-
-            def barrier_LICQ(alpha):
-                # Normalize rows of alpha
-                return jnp.linalg.det(
-                    alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True)
-                )
-                # return jnp.linalg.slogdet(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))[1]
-
-            balpha = barrier_LICQ(alpha)
-            k = self.kap * balpha**3
-
-            pLfh, Lfh = jax.jvp(barrier_LICQ, (alpha,), (u0,))
-            unroll = lambda v: jax.jvp(
-                barrier_LICQ, (alpha,), (v.reshape(alpha.shape),)
-            )
-            pLgh, Lgh = jax.vmap(unroll)(jnp.eye(alpha.size))
-
-            # Solution to QP
-            ustar = jnp.where(
-                Lfh + Lgh @ u0flat + k >= 0.0,
-                jnp.zeros_like(u0flat),  # constraint inactive
-                -(Lfh + Lgh @ u0flat + k) * Lgh.T / (Lgh @ Lgh.T),
-            ).reshape(alpha.shape)
-        elif PENALTY == 2:
-            ustar = jnp.zeros_like(u0)
-
-            def soft(H):
-                HHT = H @ H.T
-                return jnp.sum((HHT - jnp.eye(H.shape[0])) ** 2)
-
-            ustar = -self.kap * jax.grad(soft)(alpha)
-
-        # Hypercontrol enters exactly like the CBF term ustar: it perturbs H_dot
-        # AND must appear in the offset-growth bound below, so the enclosure stays
-        # sound. Fold it into ustar so every use of ustar accounts for it.
-        Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
-        ustar = ustar + Uctrl
-
-        if alpha_dot is not None:
-            # Symplectic path: H_dot == alpha_dot below, and the offset bound
-            # sees alpha@(Mx - J) + ustar == alpha@Mx + alpha_dot.
-            ustar = alpha_dot - u0
-
-        ## Offset Dynamics given ustar
-
-        MJACM = True
-
-        # For properly handling signs in lower offsets
-        K_2 = len(y) // 2
-        mul = jnp.concatenate((-jnp.ones(K_2), jnp.ones(K_2)))
-        big_iz = pt.hinv(pt.y)
+        K = len(y) // 2
+        mul = jnp.concatenate((-jnp.ones(K), jnp.ones(K)))  # sign of lower offsets
         Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
 
-        refine = lambda y: _refine_N(y, N)
-
-        if MJACM:
-            if self.permutation is None:
-                lenperm = sum([len(arg) for arg in centers])
-                self.permutation = Permutation(range(lenperm))
-
-            MM = self.Mf(
-                t,
-                interval(alpha_p) @ big_iz + ox,
-                *args,
-                center=centers,
-                permutation=self.permutation,
+        def F(t, iy, *args):
+            iz = pt.hinv(i2ut(_refine_N(iy, N)) * mul)
+            PH = Jh(iz)  # post first-order cancellation
+            return interval(PH[len(PH) // 2 :, :]) @ (
+                W @ (interval(alpha_p) @ iz) + dist
             )
-            ls = []
-            us = []
 
-            # jax.debug.print('{a}, {b}, {c}', a=len(MM[2:]), b=len(args), c=len(args_centers))
-            # jax.debug.print('{a}', a=len(args_centers))
-            for M, arg, cent in zip(MM[2:], args, args_centers):
-                term = interval(M) @ (arg - cent)
-                ls.append(term.lower)
-                us.append(term.upper)
+        E_res = embed(F)(t, y * mul, *args) * mul
 
-            dist = interval(jnp.sum(jnp.asarray(ls)), jnp.sum(jnp.asarray(us)))
-            # jax.debug.print('dist={dist}', dist=dist)
-
-            def F(t, iy, *args):
-                iy = refine(iy)
-                iz = pt.hinv(i2ut(iy) * mul)
-
-                # _, iJx = self.Jf(interval(t), interval(Hp)@iz + ox, *args)
-                # MM = self.Mf(t, interval(alpha_p)@big_iz + ox, *args, \
-                #             centers=(centers,), permutations=self.permutation)[0]
-                Mx = MM[1]
-
-                # empty = jnp.any(iy.lower > iy.upper)
-                # empty = jnp.ones_like(iy.lower).astype(bool)
-                empty = False
-
-                def _zero():
-                    return interval(jnp.zeros_like(iz.lower))
-
-                def _ret():
-                    # Post first order cancellation
-                    PH = Jh(iz)
-                    if not self.disable_adjoint:
-                        return interval(PH[len(PH) // 2 :, :]) @ (
-                            (interval(alpha) @ (Mx - J) + ustar)
-                            @ (interval(alpha_p) @ iz)
-                            + dist
-                        )
-                    else:
-                        return interval(PH[len(PH) // 2 :, :]) @ (
-                            (interval(alpha) @ (Mx) + ustar) @ (interval(alpha_p) @ iz)
-                            + dist
-                        )
-
-                return jax.lax.cond(empty, _zero, _ret)
-
-            E = embed(F)
-        else:
-
-            def F_second(t, iy, *args):
-                iy = refine(iy)
-                iz = pt.hinv(i2ut(iy) * mul)
-
-                empty = jnp.any(iy.lower > iy.upper)
-
-                def _zero():
-                    return interval(jnp.zeros_like(iz.lower))
-
-                def _ret():
-                    def _get_second(oz, z):
-                        primals = (t, alpha_p @ oz + ox)
-                        series = (
-                            (0.0, 0.0),
-                            (alpha_p @ z, jnp.zeros_like(alpha_p @ z)),
-                        )
-                        _, coeffs = jet(self.sys.f, primals, series)
-                        return coeffs[1]
-
-                    res = natif(_get_second)(big_iz, iz)
-
-                    # Post first order cancellation
-                    PH = Jh(iz)
-                    return interval(PH[len(PH) // 2 :, :]) @ (
-                        interval(ustar) @ alpha_p @ iz + interval(alpha) @ res
-                    )
-
-                return jax.lax.cond(empty, _zero, _ret)
-
-            E = embed(F_second)
-
-        E_res = E(t, y * mul, *args) * mul
-
-        # H_dot includes the hypercontrol (folded into ustar above); propagate it
-        # through H+ and N so alpha_p @ alpha = I and N @ alpha = 0 are preserved.
-        H_dot = u0 + ustar
+        H_dot = U0 + Ustar
         pt_dot = pt.from_parametope(hParametope(self.sys.f(*centers), H_dot, E_res))
-        alpha_p_dot = -alpha_p @ H_dot @ alpha_p
-        N_dot = -N @ H_dot @ alpha_p
-
-        return (pt_dot, (alpha_p_dot, N_dot))
+        return pt_dot, (-alpha_p @ H_dot @ alpha_p, -N @ H_dot @ alpha_p)
 
     def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
         pt, (alpha_p, N) = state
@@ -328,67 +175,35 @@ class AdjointEmbedding(ParametricEmbedding):
         centers = (jnp.array([t]), ox) + tuple(arg.center for arg in args)
         J = self.Jf_x(*centers)
         A = jnp.zeros_like(J) if self.disable_adjoint else J
-        # PENALTY == 0 in _dynamics => the CBF part of ustar is identically zero;
-        # only the hypercontrol is explicit forcing. If PENALTY is ever
-        # re-enabled there, replicate the CBF term here.
-        ustar = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
+        Ustar = _licq_Ustar(alpha, -alpha @ A, self.kap) + _hyper(U, alpha)
 
+        # alpha_next (I + dt A) = alpha + dt U* is the exact discrete adjoint of
+        # the Euler state map, so z_next = z + dt (alpha_next (M - A) + U*)(x - ox):
+        # the residual pairs with alpha_NEXT. Pairing it with alpha instead leaks
+        # dt alpha_dot M -- first order in the set size, and of either sign, so it
+        # under-approximates whenever that sign is negative.
         B = jnp.eye(A.shape[0], dtype=alpha.dtype) + dt * A
-        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * ustar).T).T
+        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * Ustar).T).T
+        forced = None if (U is None and self.kap is None) else alpha + dt * Ustar
+        alpha_p_next, N_next = _step_aux(B, alpha_p, N, dt, Ustar, forced)
 
-        if U is None:
-            # ustar == 0: alpha_next = alpha @ B^{-1}, so these are exact.
-            alpha_p_next = B @ alpha_p
-            N_next = N
-        else:
-            # Exact updates preserving alpha_p @ alpha = I and N @ alpha = 0.
-            # inv (LU) when square: cheaper and better-behaved derivatives than
-            # SVD-pinv under the iLQR backward pass.
-            forced = alpha + dt * ustar
-            Mh = (
-                jnp.linalg.inv(forced)
-                if forced.shape[0] == forced.shape[1]
-                else jnp.linalg.pinv(forced)
-            )
-            alpha_p_next = B @ Mh
-            N_next = N - dt * (N @ ustar) @ Mh
-
-        # Exact discrete pairing: alpha_next (I + dt A) = alpha + dt U gives
-        # z_next = z + dt (U (x-ox) + alpha_next r), r the mean-value residual,
-        # so the offset bound must pair the residual with alpha_NEXT. Passing
-        # alpha_dot through _dynamics instead leaves the bracket
-        # alpha Mx + alpha_dot = alpha_next (Mx - J) + dt alpha_next J Mx --
-        # an O(dt ||J||^2) leak that diverges on stiff couplings (platoon).
-        state_next = (
-            pt.from_parametope(hParametope(ox, alpha_next, y)),
-            (alpha_p_next, N_next),
+        pt_dot, _ = self._dynamics(
+            t, state, *args, U=U, alpha_pair=alpha_next, **kwargs
         )
-        # U=ustar (identical to U here, since ustar IS the reshaped hypercontrol):
-        # any forcing on alpha must also enter the offset bound, because the
-        # discrete pairing is z_next = z + dt (ustar (x-ox) + alpha_next (M-A)(x-ox)).
-        # Dropping it loses the ustar (x-ox) term and the enclosure stops
-        # containing the flow.
-        pt_dot, _ = self._dynamics(t, state_next, *args, U=ustar, **kwargs)
-
         y_next = y + dt * pt_dot.y
 
-        # Periodic row normalization (exact set identity): alpha_i^T z <= y_i
-        # and (c alpha_i)^T z <= c y_i are the same halfspace, so rescaling
-        # each row to unit norm changes nothing geometrically while stopping
-        # the exponential magnitude growth of the adjoint (and the resulting
-        # overflow of the interval remainder products). alpha_p and N get the
-        # exact inverse scaling to preserve alpha_p alpha = I and N alpha = 0.
+        # Row normalization: alpha_i z <= y_i and (c alpha_i) z <= c y_i are the
+        # same halfspace, so this is a no-op on the set while stopping the
+        # adjoint's exponential magnitude growth (and the resulting overflow).
         d = jnp.linalg.norm(alpha_next, axis=1)
-        alpha_next = alpha_next / d[:, None]
         K = y_next.shape[0] // 2
         y_next = jnp.concatenate([y_next[:K] / d, y_next[K:] / d])
-        alpha_p_next = alpha_p_next * d[None, :]
-        N_next = N_next * d[None, :]
-
-        pt_next = pt.from_parametope(
-            hParametope(ox + dt * pt_dot.ox, alpha_next, y_next)
+        return (
+            pt.from_parametope(
+                hParametope(ox + dt * pt_dot.ox, alpha_next / d[:, None], y_next)
+            ),
+            (alpha_p_next * d[None, :], N_next * d[None, :]),
         )
-        return pt_next, (alpha_p_next, N_next)
 
 
 def _stacked_y(y, d):
@@ -411,7 +226,7 @@ class StackedAdjointEmbedding(AdjointEmbedding):
 
     Block 1 follows the adjoint; block 2 is held at the identity. Freezing it is
     a hypercontrol: the discrete pairing ``alpha_next (I + dt J) = alpha + dt
-    ustar`` forces ``ustar_2 = J``, and block 2's offset growth becomes
+    U*`` forces ``U*_2 = J``, and block 2's offset growth becomes
     ``(I(Mx - J) + J) = Mx`` -- the plain interval bound.
 
     Each step the blocks refine each other, and ``_dynamics`` is handed
@@ -448,7 +263,7 @@ class StackedAdjointEmbedding(AdjointEmbedding):
         A_cur = alpha[:d]
         A_next = jnp.linalg.solve(B.T, A_cur.T).T
         ap1_next = B @ ap1      # exact inverse update; no O(d^3) solve per step
-        ustar = jnp.vstack([jnp.zeros_like(J), J])
+        Ustar = jnp.vstack([jnp.zeros_like(J), J])
 
         if self.refine:
             b1, b2 = _stacked_y(y, d)
@@ -461,7 +276,9 @@ class StackedAdjointEmbedding(AdjointEmbedding):
             pt.from_parametope(hParametope(ox, alpha_next, y)),
             (jnp.hstack([jnp.zeros((d, d), alpha.dtype), I]), N),
         )
-        pt_dot, _ = self._dynamics(t, state_next, *args, U=ustar, **kwargs)
+        pt_dot, _ = self._dynamics(
+            t, state_next, *args, U=Ustar, alpha_pair=alpha_next, **kwargs
+        )
         y_next = y + dt * pt_dot.y
 
         nrm = jnp.concatenate([jnp.linalg.norm(A_next, axis=1),
@@ -475,12 +292,34 @@ class StackedAdjointEmbedding(AdjointEmbedding):
         )
 
 
-def _licq_ustar(alpha, u0, kap):
+def _hyper(U, alpha):
+    """Hypercontrol forcing on alpha_dot, reshaped to the frame."""
+    return jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
+
+
+def _step_aux(B, alpha_p, N, dt, Ustar, forced):
+    """alpha_p / N updates preserving alpha_p @ alpha = I and N @ alpha = 0.
+
+    ``forced = alpha + dt U*``, or None when U* == 0 -- then alpha_next =
+    alpha @ B^-1 and the updates are exact without an inverse. Square ``forced``
+    uses inv (LU): cheaper and better-behaved under the iLQR backward pass.
+    """
+    if forced is None:
+        return B @ alpha_p, N
+    Mh = (
+        jnp.linalg.inv(forced)
+        if forced.shape[0] == forced.shape[1]
+        else jnp.linalg.pinv(forced)
+    )
+    return B @ Mh, N - dt * (N @ Ustar) @ Mh
+
+
+def _licq_Ustar(alpha, U0, kap):
     """LICQ CBF-QP alpha forcing; zeros when kap is None."""
     if kap is None:
-        return jnp.zeros_like(u0)
+        return jnp.zeros_like(U0)
 
-    u0flat = u0.reshape(-1)
+    U0flat = U0.reshape(-1)
 
     def barrier_LICQ(alpha):
         # return jax.jit(jnp.linalg.det, backend='cpu')(alpha / jnp.linalg.norm(alpha, axis=1, keepdims=True))
@@ -492,7 +331,7 @@ def _licq_ustar(alpha, u0, kap):
     balpha = barrier_LICQ(alpha)
     k = kap * balpha**3
 
-    pLfh, Lfh = jax.jvp(barrier_LICQ, (alpha,), (u0,))
+    pLfh, Lfh = jax.jvp(barrier_LICQ, (alpha,), (U0,))
     unroll = lambda v: jax.jvp(
         barrier_LICQ, (alpha,), (v.reshape(alpha.shape),)
     )
@@ -500,9 +339,9 @@ def _licq_ustar(alpha, u0, kap):
 
     # Solution to QP
     return jnp.where(
-        Lfh + Lgh @ u0flat + k >= 0.0,
-        jnp.zeros_like(u0flat),  # constraint inactive
-        -(Lfh + Lgh @ u0flat + k) * Lgh.T / (Lgh @ Lgh.T),
+        Lfh + Lgh @ U0flat + k >= 0.0,
+        jnp.zeros_like(U0flat),  # constraint inactive
+        -(Lfh + Lgh @ U0flat + k) * Lgh.T / (Lgh @ Lgh.T),
     ).reshape(alpha.shape)
 
 
@@ -511,12 +350,10 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         self, sys, alpha_p0, N0, permutation=None, ustars=None, tt=None, kap=None,
         forward_mode: str = "ibp", iterated: bool = False,
     ):
-        #  refine_factory:Callable[[ArrayLike], Callable]=partial(SampleRefinement, num_samples=10)):
         super().__init__(sys)
         self.Jf_x = jax.jacfwd(sys.olsystem.f, 1)
         self.Jf_u = jax.jacfwd(sys.olsystem.f, 2)
         self.Mf = mjacM(sys.olsystem.f)
-        self.Jf = jacM(sys.olsystem.f)
         self.alpha_p0 = alpha_p0
         self.N0 = N0
         self.permutation = permutation
@@ -530,14 +367,6 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         if not isinstance(pt0, hParametope):
             raise ValueError(f"{pt0=} is not a hParametope needed for AdjointEmbedding")
 
-        # Setup refinement
-        # alpha = pt0.alpha
-        # _id = lambda x : x
-        # self.refine = self.refine_factory(alpha).get_refine_func() if alpha.shape[0] > alpha.shape[1] else _id
-        # alpha_p = jnp.linalg.pinv(alpha)
-        # N = null_space(alpha.T)
-        # print(N@alpha)
-        # return (alpha_p, N)
         return (self.alpha_p0, self.N0)
 
     def hypercontrol_shape(self, pt0: hParametope) -> tuple:
@@ -570,63 +399,33 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
         big_iu = fastlin_res(big_iz + pt.alpha @ pt.ox)
         return big_iz, fastlin_res, C, big_iu
 
-    def _dynamics(
-        self, t, state: Tuple[hParametope, ArrayLike], *args,
-        U=None, alpha_dot=None, **kwargs,
-    ):
-        pt, aux = state
-        ox = pt.ox
+    def _dynamics(self, t, state, *args, U=None, alpha_pair=None, **kwargs):
+        r"""Offset dynamics under the CROWN/fastlin-bounded feedback.
 
-        K = len(pt.y) // 2
-        # ly = -pt.y[:K] # negative for lower bound
-        # uy = pt.y[K:]
-        # iy = lu2i(ly, uy)
-        y = pt.y
-        alpha = pt.alpha
-        alpha_p, N = aux
+        ``A = J_x + J_u C alpha`` is the closed-loop Jacobian frozen at the
+        center and ``(M_x, M_u)`` its mixed-Jacobian enclosure. The offsets grow
+        along
 
-        # Global fastlin
+            z_dot = alpha_pair [(M_x - J_x) + (M_u - J_u) C alpha] alpha^+ z
+                    + alpha_pair M_u (controller residual) + U* alpha^+ z.
 
-        Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
+        ``alpha_pair`` defaults to ``pt.alpha``; :meth:`_symplectic_step` passes
+        ``alpha_next``, the multiplier the exact discrete pairing requires.
+        """
+        pt, (alpha_p, N) = state
+        alpha, ox, y = pt.alpha, pt.ox, pt.y
+        alpha_pair = alpha if alpha_pair is None else alpha_pair
+
         big_iz, fastlin_res, C, big_iu = self._fastlin_terms(pt, alpha_p)
-        CHox = C @ alpha @ ox
         ou = self.sys.control(ox)
+        centers = (jnp.array([t]), ox, ou) + tuple(arg.center for arg in args)
 
-        ## Adjoint dynamics + LICQ CBF
-
-        args_centers = (arg.center for arg in args)
-        centers = (jnp.array([t]), ox, ou) + tuple(args_centers)
-
-        J_x = self.Jf_x(*centers)
-        J_u = self.Jf_u(*centers)
-        # u0 = -alpha@(J_x@alpha_p + J_u@C)
-        u0 = -alpha @ (J_x + J_u @ C @ alpha)
-
-        ustar = _licq_ustar(alpha, u0, self.kap)
-
-        # Hypercontrol enters exactly like the CBF term ustar: it perturbs H_dot
-        # AND must appear in the offset-growth bound below, so the enclosure stays
-        # sound. Fold it into ustar so every use of ustar accounts for it.
-        Uctrl = jnp.zeros_like(alpha) if U is None else jnp.asarray(U).reshape(alpha.shape)
-        ustar = ustar + Uctrl
-
-        if alpha_dot is not None:
-            # Symplectic path: H_dot == alpha_dot below, and the offset bound
-            # sees alpha@(Mx + Mu@C@alpha) + alpha_dot.
-            ustar = alpha_dot - u0
-
-        ## Offset Dynamics given ustar
-
-        # For properly handling signs in lower offsets
-        K_2 = len(y) // 2
-        mul = jnp.concatenate((-jnp.ones(K_2), jnp.ones(K_2)))
-
-        refine = lambda y: _refine_N(y, N)
+        J_x, J_u = self.Jf_x(*centers), self.Jf_u(*centers)
+        U0 = -alpha @ (J_x + J_u @ C @ alpha)
+        Ustar = _licq_Ustar(alpha, U0, self.kap) + _hyper(U, alpha)
 
         if self.permutation is None:
-            lenperm = sum([len(arg) for arg in centers])
-            self.permutation = Permutation(range(lenperm))
-
+            self.permutation = Permutation(range(sum(len(c) for c in centers)))
         MM = self.Mf(
             t,
             interval(alpha_p) @ big_iz + ox,
@@ -635,97 +434,70 @@ class FastlinAdjointEmbedding(ParametricEmbedding):
             center=centers,
             permutation=self.permutation,
         )
+        Mx, Mu = MM[1], MM[2]
+        # Controller linearization residual, in the lifted coordinates.
+        ures = fastlin_res.lud + C @ alpha @ ox - ou
 
-        ls = []
-        us = []
+        K = len(y) // 2
+        mul = jnp.concatenate((-jnp.ones(K), jnp.ones(K)))  # sign of lower offsets
+        Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
 
         def F(t, iy, *args):
-            # Bound outputs along h^{-1}([iy.lower, iy.upper])
-
-            iy = refine(iy)
+            iy = _refine_N(iy, N)
             iz = pt.hinv(i2ut(iy) * mul)
 
-            Mx = MM[1]
-            Mu = MM[2]
-
-            empty = jnp.any(iy.lower > iy.upper)
-
-            def _zero():
-                return interval(jnp.zeros_like(iz.lower))
-
             def _ret():
-                # Post first order cancellation
-                PH = Jh(iz)
+                az = interval(alpha_p) @ iz
+                PH = Jh(iz)  # post first-order cancellation
                 return interval(PH[len(PH) // 2 :, :]) @ (
-                    interval(alpha)
+                    interval(alpha_pair)
                     @ (
-                        ((Mx - J_x) + (Mu - J_u) @ C @ alpha) @ alpha_p @ iz
-                        + interval(Mu) @ (fastlin_res.lud + CHox - ou)
+                        ((Mx - J_x) + (Mu - J_u) @ C @ alpha) @ az
+                        + interval(Mu) @ ures
                     )
-                    + interval(ustar) @ alpha_p @ iz
+                    + interval(Ustar) @ az
                 )
 
-            return jax.lax.cond(empty, _zero, _ret)
+            return jax.lax.cond(
+                jnp.any(iy.lower > iy.upper),
+                lambda: interval(jnp.zeros_like(iz.lower)),
+                _ret,
+            )
 
-        E = embed(F)
-        E_res = E(t, y * mul, *args) * mul
+        E_res = embed(F)(t, y * mul, *args) * mul
 
-        # H_dot includes the hypercontrol (folded into ustar above); propagate it
-        # through H+ and N so alpha_p @ alpha = I and N @ alpha = 0 are preserved.
-        H_dot = u0 + ustar
+        H_dot = U0 + Ustar
         pt_dot = pt.from_parametope(
             hParametope(self.sys.olsystem.f(*centers), H_dot, E_res)
         )
-        alpha_p_dot = -alpha_p @ H_dot @ alpha_p
-        N_dot = -N @ H_dot @ alpha_p
-
-        return (pt_dot, (alpha_p_dot, N_dot))
+        return pt_dot, (-alpha_p @ H_dot @ alpha_p, -N @ H_dot @ alpha_p)
 
     def _symplectic_step(self, t, dt, state, *args, U=None, **kwargs):
         pt, (alpha_p, N) = state
         alpha, ox, y = pt.alpha, pt.ox, pt.y
 
-        _big_iz, _flr, C, _big_iu = self._fastlin_terms(pt, alpha_p)
+        _, _, C, _ = self._fastlin_terms(pt, alpha_p)
         ou = self.sys.control(ox)
         centers = (jnp.array([t]), ox, ou) + tuple(arg.center for arg in args)
-        J_x = self.Jf_x(*centers)
-        J_u = self.Jf_u(*centers)
+        # C @ alpha frozen at the old frame: keeps the implicit step a linear solve.
+        A = self.Jf_x(*centers) + self.Jf_u(*centers) @ C @ alpha
+        Ustar = _licq_Ustar(alpha, -alpha @ A, self.kap) + _hyper(U, alpha)
 
-        # Closed-loop adjoint matrix with C@alpha FROZEN at the old point:
-        # linearizes the alpha-dependence so the implicit step stays a linear solve.
-        A = J_x + J_u @ C @ alpha
-        u0 = -alpha @ A
-        ustar = _licq_ustar(alpha, u0, self.kap)
-        if U is not None:
-            ustar = ustar + jnp.asarray(U).reshape(alpha.shape)
-
+        # See AdjointEmbedding._symplectic_step: the residual pairs with alpha_NEXT.
         B = jnp.eye(A.shape[0], dtype=alpha.dtype) + dt * A
-        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * ustar).T).T
-        alpha_dot = (alpha_next - alpha) / dt
+        alpha_next = jnp.linalg.solve(B.T, (alpha + dt * Ustar).T).T
+        forced = None if (U is None and self.kap is None) else alpha + dt * Ustar
+        alpha_p_next, N_next = _step_aux(B, alpha_p, N, dt, Ustar, forced)
 
-        pt_dot, _ = self._dynamics(t, state, *args, U=U, alpha_dot=alpha_dot, **kwargs)
-
-        if U is None and self.kap is None:
-            # ustar == 0: alpha_next = alpha @ B^{-1}, so these are exact.
-            alpha_p_next = B @ alpha_p
-            N_next = N
-        else:
-            # Exact updates preserving alpha_p @ alpha = I and N @ alpha = 0.
-            # inv (LU) when square: cheaper and better-behaved derivatives than
-            # SVD-pinv under the iLQR backward pass.
-            forced = alpha + dt * ustar
-            Mh = (
-                jnp.linalg.inv(forced)
-                if forced.shape[0] == forced.shape[1]
-                else jnp.linalg.pinv(forced)
-            )
-            alpha_p_next = B @ Mh
-            N_next = N - dt * (N @ ustar) @ Mh
-
-        pt_next = pt.from_parametope(
-            hParametope(ox + dt * pt_dot.ox, alpha_next, y + dt * pt_dot.y)
+        pt_dot, _ = self._dynamics(
+            t, state, *args, U=U, alpha_pair=alpha_next, **kwargs
         )
-        return pt_next, (alpha_p_next, N_next)
+        return (
+            pt.from_parametope(
+                hParametope(ox + dt * pt_dot.ox, alpha_next, y + dt * pt_dot.y)
+            ),
+            (alpha_p_next, N_next),
+        )
 
 
 def _refine_N(y: Interval, N) -> Interval:
