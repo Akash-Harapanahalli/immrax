@@ -67,9 +67,6 @@ class LinProgRefinement(Refinement):
             return interval(retl, retu)
 
         def I_r(y: Interval) -> Interval:
-            # for i in range(n):
-            #     ret = var_refine(ret, i)
-
             return jax.lax.fori_loop(0, y.shape[0], var_refine, icopy(y))
 
         return I_r
@@ -85,7 +82,6 @@ class SampleRefinement(Refinement):
     def __init__(self, H: jax.Array, num_samples: int = 10) -> None:
         self.num_samples = num_samples
         self.H = H
-        # self.Hp = jnp.linalg.pinv(H)
         self.Hp = jnp.hstack(
             (jnp.eye(H.shape[1]), jnp.zeros((H.shape[1], H.shape[0] - H.shape[1])))
         )

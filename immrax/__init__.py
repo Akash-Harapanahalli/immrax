@@ -16,6 +16,5 @@ from .parametric import *
 from . import embedding as embedding
 from .embedding import *
 
-
 from . import refinement as refinement
 from . import utils as utils

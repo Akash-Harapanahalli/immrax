@@ -1,5 +1,5 @@
 import abc
-from functools import partial
+import warnings
 from typing import Any, Callable, List, Literal, Union
 
 from diffrax import (
@@ -11,6 +11,7 @@ from diffrax import (
     Tsit5,
     diffeqsolve,
 )
+import equinox as eqx
 from immutabledict import immutabledict
 import jax
 import jax.numpy as jnp
@@ -30,7 +31,52 @@ class EvolutionError(Exception):
         )
 
 
-class System(abc.ABC):
+class LegacyAttrModule(eqx.Module):
+    """An :class:`equinox.Module` that tolerates the deprecated pattern of
+    assigning *undeclared* attributes inside a hand-written ``__init__``.
+
+    Equinox modules are frozen dataclasses, so only declared fields may be set.
+    Older ``immrax`` subclasses stored parameters as plain ``self.<name> = ...``
+    without declaring them; this base routes any such assignment into a static
+    ``_legacy`` dict (with a ``DeprecationWarning``). Legacy values survive the
+    flatten/unflatten roundtrip but, being static, are baked into the compiled
+    graph rather than traced.
+    """
+
+    # kw_only avoids "non-default argument follows default argument" on subclasses
+    # that declare required fields.
+    _legacy: dict = eqx.field(static=True, default_factory=dict, kw_only=True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+        else:
+            warnings.warn(
+                f"Setting undeclared attribute {name!r} on {type(self).__name__!r} "
+                f"is deprecated; declare it as an equinox field "
+                f"(e.g. `{name}: <type> = eqx.field(...)`). Legacy attributes are "
+                f"stored as static metadata and will not be traced by jit/vmap.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._legacy[name] = value
+
+    def __getattr__(self, name: str) -> Any:
+        # equinox skips default_factory for subclasses with a hand-written
+        # __init__, so create _legacy lazily on first access.
+        if name == "_legacy":
+            legacy: dict = {}
+            object.__setattr__(self, "_legacy", legacy)
+            return legacy
+        legacy = self.__dict__.get("_legacy", {})
+        if name in legacy:
+            return legacy[name]
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+
+class System(LegacyAttrModule):
     r"""System
 
     A dynamical system of one of the following forms:
@@ -40,20 +86,21 @@ class System(abc.ABC):
 
     where :math:`t\in T\in\{\mathbb{Z},\mathbb{R}\}` is a discrete or continuous time variable, :math:`x\in\mathbb{R}^n` is the state of the system, and :math:`\dots` are some other inputs, perhaps control and disturbance.
 
-    There are two main attributes that need to be defined in a subclass:
+    Subclasses are :class:`equinox.Module` pytrees. Declare ``xlen`` (state
+    dimension) as a ``ClassVar`` and define ``f``; ``evolution`` defaults to
+    ``'continuous'`` (set ``evolution: ClassVar[str] = "discrete"`` for a
+    discrete-time system). Genuine parameters are ordinary fields::
 
-    - `evolution` : Literal['continuous', 'discrete'], which specifies whether the system is continuous or discrete.
-    - `xlen` : int, which specifies the dimension of the state space.
+        class VanDerPol(System):
+            xlen: ClassVar[int] = 2
+            mu: float = 1.0
 
-    The main method that needs to be defined is `f(t, x, *args, **kwargs)`, which returns the time evolution of the state at time `t` and state `x`.
+            def f(self, t, x):
+                return jnp.array([x[1], self.mu * (1 - x[0] ** 2) * x[1] - x[0]])
     """
 
-    evolution: Literal["continuous", "discrete"]
-    xlen: int
-
-    def __init__(self, evolution, xlen):
-        self.evolution = evolution
-        self.xlen = xlen
+    xlen: int = eqx.field(static=True)
+    evolution: str = eqx.field(static=True, default="continuous", kw_only=True)
 
     @abc.abstractmethod
     def f(self, t: Union[Integer, Float], x: jax.Array, *args, **kwargs) -> jax.Array:
@@ -80,9 +127,7 @@ class System(abc.ABC):
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.f(*args, **kwargs)
 
-    @partial(
-        jax.jit, static_argnums=(0, 4), static_argnames=("solver", "f_kwargs", "inputs")
-    )
+    @eqx.filter_jit
     def compute_trajectory(
         self,
         t0: Union[Integer, Float],
@@ -93,6 +138,8 @@ class System(abc.ABC):
         *,
         solver: Union[Literal["euler", "rk45", "tsit5"], AbstractSolver] = "tsit5",
         f_kwargs: immutabledict = immutabledict({}),
+        dense: bool = False,
+        max_steps: int = 4096,
         **kwargs,
     ) -> RawTrajectory:
         """Computes the trajectory of the system from time t0 to tf with initial condition x0.
@@ -113,6 +160,8 @@ class System(abc.ABC):
             Solver to use for diffrax, by default 'tsit5'
         f_kwargs : immutabledict, optional
             An immutabledict to pass as keyword arguments to the dynamics f, by default {}
+        dense : bool, optional
+            Whether to save the trajectory at all time steps (dense) or only at t0, tf, and steps of size dt (sparse), by default False
         **kwargs :
             Additional kwargs to pass to the solver from diffrax
 
@@ -139,9 +188,33 @@ class System(abc.ABC):
             else:
                 raise Exception(f"{solver=} is not a valid solver")
 
-            saveat = SaveAt(t0=True, t1=True, steps=True)
-            sol = diffeqsolve(term, solver, t0, tf, dt, x0, saveat=saveat, **kwargs)
-            return RawContinuousTrajectory(sol)
+            if not dense:
+                saveat = kwargs.pop("saveat", SaveAt(t0=True, t1=True, steps=True))
+                sol = diffeqsolve(
+                    term,
+                    solver,
+                    t0,
+                    tf,
+                    dt,
+                    x0,
+                    saveat=saveat,
+                    max_steps=max_steps,
+                    **kwargs,
+                )
+                return RawContinuousTrajectory(sol)
+            else:
+                saveat = SaveAt(dense=True)
+                return diffeqsolve(
+                    term,
+                    solver,
+                    t0,
+                    tf,
+                    dt,
+                    x0,
+                    saveat=saveat,
+                    max_steps=max_steps,
+                    **kwargs,
+                )
 
         elif self.evolution == "discrete":
             if not (
@@ -152,7 +225,6 @@ class System(abc.ABC):
                     f"Times {t0=} and {tf=} must be integers for discrete evolution, got {type(t0)=} and {type(tf)=}"
                 )
 
-            max_steps = 4096
             times = jnp.where(
                 jnp.arange(max_steps) <= tf - t0,
                 t0 + jnp.arange(max_steps),
@@ -196,6 +268,8 @@ class LinearTransformedSystem(System):
     """
 
     sys: System
+    T: jax.Array
+    Tinv: jax.Array
 
     def __init__(self, sys: System, T: jax.Array) -> None:
         self.evolution = sys.evolution
@@ -214,6 +288,8 @@ class NonlinearTransformedSystem(System):
     """
 
     sys: System
+    phi: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
+    phi_inv: Callable[[jax.Array], jax.Array] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -253,7 +329,7 @@ class LiftedSystem(System):
         return self.H @ self.sys.f(t, self.Hp @ x, *args, **kwargs)
 
 
-class OpenLoopSystem(System, abc.ABC):
+class OpenLoopSystem(System):
     """OpenLoopSystem
     An open-loop nonlinear dynamical system of the form
 
