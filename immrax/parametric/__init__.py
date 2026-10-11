@@ -28,6 +28,11 @@ from .sets.normotope import (
     NormotopeEmbedding,
 )
 
+from .sets.chebyshev_polytope import (
+    ChebyshevPolytope,
+    ChebyshevPolytopeEmbedding,
+)
+
 from .reach_ilqr import (
     ReachiLQR,
     IterateResult,
@@ -54,6 +59,8 @@ __all__ = [
     "L1Normotope",
     "L2Normotope",
     "NormotopeEmbedding",
+    "ChebyshevPolytope",
+    "ChebyshevPolytopeEmbedding",
     "ReachiLQR",
     "IterateResult",
     "RunResult",

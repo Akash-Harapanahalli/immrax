@@ -31,6 +31,9 @@ cuda12 = [
 cuda13 = [
     "jax[cuda13]>=0.7.0",
 ]
+sos = [
+    "mosek>=11.0",
+]
 examples = [
     "casadi~=3.6.7",
     "control~=0.10.1",
@@ -74,4 +77,5 @@ pythonpath = ["."]
 ignore = [
 	"E731", # We like lambda functions
 	"F722", # jaxtyping dimension annotations
+	"E741", # l, u are the interval bounds
 ]
