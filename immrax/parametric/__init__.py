@@ -3,12 +3,13 @@ from .parametope import (
     g_parametope,
 )
 
-from .embedding import ParametricEmbedding, ParametopeEmbedding
+from .embedding import ParametricEmbedding, ParametopeEmbedding, ReachsetSolution
 
 from .sets.affine import (
     AffineParametope,
     hParametope,
     AdjointEmbedding,
+    StackedAdjointEmbedding,
     FastlinAdjointEmbedding,
 )
 
@@ -19,9 +20,6 @@ from .sets.polytope import (
     Polytope,
 )
 
-# from .sets.annulus import (
-#     LpAnnulus,
-# )
 from .sets.normotope import (
     Normotope,
     LinfNormotope,
@@ -30,14 +28,24 @@ from .sets.normotope import (
     NormotopeEmbedding,
 )
 
+from .reach_ilqr import (
+    ReachiLQR,
+    IterateResult,
+    RunResult,
+    constant_schedule,
+    phased_schedule,
+)
+
 __all__ = [
     "Parametope",
     "g_parametope",
     "ParametopeEmbedding",
     "ParametricEmbedding",
+    "ReachsetSolution",
     "AffineParametope",
     "hParametope",
     "AdjointEmbedding",
+    "StackedAdjointEmbedding",
     "FastlinAdjointEmbedding",
     "Ellipsoid",
     "Polytope",
@@ -46,4 +54,9 @@ __all__ = [
     "L1Normotope",
     "L2Normotope",
     "NormotopeEmbedding",
+    "ReachiLQR",
+    "IterateResult",
+    "RunResult",
+    "constant_schedule",
+    "phased_schedule",
 ]

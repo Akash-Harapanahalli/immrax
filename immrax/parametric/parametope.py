@@ -23,9 +23,6 @@ class Parametope:
     y: ArrayLike  # Offset
 
     def __init__(self, ox: ArrayLike, alpha: ArrayLike, y: ArrayLike):
-        # self.ox = jnp.asarray(ox)
-        # self.alpha = jnp.asarray(alpha)
-        # self.y = jnp.asarray(y)
         self.ox = ox
         self.alpha = alpha
         self.y = y
@@ -71,10 +68,6 @@ class Parametope:
         ox_str = self.ox
         alpha_str = self.alpha
         y_str = self.y
-
-        # ox_str = str(self.ox)
-        # alpha_str = str(self.alpha)
-        # y_str = str(self.y)
 
         return self.__class__.__name__ + f"(ox={ox_str}, alpha={alpha_str}, y={y_str})"
 
