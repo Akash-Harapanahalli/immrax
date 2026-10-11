@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jaxtyping import Float, Integer
 
 from immrax.control import Control, ControlledSystem
+from immrax.inclusion.linbp import linbp, linbp_backward
 from immrax.embedding import EmbeddingSystem
 from immrax.inclusion import (
     Corner,
@@ -78,9 +79,12 @@ class NeuralNetwork(eqx.Module, Control):
 
         inputlen = int(arch[0])
 
+        current_key = key
+
         for a in arch[1:]:
             if a.isdigit():
-                mods.append(nn.Linear(inputlen, int(a), key=key))
+                current_key, layer_key = jax.random.split(current_key)
+                mods.append(nn.Linear(inputlen, int(a), key=layer_key))
                 inputlen = int(a)
                 self.out_len = int(a)
             else:
@@ -89,15 +93,10 @@ class NeuralNetwork(eqx.Module, Control):
                 elif a.lower() == "sigmoid":
                     mods.append(nn.Lambda(jax.nn.sigmoid))
                 elif a.lower() == "tanh":
-                    # Fixes NaN bug with tanh
-                    # mods.append(nn.Lambda(jax.nn.tanh))
-                    mods.append(nn.Lambda(lambda x: 2 * jax.nn.sigmoid(2 * x) - 1))
+                    mods.append(nn.Lambda(jax.nn.tanh))
                 elif a.lower() == "logsig":
                     mods.append(nn.Lambda(jax.nn.log_sigmoid))
                 elif a.lower() == "softplus":
-                    # jax.nn.softplus uses a custom jvp call
-                    # mods.append(nn.Lambda(jax.nn.softplus))
-                    # mods.append(nn.Lambda(lambda x : jnp.log(1 + jnp.exp(x))))
                     mods.append(nn.Lambda(lambda x: jnp.log1p(jnp.exp(x))))
 
         self.seq = nn.Sequential(mods)
@@ -119,14 +118,6 @@ class NeuralNetwork(eqx.Module, Control):
         eqx.tree_serialise_leaves(savepath, self.seq)
         if verbose:
             print(" done.")
-
-    # def load (self, path) :
-    #     loadpath = Path(path).joinpath('model.eqx')
-    #     self.seq = eqx.tree_deserialise_leaves(loadpath, self.seq)
-    #     print(f'Successfully loaded model from {loadpath}')
-
-    # def set_dir (self, dir:Path) :
-    #     self.dir = Path(dir)
 
     def loadnpy(self):
         import numpy as np
@@ -158,11 +149,7 @@ class NeuralNetwork(eqx.Module, Control):
                 seq = eqx.tree_at(
                     lambda seq: seq[i].bias, seq, jnp.zeros_like(seq[i].bias)
                 )
-        savepath = self.dir.joinpath("model.eqx")
-        eqx.tree_serialise_leaves(savepath, seq)
-        # self.seq = eqx.tree_deserialise_leaves(savepath, self.seq)
-        # self = NeuralNetwork(self.dir, load=True)
-        # print(f'Successfully zero initialized model and saved to {savepath}')
+        return eqx.tree_at(lambda m: m.seq, self, seq)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         return self.seq(x)
@@ -183,9 +170,6 @@ class NeuralNetwork(eqx.Module, Control):
         return self(x)
 
 
-from immrax.inclusion.linbp import linbp
-
-
 class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
     def __call__(self, x: Union[jax.Array, Interval]) -> Interval:
         if isinstance(x, Interval):
@@ -202,9 +186,32 @@ class CROWNResult(namedtuple("CROWNResult", ["lC", "uC", "ld", "ud"])):
 
 
 def crown(
-    f: Callable[..., jax.Array], out_len: int = None
+    f: Callable[..., jax.Array],
+    out_len: int = None,
+    *,
+    backward: bool = True,
+    iterated: bool = False,
+    forward_mode: str = "linbp",
 ) -> Callable[..., CROWNResult]:
-    lb_fn = linbp(f, relu_mode="adaptive")
+    """Backward CROWN by default (sign-conditioned slope at each ReLU).
+
+    Pass ``backward=False`` to fall back to forward linbp.
+    Pass ``iterated=True`` for *pure* backward CROWN: at each ReLU the
+    pre-activation l, u are re-derived by a backward CROWN pass to the input
+    rather than using the forward-IBP-tightened values.
+
+    ``forward_mode`` selects the forward sweep used to populate pre-activation
+    ``l, u`` for the backward CROWN pass (ignored when ``backward=False``):
+      - ``'linbp'`` (default): linear-bound propagation + optional IBP tightening.
+      - ``'ibp'``: pure interval arithmetic. With ``iterated=False`` this is
+        textbook **IBP+CROWN**; with ``iterated=True`` it is standard **CROWN**.
+    """
+    if backward:
+        lb_fn = linbp_backward(
+            f, relu_mode="adaptive", iterated_bw=iterated, forward_mode=forward_mode
+        )
+    else:
+        lb_fn = linbp(f, relu_mode="adaptive")
 
     def F(ix: Interval) -> CROWNResult:
         lb = lb_fn(ix)
@@ -232,9 +239,24 @@ class FastlinResult(namedtuple("FastlinResult", ["C", "ld", "ud"])):
 
 
 def fastlin(
-    f: Callable[..., jax.Array], out_len: int = None
+    f: Callable[..., jax.Array],
+    out_len: int = None,
+    *,
+    backward: bool = True,
+    iterated: bool = False,
+    forward_mode: str = "linbp",
 ) -> Callable[..., FastlinResult]:
-    lb_fn = linbp(f, relu_mode="same-slope")
+    """Backward same-slope (FastLin) by default. ``iterated=True`` re-derives
+    pre-activation ``l, u`` via backward CROWN at each ReLU (pure backward).
+
+    ``forward_mode='ibp'`` switches the forward sweep to pure interval
+    arithmetic (textbook IBP+CROWN slope-picking)."""
+    if backward:
+        lb_fn = linbp_backward(
+            f, relu_mode="same-slope", iterated_bw=iterated, forward_mode=forward_mode
+        )
+    else:
+        lb_fn = linbp(f, relu_mode="same-slope")
 
     def F(ix: Interval) -> FastlinResult:
         lb = lb_fn(ix)
@@ -307,39 +329,8 @@ class NNCEmbeddingSystem(EmbeddingSystem):
         p = self.sys.control.out_len
         q = len(w)
 
-        # def F (t, x, w) :
-        #     ret = []
-        #     for permutation in permutations :
-        #         for c in corners :
-        #             verifier_res = self.verifier(x)
-        #             u = verifier_res(x)
-        #             _C = verifier_res.lC; C_ = verifier_res.uC
-        #             _d = verifier_res.ld; d_ = verifier_res.ud
-
-        #             Jt, Jx, Ju, Jw = self.sys_mjacM(t, x, u, w, corners=(c,), permutations=(permutation,))[0]
-
-        #             tc = t.lower if c[0] == 0 else t.upper
-        #             xc = jnp.array([x[i].lower if c[i+1] == 0 else x[i].upper for i in range(n)])
-        #             uc = jnp.array([u[i].lower if c[i+1+n] == 0 else u[i].upper for i in range(p)])
-        #             wc = jnp.array([w[i].lower if c[i+1+n+p] == 0 else w[i].upper for i in range(q)])
-        #             fc = self.sys.olsystem.f(tc, xc, uc, wc)
-
-        #             return (Jx + Ju@)
-
-        # TODO: Default permutations
-        # leninputsfull = tuple([len(x) for x in args])
-        # leninputs = sum(leninputsfull)
-        # if permutations is None :
-        #     permutations = standard_permutation(leninputs)
-        # elif isinstance(permutations, Permutation) :
-        #     permutations = [permutations]
-        # elif not isinstance(permutations, Tuple) :
-        #     raise Exception('Must pass jax.Array (one permutation), Sequence[jax.Array], or None (auto standard permutation) for the permutations argument')
-
         verifier_res = self.verifier(ix)
         uglobal = verifier_res(ix)
-
-        args = (t, ix, uglobal, w)
 
         n = self.sys.xlen
         p = len(uglobal)
@@ -357,8 +348,6 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                 )
             if corners is None:
                 raise Exception("Must pass corners for crown, mixed cornered mode")
-            # x0_corners = [tuple([(x.lower if c[i] == 0 else x.upper) for i,x in enumerate(args)]) for c in corners]
-            # print(x0_corners)
 
             txuw_corners = []
 
@@ -390,30 +379,24 @@ class NNCEmbeddingSystem(EmbeddingSystem):
             for permutation in permutations:
                 # Compute Hybrid M centerings once
                 if self.M_locality == "hybrid":
-                    Mpre = self.sys_mjacM(
-                        t,
-                        ix,
-                        uglobal,
-                        w,
-                        permutations=permutation,
-                        centers=txuw_corners,
-                    )
+                    Mpre = [
+                        self.sys_mjacM(
+                            t,
+                            ix,
+                            uglobal,
+                            w,
+                            permutation=permutation,
+                            center=c,
+                        )
+                        for c in txuw_corners
+                    ]
 
-                for c in corners:
-                    # for j, (tc, xc, uc, wc) in enumerate(txuw_corners) :
-                    # def body_fun_2 (_, a2) :
-                    # tc, xc, uc, wc = txuw_corners[j]
-                    # j = i2
-                    # tc, xc, uc, wc, c = a2
-                    # c = corners[j]
-                    # print('here: ', tc, xc, uc, wc)
-                    # def body_fun_3 (i3, a3) :
+                for j, c in enumerate(corners):  # j indexes Mpre (built per corner)
+
                     def _F(t, x):
                         # LOWER BOUND
-                        # _xi = refine(ut2i(jnp.copy(x).at[i3+n].set(x[i3])))
                         _xi = refine(x)
 
-                        # _xc = jnp.minimum(xc, _xi.upper)
                         _xc = jnp.array(
                             [
                                 _xi.lower[i] if c[i + 1] == 0 else _xi.upper[i]
@@ -437,7 +420,6 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                                 for k in range(p)
                             ]
                         )
-                        # uc = self.sys.control.u(t, _xc)
 
                         if self.M_locality == "local":
                             Jt, Jx, Ju, Jw = self.sys_mjacM(
@@ -445,9 +427,9 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                                 _xi,
                                 _ui,
                                 w,
-                                permutations=permutation,
-                                centers=((tc, _xc, _uc, wc),),
-                            )[0]
+                                permutation=permutation,
+                                center=(tc, _xc, _uc, wc),
+                            )
                         else:
                             Jt, Jx, Ju, Jw = Mpre[j]
 
@@ -463,17 +445,10 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                         B_p, B_n = d_positive(J_u)
 
                         _K = _Bp @ _C + _Bn @ C_
-                        K_ = B_p @ C_ + B_n @ _C
-                        # _Dp, _Dn = d_positive(_Jw); D_p, D_n = d_positive(J_w)
                         _Dp = jnp.clip(_Jw, 0, jnp.inf)
 
                         _H = _Jx + _K
-                        H_ = J_x + K_
                         _Hp, _Hn = d_positive(_H)
-                        # H_p, H_n = d_metzler(H_)
-
-                        # _ret.append(_Hp@_x + _Hn@x_ - _Jx@xc - _Ju@uc + _Bp@_d + _Bn@d_
-                        #             + _Dp@_w - _Dp@w_ + fc)
                         return (
                             _Hp @ _x
                             + _Hn @ x_
@@ -488,10 +463,8 @@ class NNCEmbeddingSystem(EmbeddingSystem):
 
                     def F_(t, x):
                         # UPPER BOUND
-                        # x_i = refine(ut2i(jnp.copy(x).at[i3].set(x[i3+n])))
                         x_i = refine(x)
 
-                        # x_c = jnp.maximum(xc, x_i.lower)
                         x_c = jnp.array(
                             [
                                 x_i.lower[i] if c[i + 1] == 0 else x_i.upper[i]
@@ -515,22 +488,17 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                                 for k in range(p)
                             ]
                         )
-                        # uc = self.sys.control.u(t, x_c)
                         if self.M_locality == "local":
                             Jt, Jx, Ju, Jw = self.sys_mjacM(
                                 t,
                                 x_i,
                                 u_i,
                                 w,
-                                permutations=permutation,
-                                centers=((tc, x_c, u_c, wc),),
-                            )[0]
+                                permutation=permutation,
+                                center=(tc, x_c, u_c, wc),
+                            )
                         else:
                             Jt, Jx, Ju, Jw = Mpre[j]
-
-                        # _Jx, J_x = i2lu(Jx)
-                        # _Ju, J_u = i2lu(Ju)
-                        # _Jw, J_w = i2lu(Jw)
 
                         _Jx, J_x = set_columns_from_corner(c[1 : n + 1], interval(Jx))
                         _Ju, J_u = set_columns_from_corner(
@@ -545,17 +513,12 @@ class NNCEmbeddingSystem(EmbeddingSystem):
 
                         _K = _Bp @ _C + _Bn @ C_
                         K_ = B_p @ C_ + B_n @ _C
-                        # _Dp, _Dn = d_positive(_Jw);
-                        # D_p, D_n = d_positive(J_w)
                         D_p = jnp.clip(J_w, 0, jnp.inf)
 
                         _H = _Jx + _K
                         H_ = J_x + K_
-                        # _Hp, _Hn = d_metzler(_H);
                         H_p, H_n = d_positive(H_)
 
-                        # ret_.append(H_n@_x + H_p@x_ - J_x@xc - J_u@uc + B_n@_d + B_p@d_
-                        #             - D_p@_w + D_p@w_ + fc)
                         return (
                             H_n @ _x
                             + H_p @ x_
@@ -581,45 +544,9 @@ class NNCEmbeddingSystem(EmbeddingSystem):
                     )
                     E_ = jax.vmap(F_, (None, 0))(t, X_)
 
-                    # return jnp.concatenate((jnp.diag(_E), jnp.diag(E_)))
                     _ret.append(jnp.diag(_E))
                     ret_.append(jnp.diag(E_))
 
             _ret, ret_ = jnp.array(_ret), jnp.array(ret_)
 
             return jnp.concatenate((jnp.max(_ret, axis=0), jnp.min(ret_, axis=0)))
-
-        # elif self.nn_verifier == 'fastlin' :
-        #     """ Embedding System induced by Closed-Loop Mixed Centered Inclusion Function
-        #         For more information, see 'Forward Invariance in Neural Network Controlled Systems'
-        #         https://arxiv.org/pdf/2309.09043.pdf
-        #     """
-        #     # TODO: Implement transformation for centered mode using fastlin
-
-        #     # Mixed Centered
-        #     if centers is None :
-        #         if corners is None or kwargs.get('auto_centered', False) :
-        #             # Auto-centered
-        #             centers = [tuple([(x.lower + x.upper)/2 for x in args])]
-        #         else :
-        #             centers = []
-        #     elif isinstance(centers, jax.Array) :
-        #         centers = [centers]
-        #     elif not isinstance(centers, Sequence) :
-        #         raise Exception('Must pass jax.Array (one center), Sequence[jax.Array], or None (auto-centered) for the centers argument')
-
-        #     if corners is not None :
-        #         if not isinstance(corners, Tuple) :
-        #             raise Exception('Must pass Tuple[Corner] or None for the corners argument')
-        #         centers.extend([tuple([(x.lower if c[i] == 0 else x.upper) for i,x in enumerate(args)]) for c in corners])
-
-        #     _ret, ret_ = [], []
-
-        #     # for permutation in permutations :V
-        #     #     # Compute Hybrid M centerings once
-        #     #     if self.M_locality == 'hybrid' or T == 'automatic' :
-        #     #         Mpre = self.sys_mjacM(t, ix, uglobal, w, permutations=permutation, centers=txuw_corners)
-
-        #     #     if T == 'automatic' :
-
-        #     #     for i, (tc, xc, uc, wc) in enumerate(centers) :
