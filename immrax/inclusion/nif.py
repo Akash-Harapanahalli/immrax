@@ -218,6 +218,8 @@ _add_passthrough_to_registry(lax.squeeze_p)
 _add_passthrough_to_registry(lax.transpose_p)
 _add_passthrough_to_registry(lax.broadcast_in_dim_p)
 _add_passthrough_to_registry(lax.concatenate_p)
+if hasattr(lax, "stack_p"):  # jax >= 0.10
+    _add_passthrough_to_registry(lax.stack_p)
 _add_passthrough_to_registry(lax.gather_p)
 _add_passthrough_to_registry(lax.scatter_p)
 _add_passthrough_to_registry(lax.scatter_add_p, n_ulps=1)
@@ -488,7 +490,8 @@ inclusion_registry[lax.neg_p] = _inclusion_neg_p
 Interval.__neg__ = _inclusion_neg_p
 
 
-def _inclusion_mul_p(x: Interval, y: Interval) -> Interval:
+def _inclusion_mul_p(x: Interval, y: Interval, *, out_dtype=None) -> Interval:
+    # jax >= 0.10 binds mul_p with an out_dtype param; ignored for interval arithmetic
     if isinstance(x, Interval) and isinstance(y, Interval):
         _1 = x.lower * y.lower
         _2 = x.lower * y.upper

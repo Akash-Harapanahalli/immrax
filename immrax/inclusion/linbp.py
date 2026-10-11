@@ -730,6 +730,8 @@ for _p in [
 
 if hasattr(lax, "split_p"):
     _add_structural_to_linbp_registry(lax.split_p)
+if hasattr(lax, "stack_p"):  # jax >= 0.10
+    _add_structural_to_linbp_registry(lax.stack_p)
 if hasattr(lax, "dynamic_slice_p"):
     _add_structural_to_linbp_registry(lax.dynamic_slice_p)
 if hasattr(lax, "gather_p"):
@@ -1689,6 +1691,33 @@ backward_registry[lax.neg_p] = _bw_neg
 backward_registry[lax.max_p] = _bw_max_min(1)
 backward_registry[lax.min_p] = _bw_max_min(-1)
 backward_registry[lax.concatenate_p] = _bw_concatenate
+
+
+def _bw_stack(eqn, out_bd, env, **_):
+    """y = stack(xs, axis): x_i gets slice i of A along that axis; constants fold
+    into the bias, which goes to the first bound operand only."""
+    ax = eqn.params["axis"] + 1  # A has a leading n_out axis
+    vals = [_read(env, v) for v in eqn.invars]
+    take = lambda A, i: jnp.take(A, i, axis=ax)
+    b_lo, b_hi = out_bd.b_lo, out_bd.b_hi
+    for i, v in enumerate(vals):
+        if not isinstance(v, LinearBound):
+            c = jnp.asarray(v)
+            b_lo = b_lo + jax.vmap(lambda a: _bw_sum_over_var(a, c))(take(out_bd.A_lo, i))
+            b_hi = b_hi + jax.vmap(lambda a: _bw_sum_over_var(a, c))(take(out_bd.A_hi, i))
+    out, first = [], True
+    for i, v in enumerate(vals):
+        if not isinstance(v, LinearBound):
+            out.append(None)
+            continue
+        lo, hi = (b_lo, b_hi) if first else (jnp.zeros_like(b_lo), jnp.zeros_like(b_hi))
+        out.append(BackwardBound(take(out_bd.A_lo, i), lo, take(out_bd.A_hi, i), hi))
+        first = False
+    return out
+
+
+if hasattr(lax, "stack_p"):  # jax >= 0.10
+    backward_registry[lax.stack_p] = _bw_stack
 for _p in (
     lax.slice_p,
     lax.squeeze_p,
