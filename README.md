@@ -61,7 +61,7 @@ The above comments on [system dependencies](#system-dependencies) still apply.
 To test if the installation process worked, run the `compare.py` example.  This should return the outputs of different inclusion functions as well as their runtimes.
 
 ```shell
-uv run examples/compare.py
+uv run examples/getting_started/compare.py
 ```
 
 The additional `examples` extra contains some dependencies needed for the more complex examples; be sure to also install it if you want to run the others.

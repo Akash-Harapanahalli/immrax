@@ -27,7 +27,9 @@ extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = []
+exclude_patterns = [
+    "**/README.md",  # repo READMEs, not doc pages
+]
 
 autoclass_content = "both"
 

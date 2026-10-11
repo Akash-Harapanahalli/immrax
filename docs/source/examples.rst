@@ -1,9 +1,16 @@
 .. _examples:
+
 Examples
 ========
 
-.. toctree::
-   :maxdepth: 1
+Worked examples, organized like the ``examples/`` folder. Notebooks render
+directly; script examples show their figures and source.
 
-   examples/vehicle/vehicle
-   examples/pendulum/pendulum
+.. toctree::
+   :maxdepth: 2
+
+   examples_getting_started
+   examples_neural
+   examples_aux
+   examples_parametric
+   examples_platoon

@@ -56,7 +56,7 @@ jobs:
       - name: Run sanity example (compare.py)
         id: sanity
         continue-on-error: true
-        run: uv run examples/compare.py
+        run: uv run examples/getting_started/compare.py
 
       - name: Summarize sanity result
         id: sanityresult
