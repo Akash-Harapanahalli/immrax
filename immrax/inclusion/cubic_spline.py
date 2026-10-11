@@ -110,7 +110,6 @@ def make_spline_eval_fn(x_knots, coeffs):
         upper_bins = jnp.concatenate((x_knots[1:-1], jnp.array([jnp.inf])))
         bins = irx.interval(lower_bins, upper_bins)
 
-        # int_eval_partitioned = jax.vmap(lambda x, y: x and y, in_axes=(0, None))(
         int_eval_partitioned = jax.vmap(
             lambda x, y: x & y,
             in_axes=(0, None),
@@ -130,16 +129,6 @@ def make_spline_eval_fn(x_knots, coeffs):
         # Use jnp.where to replace empty intervals with neutral elements for the reduction.
         valid_lowers = jnp.where(is_empty, jnp.inf, out_partitioned.lower)
         valid_uppers = jnp.where(is_empty, -jnp.inf, out_partitioned.upper)
-
-        # jax.debug.print(
-        #     "int_eval_partitioned: {}\n dx_intervals: {}\nis_empty: {},\nout_partitioned: {},\nvalid_lowers: {},\nvalid_uppers: {}",
-        #     int_eval_partitioned,
-        #     dx_intervals,
-        #     is_empty,
-        #     out_partitioned,
-        #     valid_lowers,
-        #     valid_uppers,
-        # )
 
         return irx.interval(jnp.min(valid_lowers), jnp.max(valid_uppers))
 

@@ -28,7 +28,7 @@ def spline_raw_data():
     x_range = (0.0, 50.0)
     x_coords = np.linspace(x_range[0], x_range[1], num_points)
     y_range = (-10.0, 10.0)
-    y_coords = np.random.uniform(y_range[0], y_range[1], size=num_points)
+    y_coords = np.random.default_rng(0).uniform(y_range[0], y_range[1], size=num_points)
     points = jnp.array(np.vstack((x_coords, y_coords)).T)
     return points
 
@@ -197,7 +197,7 @@ if __name__ == "__main__":
 
     # Generate y-coordinates randomly from a uniform distribution
     y_range = (-10.0, 10.0)
-    y_coords = np.random.uniform(y_range[0], y_range[1], size=num_points)
+    y_coords = np.random.default_rng(0).uniform(y_range[0], y_range[1], size=num_points)
 
     # Combine into a single array of points
     input_points_np = np.vstack((x_coords, y_coords)).T

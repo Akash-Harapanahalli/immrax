@@ -6,19 +6,14 @@ import jax
 from jax._src.traceback_util import api_boundary
 from jax._src.util import wraps
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as onp
-from pypoman import plot_polygon
-from scipy.spatial import HalfspaceIntersection
-import shapely.geometry as sg
-import shapely.ops as so
 
-import immrax as irx
-from immrax.inclusion import interval, Corner, Interval, all_corners, i2lu, i2ut, ut2i
+from immrax.inclusion import interval, Corner, Interval, i2lu, i2ut, ut2i
+from immrax.inclusion import (
+    get_corners as get_corners,
+)  # re-export: corner-utility family
 from immrax.system import Trajectory
 
-from itertools import product
 from functools import partial
 
 # ================================================================================
@@ -30,15 +25,18 @@ def timed(f: Callable):
     @wraps(f)
     @api_boundary
     def f_timed(*args, **kwargs):
-        t0 = time.time()
+        t0 = time.perf_counter()
         ret = jax.block_until_ready(f(*args, **kwargs))
-        tf = time.time()
+        tf = time.perf_counter()
         return ret, (tf - t0)
 
     return f_timed
 
 
-def run_times(N: int, f: Callable, *args, **kwargs):
+def run_times(N: int, f: Callable, *args, **kwargs) -> Tuple:
+    """
+    Run a function N times and return the (result, times)
+    """
     f_timed = timed(f)
     times = []
     for i in range(N):
@@ -51,13 +49,26 @@ def run_times(N: int, f: Callable, *args, **kwargs):
 # Plotting
 # ================================================================================
 
-sg_box = lambda x, xi=0, yi=1: sg.box(
-    x[xi].lower, x[yi].lower, x[xi].upper, x[yi].upper
-)
-sg_boxes = lambda xx, xi=0, yi=1: [sg_box(x, xi, yi) for x in xx]
+
+def _get_shapely():
+    """Lazy import of shapely."""
+    import shapely.geometry as sg
+    import shapely.ops as so
+
+    return sg, so
+
+
+def sg_box(x, xi=0, yi=1):
+    sg, _ = _get_shapely()
+    return sg.box(x[xi].lower, x[yi].lower, x[xi].upper, x[yi].upper)
+
+
+def sg_boxes(xx, xi=0, yi=1):
+    return [sg_box(x, xi, yi) for x in xx]
 
 
 def draw_sg_union(ax, boxes, **kwargs):
+    _, so = _get_shapely()
     shape = so.unary_union(boxes)
     xs, ys = shape.exterior.xy
     kwargs.setdefault("ec", "tab:blue")
@@ -76,6 +87,8 @@ def draw_iarrays(ax, xx, xi=0, yi=1, **kwargs):
 
 
 def draw_iarray_3d(ax, x, xi=0, yi=1, zi=2, **kwargs):
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
     Xl, Yl, Zl = x.lower[(xi, yi, zi),]
     Xu, Yu, Zu = x.upper[(xi, yi, zi),]
     poly_alpha = kwargs.pop("poly_alpha", 0.0)
@@ -122,9 +135,11 @@ def plot_interval_t(ax, tt, x, **kwargs):
 
 
 def draw_trajectory_2d(traj: Trajectory, vars=(0, 1), **kwargs):
+    import matplotlib.pyplot as plt
+
     n = traj.ys[0].shape[0] // 2
     y_int = [
-        irx.ut2i(jnp.array([y[vars[0]], y[vars[1]], y[vars[0] + n], y[vars[1] + n]]))
+        ut2i(jnp.array([y[vars[0]], y[vars[1]], y[vars[0] + n], y[vars[1] + n]]))
         for y in traj.ys
     ]  # TODO: fix indexing
     alpha = kwargs.pop("alpha", 0.4)
@@ -135,7 +150,10 @@ def draw_trajectory_2d(traj: Trajectory, vars=(0, 1), **kwargs):
 
 
 def draw_refined_trajectory_2d(traj: Trajectory, H: jnp.ndarray, vars=(0, 1), **kwargs):
-    ys_int = [irx.ut2i(y) for y in traj.ys]
+    from scipy.spatial import HalfspaceIntersection
+    from pypoman import plot_polygon
+
+    ys_int = [ut2i(y) for y in traj.ys]
     color = kwargs.pop("color", "tab:blue")
     for bound in ys_int:
         dx = 1e-3 * jnp.ones_like(bound.lower)
@@ -146,11 +164,6 @@ def draw_refined_trajectory_2d(traj: Trajectory, H: jnp.ndarray, vars=(0, 1), **
             )
         )
         hs = HalfspaceIntersection(cons, bound.center[0 : H.shape[1]])
-        # try:
-        #     hs = HalfspaceIntersection(cons, bound.center[0 : H.shape[1]])
-        # except Exception:
-        #     x = bound.center[0 : H.shape[1]]
-        #     print(bound.lower[0 : H.shape[1]], H @ x, bound.upper[0 : H.shape[1]])
 
         vertices = hs.intersections[:, 0:2]
         vertices = onp.vstack(
@@ -206,7 +219,6 @@ def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
 
 
 def gen_ics(x0, N, key=jax.random.key(0)):
-    # X = np.empty((N, len(x0)))
     X = []
     keys = jax.random.split(key, len(x0))
     for i in range(len(x0)):
@@ -225,56 +237,55 @@ def set_columns_from_corner(corner: Corner, A: Interval):
     return _Jx, J_x
 
 
-def get_corners(x: Interval, corners: Tuple[Corner] | None = None):
-    """Gets the specified corners of the interval x. Returns all corners if None."""
-    corners = all_corners(len(x)) if corners is None else corners
-    xut = i2ut(x)
-    return jnp.array(
-        [
-            jnp.array([x.lower[i] if c[i] == 0 else x.upper[i] for i in range(len(x))])
-            for c in corners
-        ]
-    )
-
-
 def get_sparse_corners(x: Interval, verbose=False, **kwargs):
-    """Returns a function returning the sparse corners of the interval
+    """Returns a function returning the sparse corners of the interval.
+
+    Only the entries that are non-constant in the template ``x`` are varied, so an
+    interval with ``k`` non-constant entries yields ``2**k`` corners. The sparsity
+    pattern is detected once from the (static) template; the returned ``gsc`` is
+    fully vectorized over the ``2**k`` corners via the same bit-extraction trick as
+    :func:`get_rohn_corners` -- no Python-level loop over corners or entries.
 
     Parameters
     ----------
     x : Interval
-        Interval object to model the gsc off of---value of x should be static
+        Template interval used to find the sparsity pattern---its bounds must be
+        static (``onp.isclose`` cannot run under ``jit``).
+    verbose : bool
+        Print the corner / non-constant-entry counts.
     **kwargs : dict
-        Additional keyword arguments to pass to jnp.isclose
+        Additional keyword arguments forwarded to ``numpy.isclose``.
 
     Returns
     -------
-    function
-        A function that takes an Interval object and returns the sparse corners based on
-        the entries that are not constant in the test x
+    Callable[[Interval], Array]
+        ``gsc(x)`` returning a stacked ``(2**k, *x.shape)`` array of corner points.
     """
     sh = x.shape
+    n = int(onp.prod(sh)) if sh else 1
 
-    # Static value usage here.
-    ic = onp.isclose(x.lower.reshape(-1), x.upper.reshape(-1), **kwargs)
-    cs = [
-        irx.Corner(p)
-        for p in product(*[(0,) if ic[i] else (0, 1) for i in range(len(ic))])
-    ]
+    # Static: positions of the non-constant (free) entries.
+    free = ~onp.isclose(
+        onp.asarray(x.lower).reshape(-1), onp.asarray(x.upper).reshape(-1), **kwargs
+    )
+    free_idx = jnp.asarray(onp.nonzero(free)[0])  # (k,)
+    k = int(free.sum())
     if verbose:
-        print(
-            f"Found {len(cs)} corners, from {jnp.sum(jnp.logical_not(ic))} nonconstant entries."
-        )
+        print(f"Found {2**k} corners, from {k} nonconstant entries.")
+
+    # Static (2**k, k) bit table: bit j of corner i selects upper (1) / lower (0).
+    codes = onp.arange(2**k)
+    bits = jnp.asarray((codes[:, None] >> onp.arange(k)) & 1)  # (2**k, k)
 
     @jax.jit
     def gsc(x: Interval):
-        x = x.reshape(-1)
-        return [
-            jnp.array(
-                [x.lower[i] if ci == 0 else x.upper[i] for i, ci in enumerate(c)]
-            ).reshape(sh)
-            for c in cs
-        ]
+        lo = x.lower.reshape(-1)
+        up = x.upper.reshape(-1)
+        # Every corner starts at the lower bound (constant entries stay fixed),
+        # then the free entries are overwritten with upper where the bit is set.
+        corners = jnp.broadcast_to(lo, (2**k, n))  # (2**k, n)
+        free_vals = jnp.where(bits == 1, up[free_idx], lo[free_idx])  # (2**k, k)
+        return corners.at[:, free_idx].set(free_vals).reshape((2**k, *sh))
 
     return gsc
 
@@ -289,20 +300,17 @@ def get_rohn_corners(A: Interval, sign: Literal["+", "-"] = "+"):
     Ac = A.center
     Ap = A.pert
 
+    # All 2^n sign vectors via bit extraction: bit j of i gives sign j.
+    # 2**n is a compile-time constant (n = A.shape[0] is static).
+    indices = jnp.arange(2**n)  # (2^n,)
+    signs = 2 * ((indices[:, None] >> jnp.arange(n)) & 1) - 1  # (2^n, n)
+    # Outer product: diag(s) @ M @ diag(s) = (s[:,None]*s[None,:])*M
+    sign_matrices = signs[:, :, None] * signs[:, None, :]  # (2^n, n, n)
+
     if sign == "+":
-        return jnp.asarray(
-            [
-                Ac + jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s))
-                for s in product(*[[-1, +1] for i in range(n)])
-            ]
-        )
+        return Ac + sign_matrices * Ap
     elif sign == "-":
-        return jnp.asarray(
-            [
-                Ac - jnp.diag(jnp.asarray(s)) @ Ap @ jnp.diag(jnp.asarray(s))
-                for s in product(*[[-1, +1] for i in range(n)])
-            ]
-        )
+        return Ac - sign_matrices * Ap
     else:
         raise Exception("pm should be '+' or '-'.")
 
@@ -315,8 +323,6 @@ def null_space(A, rcond=None, dim_null: int | None = None):
         rcond = jnp.finfo(s.dtype).eps * max(M, N)
     tol = jnp.amax(s) * rcond
     num = jnp.sum(s > tol, dtype=int) if dim_null is None else len(s) - dim_null + 1
-    # num = jnp.sum(s > tol, dtype=int)
-    # print(num)
     Q = vh[num:, :].T.conj()
 
     return Q

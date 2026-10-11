@@ -11,57 +11,21 @@ def polynomial(a, x):
 
 @polynomial.defif
 def polynomial_inclusion(a, x):
-    # if not isinstance(a, Interval) or jnp.allclose(a.lower, a.upper) :
-    # TODO: This only works for constant coefficients. Try to take inclusion for x, natif into inclusion for both
-    if True:
-        # TODO: Can we make this static wrt a somehow, to avoid recomputing the critical points?
-        """Minimal inclusion function for constant coefficient a.
+    """Tight inclusion for constant coefficients ``a``: the min/max over the
+    endpoints of ``x`` and the real critical points inside it. Interval
+    coefficients fall back to the natural inclusion function."""
+    if isinstance(a, Interval):
+        return nif.natif(jnp.polyval)(a, x)
 
-        ulf = min_{x \\in [ulx, olx]} f(a, x)
-        olf = max_{x \\in [ulx, olx]} f(a, x)
-
-        Since f is a polynomial, check critical points and endpoints.
-        """
-        if isinstance(a, Interval):
-            a = a.lower
-
-        ad = jnp.polyder(a)
-        ad_roots = jnp.roots(ad, strip_zeros=False)
-        # Critical points and values
-        # crit = jnp.real(ad_roots[jnp.isreal(ad_roots)])
-        # crit = ad_roots[jnp.where(jnp.isreal(ad_roots))]
-        # crit = ad_roots
-
-        crit_vals = jnp.real(jax.vmap(jnp.polyval, in_axes=(None, 0))(a, ad_roots))
-        crit_in_x = jax.vmap(
-            lambda crit: jnp.logical_and(
-                jnp.logical_and(
-                    crit > jnp.atleast_1d(x.lower), crit < jnp.atleast_1d(x.upper)
-                ),
-                jnp.isreal(crit),
-            )
-        )(ad_roots)
-
-        end_vals = jnp.array(
-            [
-                jnp.polyval(a, jnp.atleast_1d(x.lower)),
-                jnp.polyval(a, jnp.atleast_1d(x.upper)),
-            ]
-        )
-
-        # print(f"{ad_roots.shape=}")
-        # print(f"{end_vals.shape=}")
-        # print(f"{crit_vals[:, None].shape=},\n{crit_in_x.shape=}")
-        l_vals = jnp.concatenate(
-            (end_vals, jnp.where(crit_in_x, crit_vals[:, None], jnp.inf))
-        )
-        u_vals = jnp.concatenate(
-            (end_vals, jnp.where(crit_in_x, crit_vals[:, None], -jnp.inf))
-        )
-
-        return interval(jnp.min(l_vals, axis=0), jnp.max(u_vals, axis=0))
-
-    else:
-        """Otherwise, simply use natural inclusion function."""
-        print("Using natural inclusion function for polynomial primitive.")
-        return nif.natif(polynomial_impl)(a, x)
+    ad_roots = jnp.roots(jnp.polyder(a), strip_zeros=False)
+    crit_vals = jnp.real(jax.vmap(jnp.polyval, in_axes=(None, 0))(a, ad_roots))
+    lo, hi = jnp.atleast_1d(x.lower), jnp.atleast_1d(x.upper)
+    crit_in_x = jax.vmap(lambda c: (c > lo) & (c < hi) & jnp.isreal(c))(ad_roots)
+    end_vals = jnp.array([jnp.polyval(a, lo), jnp.polyval(a, hi)])
+    l_vals = jnp.concatenate(
+        (end_vals, jnp.where(crit_in_x, crit_vals[:, None], jnp.inf))
+    )
+    u_vals = jnp.concatenate(
+        (end_vals, jnp.where(crit_in_x, crit_vals[:, None], -jnp.inf))
+    )
+    return interval(jnp.min(l_vals, axis=0), jnp.max(u_vals, axis=0))

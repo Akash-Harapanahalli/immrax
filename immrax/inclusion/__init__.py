@@ -1,6 +1,7 @@
 from .interval import (
     Interval,
     interval,
+    isinterval,
     icopy,
     icentpert,
     i2centpert,
@@ -12,11 +13,23 @@ from .interval import (
     izeros,
     interval_intersect,
     interval_union,
+    widen,
+    rigorous,
+    non_rigorous,
+    set_rigorous,
 )
 
 from . import nif as nif
 from .nif import natif
 from .custom_if import custom_if
+
+from .kaucher import (
+    KaucherInterval,
+    kaucher_interval,
+    kaucher_dual,
+    kaucher_pro,
+    iskaucher,
+)
 
 from . import linbp as linbp
 from .linbp import LinearBound, linbp as linbp_fn
@@ -42,6 +55,7 @@ from .jacobian import (
 __all__ = [
     "Interval",
     "interval",
+    "isinterval",
     "icopy",
     "icentpert",
     "i2centpert",
@@ -53,6 +67,11 @@ __all__ = [
     "izeros",
     "interval_intersect",
     "interval_union",
+    "KaucherInterval",
+    "kaucher_interval",
+    "kaucher_dual",
+    "kaucher_pro",
+    "iskaucher",
     "nif",
     "natif",
     "jacM",
@@ -71,6 +90,10 @@ __all__ = [
     "get_corners",
     "mjacif",
     "mjacM",
+    "widen",
+    "rigorous",
+    "non_rigorous",
+    "set_rigorous",
     "linbp",
     "LinearBound",
     "linbp_fn",

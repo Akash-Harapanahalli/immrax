@@ -19,15 +19,15 @@ def validate_overapproximation_nd(func, input_interval, output_interval):
     assert jnp.all(true_values <= output_interval.upper)
 
 
-def validate_overapproximation_1d_list(func, input_interval, output_interval):
+def validate_overapproximation_1d_list(func, input_interval, output_interval, tol=1e-5):
     """
     Validates that the output_interval overapproximates the true values of the
-    function over a list of 1D input_intervals by sampling.
+    function over a list of 1D input_intervals by sampling (up to float round-off ``tol``).
     """
     for i in range(len(input_interval.lower)):
         sample_points = jnp.linspace(
             input_interval.lower[i], input_interval.upper[i], 100
         )
         true_values = jax.vmap(func)(sample_points)
-        assert jnp.all(true_values >= output_interval.lower[i].squeeze())
-        assert jnp.all(true_values <= output_interval.upper[i].squeeze())
+        assert jnp.all(true_values >= output_interval.lower[i].squeeze() - tol)
+        assert jnp.all(true_values <= output_interval.upper[i].squeeze() + tol)
