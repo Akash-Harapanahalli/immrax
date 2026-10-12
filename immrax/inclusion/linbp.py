@@ -1703,8 +1703,12 @@ def _bw_stack(eqn, out_bd, env, **_):
     for i, v in enumerate(vals):
         if not isinstance(v, LinearBound):
             c = jnp.asarray(v)
-            b_lo = b_lo + jax.vmap(lambda a: _bw_sum_over_var(a, c))(take(out_bd.A_lo, i))
-            b_hi = b_hi + jax.vmap(lambda a: _bw_sum_over_var(a, c))(take(out_bd.A_hi, i))
+            b_lo = b_lo + jax.vmap(lambda a: _bw_sum_over_var(a, c))(
+                take(out_bd.A_lo, i)
+            )
+            b_hi = b_hi + jax.vmap(lambda a: _bw_sum_over_var(a, c))(
+                take(out_bd.A_hi, i)
+            )
     out, first = [], True
     for i, v in enumerate(vals):
         if not isinstance(v, LinearBound):

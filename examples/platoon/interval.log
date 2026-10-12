@@ -1,0 +1,38 @@
+backend: gpu (NVIDIA GeForce RTX 3070), x64=False
+  n=3: 0.055 s (JIT 8 s)  avg vol 1.809e-03  final vol 3.561e-03
+  n=9: 0.077 s (JIT 8 s)  avg vol 7.041e-03  final vol 1.192e-02
+  n=15: 0.087 s (JIT 8 s)  avg vol 9.002e-03  final vol 1.195e-02
+  n=25: 0.136 s (JIT 10 s)  avg vol 1.018e-02  final vol 1.195e-02
+  n=50: 0.265 s (JIT 11 s)  avg vol 1.106e-02  final vol 1.194e-02
+  n=125: 1.137 s (JIT 92 s)  avg vol 1.159e-02  final vol 1.195e-02
+  n=250: 14.468 s (JIT 39 s)  avg vol 1.177e-02  final vol 1.194e-02
+
+% unicycle platoon interval reachability (symplectic, dt=0.01, tf=3.0, pert 0.005, fp32 on gpu: NVIDIA GeForce RTX 3070)
+  N    # States  Runtime s (JIT s)      Average vol    Final vol
+---  ----------  -------------------  -------------  -----------
+  3          12  0.055 (8)                1.809e-03    3.561e-03
+  9          36  0.077 (8)                7.041e-03    1.192e-02
+ 15          60  0.087 (8)                9.002e-03    1.195e-02
+ 25         100  0.136 (10)               1.018e-02    1.195e-02
+ 50         200  0.265 (11)               1.106e-02    1.194e-02
+125         500  1.137 (92)               1.159e-02    1.195e-02
+250        1000  14.468 (39)              1.177e-02    1.194e-02
+
+\begin{tabular}{rrlrr}
+\hline
+   $N$ &   \# States & Runtime s (JIT s)   &   Average vol &   Final vol \\
+\hline
+     3 &          12 & 0.055 (8)           &     1.809e-03 &   3.561e-03 \\
+     9 &          36 & 0.077 (8)           &     7.041e-03 &   1.192e-02 \\
+    15 &          60 & 0.087 (8)           &     9.002e-03 &   1.195e-02 \\
+    25 &         100 & 0.136 (10)          &     1.018e-02 &   1.195e-02 \\
+    50 &         200 & 0.265 (11)          &     1.106e-02 &   1.194e-02 \\
+   125 &         500 & 1.137 (92)          &     1.159e-02 &   1.195e-02 \\
+   250 &        1000 & 14.468 (39)         &     1.177e-02 &   1.194e-02 \\
+\hline
+\end{tabular}
+
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_interval_grid.pdf
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_interval_grid.svg
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_interval_overview.pdf
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_interval_overview.svg

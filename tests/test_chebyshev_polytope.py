@@ -26,21 +26,21 @@ class VDP(irx.System):
 def test_affine_change_exact():
     mu, M = jnp.array([0.1, -0.2]), jnp.array([[0.5, 0.1], [-0.2, 0.7]])
     S, exps = affine_change(mu, M, 3), cheb_indices(2, 3)
-    w = jax.random.uniform(jax.random.PRNGKey(0), (50, 2), minval=-1, maxval=1)
-    lhs = jax.vmap(lambda w: cheb_eval(mu + M @ w, exps))(w)
-    rhs = jax.vmap(lambda w: S @ cheb_eval(w, exps))(w)
+    z = jax.random.uniform(jax.random.PRNGKey(0), (50, 2), minval=-1, maxval=1)
+    lhs = jax.vmap(lambda z: cheb_eval(mu + M @ z, exps))(z)
+    rhs = jax.vmap(lambda z: S @ cheb_eval(z, exps))(z)
     assert jnp.allclose(lhs, rhs, atol=1e-5)
 
 
 def test_signed_bound_contains():
     q, G = 6, 4
-    p = lambda w: jnp.sin(3 * w[0]) * w[1] ** 2 + w[0] * w[1]
+    p = lambda z: jnp.sin(3 * z[0]) * z[1] ** 2 + z[0] * z[1]
     C = cheb_coeffs(jax.vmap(p)(jnp.asarray(_grid(2, q)))[:, None], 2, q)
     pc, dev = signed_bound(C, G)
-    w = onp.random.default_rng(0).uniform(-1, 1, (4000, 2))
-    cell = (onp.clip(((w + 1) / 2 * G).astype(int), 0, G - 1) * [G, 1]).sum(1)
+    z = onp.random.default_rng(0).uniform(-1, 1, (4000, 2))
+    cell = (onp.clip(((z + 1) / 2 * G).astype(int), 0, G - 1) * [G, 1]).sum(1)
     pw = onp.asarray(
-        jax.vmap(lambda w: cheb_eval(w, cheb_indices(2, q - 1)))(jnp.asarray(w))
+        jax.vmap(lambda z: cheb_eval(z, cheb_indices(2, q - 1)))(jnp.asarray(z))
     )
     vals = (
         pw @ onp.asarray(C[tuple(cheb_indices(2, q - 1).T)])[:, 0]
@@ -63,7 +63,7 @@ def _reach(bound, m, tf, **kw):
     )
     worst = -jnp.inf
     for k in range(ys.ox.shape[0]):
-        pt = irx.ChebyshevPolytope(ys.ox[k], ys.H[k], ys.alpha[k], ys.lo[k], ys.hi[k])
+        pt = irx.ChebyshevPolytope(ys.ox[k], ys.H[k], ys.alpha[k], ys.y[k])
         worst = max(worst, float(jnp.max(jax.vmap(pt.g)(X))))
         X = jax.vmap(F)(X)
     return emb, pt, worst

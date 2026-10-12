@@ -51,9 +51,7 @@ ys = jax.block_until_ready(
     emb.compute_reachset(0.0, tf, pt0, dt=dt, solver="symplectic_heun").ys[0]
 )
 t_run = time.time() - t0
-pt_at = lambda k: irx.ChebyshevPolytope(
-    ys.ox[k], ys.H[k], ys.alpha[k], ys.lo[k], ys.hi[k]
-)
+pt_at = lambda k: irx.ChebyshevPolytope(ys.ox[k], ys.H[k], ys.alpha[k], ys.y[k])
 
 # certified max y_i: SOS support function over each set
 C = jnp.zeros((2, 4)).at[0, 1].set(1.0).at[1, 3].set(1.0)
@@ -76,13 +74,13 @@ y_true = MC[:, :, [1, 3]].max((0, 2))
 
 # certified set: samples of its chart box kept by the faces
 exps = cheb_indices(4, 2)
-W = jax.random.uniform(jax.random.PRNGKey(1), (4_000_000, 4), minval=-1, maxval=1)
+Z = jax.random.uniform(jax.random.PRNGKey(1), (4_000_000, 4), minval=-1, maxval=1)
 
 
 @jax.jit
 def set_samples(pt):
-    u = jax.vmap(lambda w: pt.alpha @ cheb_eval(w, exps))(W)
-    return pt.ox + W @ jnp.linalg.inv(pt.H).T, jnp.all((u >= pt.lo) & (u <= pt.hi), 1)
+    u = jax.vmap(lambda z: pt.alpha @ cheb_eval(z, exps))(Z)
+    return pt.ox + Z @ jnp.linalg.inv(pt.H).T, jnp.all((u >= pt.ly) & (u <= pt.uy), 1)
 
 
 def region(ax, P, color, edge, z):
@@ -147,9 +145,9 @@ axs[2].set_xlabel("$t$")
 axs[2].grid(alpha=0.3)
 axs[2].legend(fontsize=8, loc="lower left")
 ins = axs[2].inset_axes([0.55, 0.1, 0.42, 0.35])
-w = (tt > 6.0) & (tt < 7.0)
-ins.plot(tt[w], y_cert[w], color="tab:red")
-ins.plot(tt[w], y_true[w], color="k")
+peak = (tt > 6.0) & (tt < 7.0)
+ins.plot(tt[peak], y_cert[peak], color="tab:red")
+ins.plot(tt[peak], y_true[peak], color="k")
 ins.axhline(spec, color="tab:purple", ls="--")
 ins.grid(alpha=0.3)
 ins.set_title("near the peak", fontsize=8)
