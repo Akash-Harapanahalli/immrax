@@ -4,8 +4,8 @@ For each objective ``p`` and sign ``s`` this solves
 
 .. math::
     \min \gamma \ \text{s.t.}\ \gamma - s p = \sigma_0
-    + \sum_j \sigma_j^+ (u_j - \alpha_j b) + \sigma_j^- (\alpha_j b - \ell_j)
-    + \sum_k \tau_k (1 - w_k^2),
+    + \sum_j \sigma_j^+ (\overline{y}_j - \alpha_j b) + \sigma_j^- (\alpha_j b - \underline{y}_j)
+    + \sum_k \tau_k (1 - z_k^2),
 
 with SOS ``sigma``, ``tau`` written as Gram matrices in the Chebyshev basis and
 the identity matched coefficient-wise (exact Chebyshev product rules). The
@@ -61,19 +61,19 @@ def _unpack(v, L):
 
 
 @functools.lru_cache(maxsize=None)
-def solver(n: int, m: int) -> "_Solver":
-    return _Solver(n, m)
+def solver(n: int, m: int, rows: int) -> "_Solver":
+    return _Solver(n, m, rows)
 
 
 class _Solver:
     """One single-threaded MOSEK task per (objective, sign), solved in parallel."""
 
-    def __init__(self, n: int, m: int, workers: int = 12):
+    def __init__(self, n: int, m: int, rows: int, workers: int = 12):
         import mosek
 
         self.mosek, self.n, self.m, D = mosek, n, m, 2 * m
-        faces = cheb_indices(n, m)
-        self.P = len(faces)
+        basis = cheb_indices(n, m)
+        self.R = rows  # constraint rows: alpha is (rows, len(basis))
         ED = cheb_indices(n, D)
         idx = {tuple(e): i for i, e in enumerate(ED)}
         self.NC, self.z = len(ED), idx[(0,) * n]
@@ -83,10 +83,10 @@ class _Solver:
         box = lambda k: {
             z: 0.5,
             tuple(2 * (i == k) for i in range(n)): -0.5,
-        }  # 1 - w_k^2
+        }  # 1 - z_k^2
         self.Sb = onp.stack([_gram_map(e2, idx, box(k)) for k in range(n)])
-        self.Pi = onp.stack([_gram_map(e1, idx, {tuple(b): 1.0}) for b in faces])
-        self.sizes = [len(e0)] + [len(e1)] * (2 * self.P) + [len(e2)] * n
+        self.Ri = onp.stack([_gram_map(e1, idx, {tuple(b): 1.0}) for b in basis])
+        self.sizes = [len(e0)] + [len(e1)] * (2 * self.R) + [len(e2)] * n
 
         V0, k0, l0 = _lower(self.S0)
         Vb, kb, lb = _lower(self.Sb)
@@ -95,12 +95,12 @@ class _Solver:
         for k in range(n):
             c, t = onp.nonzero(Vb[k])
             stat.append(
-                (c, onp.full(len(c), 1 + 2 * self.P + k), kb[t], lb[t], -Vb[k][c, t])
+                (c, onp.full(len(c), 1 + 2 * self.R + k), kb[t], lb[t], -Vb[k][c, t])
             )
         self.static = [onp.concatenate(a) for a in zip(*stat)]
         # face blocks: always write every entry any face can touch (zeros included),
         # since reused tasks keep entries that are not overwritten
-        Vp = _lower(self.Pi)[0]
+        Vp = _lower(self.Ri)[0]
         self.face_ct = onp.nonzero(onp.any(Vp != 0, axis=0))
         self.env, self.tasks = mosek.Env(), []
         self.pool = ThreadPoolExecutor(workers)
@@ -118,29 +118,29 @@ class _Solver:
         t.putintparam(mk.iparam.num_threads, 1)
         return t
 
-    def solve(self, alpha, lo, hi, Pc) -> onp.ndarray:
+    def solve(self, alpha, ly, uy, Pc) -> onp.ndarray:
         """``Pc (NC, Q)`` objective coefficients -> validated ``[sup p, sup -p]`` ``(2, Q)``."""
-        mk, P, NC = self.mosek, self.P, self.NC
-        alpha, lo, hi, Pc = (onp.asarray(a, dtype=float) for a in (alpha, lo, hi, Pc))
+        mk, R, NC = self.mosek, self.R, self.NC
+        alpha, ly, uy, Pc = (onp.asarray(a, dtype=float) for a in (alpha, ly, uy, Pc))
         Q = Pc.shape[1]
         while len(self.tasks) < 2 * Q:
             self.tasks.append(self._task())
 
-        A = onp.einsum("jb,bcxy->jcxy", alpha, self.Pi)
-        one = self.Pi[0][None]  # the T_0 map
+        A = onp.einsum("jb,bcxy->jcxy", alpha, self.Ri)
+        one = self.Ri[0][None]  # the T_0 map
         Mf = onp.stack(
-            [hi[:, None, None, None] * one - A, A - lo[:, None, None, None] * one], 1
+            [uy[:, None, None, None] * one - A, A - ly[:, None, None, None] * one], 1
         )
-        Mf = Mf.reshape(2 * P, NC, *A.shape[2:])
+        Mf = Mf.reshape(2 * R, NC, *A.shape[2:])
         Vf, kf, lf = _lower(Mf)
-        c, t_ = (onp.tile(a, 2 * P) for a in self.face_ct)
-        q = onp.repeat(onp.arange(2 * P), len(self.face_ct[0]))
+        c, t_ = (onp.tile(a, 2 * R) for a in self.face_ct)
+        q = onp.repeat(onp.arange(2 * R), len(self.face_ct[0]))
         I, J, K, L, V = (
             onp.concatenate([s, x])
             for s, x in zip(self.static, (c, 1 + q, kf[t_], lf[t_], -Vf[q, c, t_]))
         )
         I, J, K, L = (a.astype(onp.int32) for a in (I, J, K, L))
-        width = onp.repeat(hi - lo, 2)
+        width = onp.repeat(uy - ly, 2)
         ntot = sum(s * (s + 1) // 2 for s in self.sizes)
         ev = lambda M: max(0.0, -onp.linalg.eigvalsh(M)[0])
 
@@ -160,13 +160,13 @@ class _Solver:
             E = (
                 -sign * p
                 - onp.einsum("cij,ij->c", self.S0, X[0])
-                - onp.einsum("qcij,qij->c", Mf, onp.stack(X[1 : 1 + 2 * P]))
-                - onp.einsum("kcij,kij->c", self.Sb, onp.stack(X[1 + 2 * P :]))
+                - onp.einsum("qcij,qij->c", Mf, onp.stack(X[1 : 1 + 2 * R]))
+                - onp.einsum("kcij,kij->c", self.Sb, onp.stack(X[1 + 2 * R :]))
             )
             E[self.z] += g
             pen = onp.abs(E).sum() + ev(X[0]) * self.sizes[0]
-            pen += sum(ev(X[1 + j]) * self.sizes[1] * width[j] for j in range(2 * P))
-            pen += sum(ev(X[1 + 2 * P + k]) * self.sizes[-1] for k in range(self.n))
+            pen += sum(ev(X[1 + j]) * self.sizes[1] * width[j] for j in range(2 * R))
+            pen += sum(ev(X[1 + 2 * R + k]) * self.sizes[-1] for k in range(self.n))
             return g + pen
 
         out = onp.array(list(self.pool.map(run, range(2 * Q))))

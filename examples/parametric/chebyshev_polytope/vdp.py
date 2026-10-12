@@ -48,9 +48,7 @@ t_first = time.time() - t0
 t0 = time.time()
 ys = jax.block_until_ready(reach(pt0))
 t_run = time.time() - t0
-pt_at = lambda k: irx.ChebyshevPolytope(
-    ys.ox[k], ys.H[k], ys.alpha[k], ys.lo[k], ys.hi[k]
-)
+pt_at = lambda k: irx.ChebyshevPolytope(ys.ox[k], ys.H[k], ys.alpha[k], ys.y[k])
 
 # true set: the flowed boundary of the box
 f = lambda x: sys.f(0.0, x)
@@ -146,9 +144,9 @@ ax2.set_ylabel("$y$")
 ax2.grid(alpha=0.3)
 ax2.legend(fontsize=9)
 ins = ax2.inset_axes([0.55, 0.12, 0.42, 0.35])
-w = (tt > 6.2) & (tt < 6.9)
-ins.plot(tt[w], y_cert[w], color="tab:red")
-ins.plot(tt[w], y_true[w], color="k")
+peak = (tt > 6.2) & (tt < 6.9)
+ins.plot(tt[peak], y_cert[peak], color="tab:red")
+ins.plot(tt[peak], y_true[peak], color="k")
 ins.axhline(spec, color="tab:purple", ls="--")
 ins.grid(alpha=0.3)
 ins.set_title("near the peak", fontsize=8)
