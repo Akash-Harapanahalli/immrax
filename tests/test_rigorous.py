@@ -93,6 +93,7 @@ FNS = [
     ("poly", lambda m, a: a**3 - 2 * a**2 + a),
     ("exp-composed", lambda m, a: m.exp(m.sin(a)) * a),
     ("matmul", lambda m, a: A @ a),
+    ("rmatmul", lambda m, a: a @ A.T),
     ("sum", lambda m, a: m.sum(a * a)),
 ]
 

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
 from jaxtyping import ArrayLike
 
-from ...embedding import embed
+from ...embedding import embed, embed_ldi
 from ...inclusion import (
     Interval,
     Permutation,
@@ -14,6 +14,7 @@ from ...inclusion import (
     kaucher_pro,
     mjacM,
     natif,
+    ut2i,
 )
 from ...neural import fastlin
 from ..parametope import Parametope
@@ -183,12 +184,16 @@ class AdjointEmbedding(ParametricEmbedding):
         dist = interval(jnp.zeros_like(ox))
         for M, arg, cent in zip(MM[2:], args, ctx["args_centers"]):
             dist = dist + interval(M) @ (arg - cent)
-        dist = interval(alpha_pair) @ dist
+        dist = alpha_pair @ dist
 
-        W = interval(alpha_pair) @ (MM[1] - A) + Ustar
+        W = alpha_pair @ (MM[1] - A) + Ustar
 
         K = len(y) // 2
         mul = jnp.concatenate((-jnp.ones(K), jnp.ones(K)))  # sign of lower offsets
+        from .polytope import Polytope  # imports this module
+
+        if isinstance(pt, Polytope) and len(N) == 0:  # h = id: the faces are an LDI
+            return embed_ldi(W, ut2i(y * mul), dist, Xi) * mul, MM[1]
         Jh = natif(jax.jacfwd(lambda z: jnp.asarray(pt.h(z))))
 
         def F(t, iy, *args):
