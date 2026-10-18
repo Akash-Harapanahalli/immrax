@@ -234,3 +234,23 @@ def test_lin_sys_natif(x_vec, u_vec, x_interval, u_interval):
     combined_interval = irx.interval(combined_lower, combined_upper)
 
     validate_overapproximation_nd(wrapped_lin_sys, combined_interval, result)
+
+
+@pytest.mark.parametrize("Xi_kind", ["none", "point", "interval"])
+def test_embed_ldi(Xi_kind):
+    """embed_ldi agrees with embed on the per-face evaluation of [M]([Xi] z) + c."""
+    k = jax.random.split(jax.random.PRNGKey(0), 4)
+    K, n = 6, 6 if Xi_kind == "none" else 4
+    iv = lambda key, s: irx.icentpert(
+        jax.random.normal(key, s),
+        jnp.abs(jax.random.normal(jax.random.fold_in(key, 1), s)),
+    )
+    M, c, iz = iv(k[0], (K, n)), iv(k[1], (K,)), iv(k[2], (K,))
+    Xi = {
+        "none": None,
+        "point": jax.random.normal(k[3], (n, K)),
+        "interval": iv(k[3], (n, K)),
+    }[Xi_kind]
+    F = lambda t, z: M @ (z if Xi is None else Xi @ z) + c
+    ref = irx.embed(F)(0.0, irx.i2ut(iz))
+    assert jnp.allclose(irx.embed_ldi(M, iz, c, Xi), ref, atol=1e-5)

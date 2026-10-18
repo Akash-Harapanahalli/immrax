@@ -9,6 +9,7 @@ from jaxtyping import Float, Integer, Bool, Array
 
 from .refinement import SampleRefinement, LinProgRefinement
 from .inclusion import Interval, i2ut, interval, jacif, mjacif, natif, ut2i
+from .inclusion.interval import _get_rigorous
 from .system import LiftedSystem, System
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "jacemb",
     "mjacemb",
     "embed",
+    "embed_ldi",
     "get_faces",
 ]
 
@@ -216,6 +218,43 @@ def embed(F: Callable[..., Interval]):
             return jnp.array([_E, E_])
 
     return E
+
+
+def embed_ldi(M, iz: Interval, c=None, Xi=None) -> jax.Array:
+    """:func:`embed` of the linear inclusion ``z -> [M] ([Xi] z) + [c]`` on the box
+    ``iz``, in the same layout (row ``i`` bounded on face ``i``).
+
+    Each face differs from ``iz`` in one coordinate, so ``[Xi] z`` on every face is
+    one sum plus a rank-one swap, and only the diagonal of ``[M] V`` is contracted:
+    ``O(K n)`` work and memory against ``embed``'s ``O(K^2 n)``. ``Xi = None`` is
+    the identity; ``M``, ``Xi`` may be point arrays.
+    """
+    iz = interval(iz)
+    l, u = iz.lower, iz.upper
+    eye = jnp.eye(l.shape[0], dtype=bool)
+    mul = natif(jnp.multiply)
+    if Xi is not None:
+        Pz = mul(Xi, interval(l[None], u[None]))  # [Xi_jk] [z_k]
+        Sl, Su = Pz.lower.sum(1, keepdims=True), Pz.upper.sum(1, keepdims=True)
+        if _get_rigorous():  # the swap below adds and cancels in floating point
+            tol = (l.shape[0] + 2) * jnp.finfo(l.dtype).eps
+            e = tol * (jnp.abs(Pz.lower) + jnp.abs(Pz.upper)).sum(1, keepdims=True)
+            Sl, Su = Sl - 2 * e, Su + 2 * e
+
+    def faces(p):  # V[:, i] = [Xi] z with z_i pinned to p_i
+        if Xi is None:
+            return interval(
+                jnp.where(eye, p, l[:, None]), jnp.where(eye, p, u[:, None])
+            )
+        Q = mul(Xi, interval(p[None]))
+        return interval(Sl - Pz.lower + Q.lower, Su - Pz.upper + Q.upper)
+
+    diag = natif(lambda M, V: jnp.einsum("ij,ji->i", M, V))
+    lo, up = diag(M, faces(l)).lower, diag(M, faces(u)).upper
+    if c is not None:
+        c = c if hasattr(c, "lower") else interval(c)
+        lo, up = lo + c.lower, up + c.upper
+    return jnp.concatenate((lo, up))
 
 
 def get_faces(ix: Interval) -> tuple[Interval, Interval]:

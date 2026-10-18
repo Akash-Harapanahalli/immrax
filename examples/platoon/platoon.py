@@ -42,8 +42,8 @@ args = (
     else _ap.parse_args(shlex.split(os.environ.get("PLATOON_ARGS", "")))
 )
 
-if args.platform != "auto":
-    os.environ["JAX_PLATFORMS"] = args.platform
+if args.platform != "auto":  # "gpu" means CUDA; jax would also probe ROCm
+    os.environ["JAX_PLATFORMS"] = {"gpu": "cuda"}.get(args.platform, args.platform)
 
 import equinox as eqx
 import jax

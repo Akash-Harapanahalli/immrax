@@ -1,4 +1,5 @@
 from functools import wraps
+import math
 from typing import Any, Callable, Optional
 
 import equinox as eqx
@@ -599,7 +600,34 @@ if hasattr(lax, "square_p"):
     inclusion_registry[lax.square_p] = _inclusion_square_p
 
 
+def _dot_general_midrad(A, B, **kwargs) -> Interval:
+    """One operand a point array: ``A m +- |A| r`` in two matmuls, exact up to
+    rounding. HIGHEST precision, so GPU fp32 never drops to TF32."""
+    hi = lax.Precision.HIGHEST
+    (lc, rc), _ = kwargs["dimension_numbers"]
+    point_left = not isinstance(A, Interval)
+    X, P, pc = (B, jnp.asarray(A), lc) if point_left else (A, jnp.asarray(B), rc)
+
+    def prod(x, p):
+        x, p = (p, x) if point_left else (x, p)
+        return lax.dot_general_p.bind(x, p, **{**kwargs, "precision": (hi, hi)})
+
+    m = (X.lower + X.upper) / 2
+    r = (X.upper - X.lower) / 2  # signed: an improper X stays improper
+    rigorous = _get_rigorous()
+    if rigorous:  # round r up so that [l, u] is inside [m -+ r]
+        r = jnp.nextafter(jnp.maximum(X.upper - m, m - X.lower), jnp.inf)
+    c, d = prod(m, P), prod(r, jnp.abs(P))
+    if rigorous:  # each matmul is within gamma_k |P| |x| of exact
+        k = math.prod(P.shape[i] for i in pc)
+        d = d + (k + 2) * jnp.finfo(c.dtype).eps * prod(jnp.abs(m) + r, jnp.abs(P))
+        return widen(Interval(c - d, c + d), 1)
+    return Interval(c - d, c + d)
+
+
 def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
+    if not (isinstance(A, Interval) and isinstance(B, Interval)):
+        return _dot_general_midrad(A, B, **kwargs)
     # All checks of batch/contracting dims are done in first pass on lower bounds
 
     A = interval(A)
