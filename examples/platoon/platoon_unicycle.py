@@ -114,7 +114,7 @@ obstacle_padding = 1.7  # modest extra berth for the followers' corner cut
 AGENTS = [(n, 1.0) for n in (args.agents or [3, 9, 15, 25, 50, 125, 250])]
 SHOW_AGENTS = 9 if 9 in [n for n, _ in AGENTS] else AGENTS[0][0]
 # Uniform initial box on every state of every vehicle.
-PERT_VEHICLE = 1e-2 * jnp.ones(4)
+PERT_VEHICLE = 2e-2 * jnp.ones(4)
 
 
 # ------------------------------------------------ leader nominal (a, omega)
