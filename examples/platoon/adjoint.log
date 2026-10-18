@@ -1,0 +1,38 @@
+backend: gpu (NVIDIA GeForce RTX 3070), x64=False
+  n=3: 0.053 s (JIT 7 s)  avg vol 2.013e-07  final vol 4.802e-07
+  n=9: 0.080 s (JIT 8 s)  avg vol 5.565e-06  final vol 1.673e-05
+  n=15: 0.082 s (JIT 8 s)  avg vol 1.629e-05  final vol 4.271e-05
+  n=25: 0.142 s (JIT 10 s)  avg vol 3.137e-05  final vol 5.852e-05
+  n=50: 0.284 s (JIT 12 s)  avg vol 4.549e-05  final vol 5.972e-05
+  n=125: 1.145 s (JIT 93 s)  avg vol 5.398e-05  final vol 5.968e-05
+  n=250: 14.505 s (JIT 39 s)  avg vol 5.683e-05  final vol 5.966e-05
+
+% unicycle platoon adjoint reachability (symplectic, dt=0.01, tf=3.0, pert 0.005, fp32 on gpu: NVIDIA GeForce RTX 3070)
+  N    # States  Runtime s (JIT s)      Average vol    Final vol
+---  ----------  -------------------  -------------  -----------
+  3          12  0.053 (7)                2.013e-07    4.802e-07
+  9          36  0.080 (8)                5.565e-06    1.673e-05
+ 15          60  0.082 (8)                1.629e-05    4.271e-05
+ 25         100  0.142 (10)               3.137e-05    5.852e-05
+ 50         200  0.284 (12)               4.549e-05    5.972e-05
+125         500  1.145 (93)               5.398e-05    5.968e-05
+250        1000  14.505 (39)              5.683e-05    5.966e-05
+
+\begin{tabular}{rrlrr}
+\hline
+   $N$ &   \# States & Runtime s (JIT s)   &   Average vol &   Final vol \\
+\hline
+     3 &          12 & 0.053 (7)           &     2.013e-07 &   4.802e-07 \\
+     9 &          36 & 0.080 (8)           &     5.565e-06 &   1.673e-05 \\
+    15 &          60 & 0.082 (8)           &     1.629e-05 &   4.271e-05 \\
+    25 &         100 & 0.142 (10)          &     3.137e-05 &   5.852e-05 \\
+    50 &         200 & 0.284 (12)          &     4.549e-05 &   5.972e-05 \\
+   125 &         500 & 1.145 (93)          &     5.398e-05 &   5.968e-05 \\
+   250 &        1000 & 14.505 (39)         &     5.683e-05 &   5.966e-05 \\
+\hline
+\end{tabular}
+
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_adjoint_grid.pdf
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_adjoint_grid.svg
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_adjoint_overview.pdf
+saved /home/akash/Research/immrax/examples/platoon/platoon_unicycle_adjoint_overview.svg
