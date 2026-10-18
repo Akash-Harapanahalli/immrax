@@ -1,34 +1,34 @@
 backend: gpu (NVIDIA GeForce RTX 3070), x64=False
-  n=3: 0.053 s (JIT 7 s)  avg vol 2.013e-07  final vol 4.802e-07
-  n=9: 0.080 s (JIT 8 s)  avg vol 5.565e-06  final vol 1.673e-05
-  n=15: 0.082 s (JIT 8 s)  avg vol 1.629e-05  final vol 4.271e-05
-  n=25: 0.142 s (JIT 10 s)  avg vol 3.137e-05  final vol 5.852e-05
-  n=50: 0.284 s (JIT 12 s)  avg vol 4.549e-05  final vol 5.972e-05
-  n=125: 1.145 s (JIT 93 s)  avg vol 5.398e-05  final vol 5.968e-05
-  n=250: 14.505 s (JIT 39 s)  avg vol 5.683e-05  final vol 5.966e-05
+  n=3: 0.053 s (JIT 7 s)  avg vol 5.168e-06  final vol 1.290e-05
+  n=9: 0.080 s (JIT 8 s)  avg vol 1.870e-03  final vol 1.055e-02
+  n=15: 0.082 s (JIT 8 s)  avg vol 1.824e+00  final vol 2.199e+01
+  n=25: 0.136 s (JIT 10 s)  avg vol nan  final vol nan
+  n=50: 0.283 s (JIT 12 s)  avg vol nan  final vol nan
+  n=125: 1.150 s (JIT 92 s)  avg vol nan  final vol nan
+  n=250: 14.534 s (JIT 39 s)  avg vol nan  final vol nan
 
-% unicycle platoon adjoint reachability (symplectic, dt=0.01, tf=3.0, pert 0.005, fp32 on gpu: NVIDIA GeForce RTX 3070)
+% unicycle platoon adjoint reachability (symplectic, dt=0.01, tf=3.0, pert 0.01, fp32 on gpu: NVIDIA GeForce RTX 3070)
   N    # States  Runtime s (JIT s)      Average vol    Final vol
 ---  ----------  -------------------  -------------  -----------
-  3          12  0.053 (7)                2.013e-07    4.802e-07
-  9          36  0.080 (8)                5.565e-06    1.673e-05
- 15          60  0.082 (8)                1.629e-05    4.271e-05
- 25         100  0.142 (10)               3.137e-05    5.852e-05
- 50         200  0.284 (12)               4.549e-05    5.972e-05
-125         500  1.145 (93)               5.398e-05    5.968e-05
-250        1000  14.505 (39)              5.683e-05    5.966e-05
+  3          12  0.053 (7)                5.168e-06    1.290e-05
+  9          36  0.080 (8)                1.870e-03    1.055e-02
+ 15          60  0.082 (8)                1.824e+00    2.199e+01
+ 25         100  0.136 (10)                     inf          inf
+ 50         200  0.283 (12)                     inf          inf
+125         500  1.150 (92)                     inf          inf
+250        1000  14.534 (39)                    inf          inf
 
 \begin{tabular}{rrlrr}
 \hline
    $N$ &   \# States & Runtime s (JIT s)   &   Average vol &   Final vol \\
 \hline
-     3 &          12 & 0.053 (7)           &     2.013e-07 &   4.802e-07 \\
-     9 &          36 & 0.080 (8)           &     5.565e-06 &   1.673e-05 \\
-    15 &          60 & 0.082 (8)           &     1.629e-05 &   4.271e-05 \\
-    25 &         100 & 0.142 (10)          &     3.137e-05 &   5.852e-05 \\
-    50 &         200 & 0.284 (12)          &     4.549e-05 &   5.972e-05 \\
-   125 &         500 & 1.145 (93)          &     5.398e-05 &   5.968e-05 \\
-   250 &        1000 & 14.505 (39)         &     5.683e-05 &   5.966e-05 \\
+     3 &          12 & 0.053 (7)           &     5.168e-06 &   1.290e-05 \\
+     9 &          36 & 0.080 (8)           &     1.870e-03 &   1.055e-02 \\
+    15 &          60 & 0.082 (8)           &     1.824e+00 &   2.199e+01 \\
+    25 &         100 & 0.136 (10)          &      $\infty$ &    $\infty$ \\
+    50 &         200 & 0.283 (12)          &      $\infty$ &    $\infty$ \\
+   125 &         500 & 1.150 (92)          &      $\infty$ &    $\infty$ \\
+   250 &        1000 & 14.534 (39)         &      $\infty$ &    $\infty$ \\
 \hline
 \end{tabular}
 
