@@ -107,8 +107,8 @@ theta0 = float(
 v_init = 2.0
 follow_dist = 0.4
 obstacle_center = (4, 4)
-obstacle_radius = 2.25
-obstacle_padding = 1.7  # modest extra berth for the followers' corner cut
+obstacle_radius = 1.5
+obstacle_padding = 2.0  # additive berth (m) for the followers' corner cut
 
 # (n, pert scale) pairs for the sweep.
 AGENTS = [(n, 1.0) for n in (args.agents or [3, 9, 15, 25, 50, 125, 250])]
@@ -155,7 +155,7 @@ def make_nominal():
         J += 1e5 * slack[0, n] ** 2
         opti.subject_to(
             (xx[0, n] - obstacle_center[0]) ** 2 + (xx[1, n] - obstacle_center[1]) ** 2
-            >= (obstacle_radius * obstacle_padding) ** 2 - slack[0, n]
+            >= (obstacle_radius + obstacle_padding) ** 2 - slack[0, n]
         )
     J += (
         100 * xx[0, n_horizon] ** 2
@@ -220,7 +220,7 @@ class UnicyclePlatoon(irx.System):
     d: ClassVar[float] = follow_dist
     ka: ClassVar[float] = 0.35  # thrust from predecessor speed error
     k1: ClassVar[float] = 0.15  # thrust from along-track gap error
-    k2: ClassVar[float] = 0.3  # omega from cross-track error
+    k2: ClassVar[float] = 0.2  # omega from cross-track error
     k3: ClassVar[float] = 0.7  # omega from heading alignment
 
     def __init__(self, n: int):
