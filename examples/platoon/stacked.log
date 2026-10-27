@@ -1,34 +1,16 @@
 backend: gpu (NVIDIA GeForce RTX 3070), x64=False
-  n=3: 0.051 s (JIT 7 s)  avg vol 1.920e-04  final vol 5.004e-04
-  n=9: 0.083 s (JIT 9 s)  avg vol 2.471e-02  final vol 7.431e-02
-  n=15: 0.090 s (JIT 9 s)  avg vol 4.946e-02  final vol 8.922e-02
-  n=25: 0.131 s (JIT 15 s)  avg vol 6.552e-02  final vol 8.964e-02
-  n=50: 0.246 s (JIT 15 s)  avg vol 7.758e-02  final vol 8.964e-02
-  n=125: 0.687 s (JIT 18 s)  avg vol 8.482e-02  final vol 8.964e-02
-  n=250: 2.133 s (JIT 46 s)  avg vol 8.723e-02  final vol 8.963e-02
+  n=251: 2.128 s (JIT 45 s)  avg vol 8.723e-02  final vol 8.963e-02
 
 % unicycle platoon stacked reachability (symplectic, dt=0.01, tf=3.0, pert 0.02, fp32 on gpu: NVIDIA GeForce RTX 3070)
   N    # States  Runtime s (JIT s)      Average vol    Final vol
 ---  ----------  -------------------  -------------  -----------
-  3          12  0.051 (7)                1.920e-04    5.004e-04
-  9          36  0.083 (9)                2.471e-02    7.431e-02
- 15          60  0.090 (9)                4.946e-02    8.922e-02
- 25         100  0.131 (15)               6.552e-02    8.964e-02
- 50         200  0.246 (15)               7.758e-02    8.964e-02
-125         500  0.687 (18)               8.482e-02    8.964e-02
-250        1000  2.133 (46)               8.723e-02    8.963e-02
+251        1004  2.128 (45)               8.723e-02    8.963e-02
 
 \begin{tabular}{rrlrr}
 \hline
    $N$ &   \# States & Runtime s (JIT s)   &   Average vol &   Final vol \\
 \hline
-     3 &          12 & 0.051 (7)           &     1.920e-04 &   5.004e-04 \\
-     9 &          36 & 0.083 (9)           &     2.471e-02 &   7.431e-02 \\
-    15 &          60 & 0.090 (9)           &     4.946e-02 &   8.922e-02 \\
-    25 &         100 & 0.131 (15)          &     6.552e-02 &   8.964e-02 \\
-    50 &         200 & 0.246 (15)          &     7.758e-02 &   8.964e-02 \\
-   125 &         500 & 0.687 (18)          &     8.482e-02 &   8.964e-02 \\
-   250 &        1000 & 2.133 (46)          &     8.723e-02 &   8.963e-02 \\
+   251 &        1004 & 2.128 (45)          &     8.723e-02 &   8.963e-02 \\
 \hline
 \end{tabular}
 
