@@ -1,0 +1,34 @@
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_heun.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_heun.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_heun.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_heun.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_rk4.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_rk4.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_rk4.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_rk4.svg
+
+% robot arm, box x0 +- 0.03 / its circumscribed ball (radius 0.06), dt=0.01, tf=10.0; area and bloat (symplectic Euler) vs own-initial-set MC truth at t=2
+Method                               Symplectic Euler s (JIT s)    Symplectic Heun s (JIT s)    Symplectic RK4 s (JIT s)      Area at t=2  Bloat
+-----------------------------------  ----------------------------  ---------------------------  --------------------------  -------------  --------
+Interval (natural embedding)         0.0001 (0.7)                  --                           --                               0.1027    +4047.4%
+Polytope + adjoint                   0.0062 (0.4)                  0.0158 (0.7)                 0.0238 (1.1)                     0.005481  +121.3%
+L2 normotope (log-norm, no adjoint)  0.0304 (0.4)                  0.0638 (0.6)                 0.1103 (1.3)                     0.01599   +272.1%
+L2 normotope (log-norm + adjoint)    0.0447 (0.4)                  0.0585 (0.6)                 0.1234 (1.0)                     0.008788  +104.5%
+L2 + adjoint + ReachiLQR (50 iters)  24.7073 (3.5)                 48.0168 (5.9)                154.5460 (13.0)                  0.006102  +42.0%
+
+\begin{tabular}{llllrl}
+\hline
+ Method                              & Symplectic Euler s (JIT s)   & Symplectic Heun s (JIT s)   & Symplectic RK4 s (JIT s)   &   Area at $t=2$ & Bloat     \\
+\hline
+ Interval (natural embedding)        & 0.0001 (0.7)                 & --                          & --                         &        0.1027   & +4047.4\% \\
+ Polytope + adjoint                  & 0.0062 (0.4)                 & 0.0158 (0.7)                & 0.0238 (1.1)               &        0.005481 & +121.3\%  \\
+ L2 normotope (log-norm, no adjoint) & 0.0304 (0.4)                 & 0.0638 (0.6)                & 0.1103 (1.3)               &        0.01599  & +272.1\%  \\
+ L2 normotope (log-norm + adjoint)   & 0.0447 (0.4)                 & 0.0585 (0.6)                & 0.1234 (1.0)               &        0.008788 & +104.5\%  \\
+ L2 + adjoint + ReachiLQR (50 iters) & 24.7073 (3.5)                & 48.0168 (5.9)               & 154.5460 (13.0)            &        0.006102 & +42.0\%   \\
+\hline
+\end{tabular}
+
