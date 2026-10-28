@@ -28,7 +28,7 @@ explicit tableau. Produces robot_arm_pert<pert>{,_heun,_rk4}.{pdf,svg}
 (snapshots on MC truth, full view + zoom at the setpoint),
 robot_arm_bloat_pert<pert>{,_heun,_rk4}.{pdf,svg} (percent bloat over time),
 and a LaTeX table (method, runtime per integrator,
-symplectic Euler reach set area) on stdout.
+symplectic Euler 4-D volume and bloat) on stdout.
 """
 
 import argparse
@@ -115,10 +115,12 @@ def timings(f, *args):
 
 
 # ---------------------------------------------------------------- MC truth
-# Two nested initial sets: the box, and its circumscribed ellipsoid (the common
-# initial set of the interval / polytope methods). Boundary points flow to
-# boundary points, so hulls of the projected samples give the true areas. Each
-# integrator's truth rolls them with its own explicit tableau (make_roll).
+# Two nested initial sets: the box (interval / polytope methods) and its
+# circumscribed ball (L2 methods). Boundary samples flow to the true set's
+# boundary (drawn in the figures). True 4-D volumes use interior samples:
+# vol phi(X0) = vol X0 * E_x |det D phi(x)|, with D phi accumulated as the
+# product of step Jacobians. Each integrator's truth uses its own explicit
+# tableau (make_step).
 key = jax.random.PRNGKey(0)
 M_MC = 8192
 u = jax.random.normal(key, (M_MC, 4))
@@ -132,31 +134,56 @@ w = jax.random.uniform(key, (M_MC, 4), minval=-1.0, maxval=1.0)
 w = w.at[jnp.arange(M_MC), face].set(sgn)
 box_bnd = x0 + pert * w
 
+ki_, kr_ = jax.random.split(ks_)
+box_int = x0 + pert * jax.random.uniform(ki_, (M_MC, 4), minval=-1.0, maxval=1.0)
+r = jax.random.uniform(kr_, (M_MC, 1)) ** 0.25  # uniform in the unit 4-ball
+ell_int = x0 + 2.0 * pert * r * u
+VOL0 = {
+    "box": float(onp.prod(2.0 * onp.asarray(pert))),
+    "ell": onp.pi**2 / 2 * float(2.0 * pert[0]) ** 4,
+}
+
+
+def make_step(system, tableau):
+    A, b, _ = get_tableau(tableau)
+
+    def step(c):
+        ks = []
+        for i in range(len(b)):
+            xi = c
+            for j in range(i):
+                if A[i, j] != 0.0:
+                    xi = xi + dt * A[i, j] * ks[j]
+            ks.append(system.f(0.0, xi))
+        return c + dt * sum(b[i] * ks[i] for i in range(len(b)))
+
+    return step
+
 
 def make_roll(system, tableau):
-    A, b, _ = get_tableau(tableau)
+    step = make_step(system, tableau)
 
     @jax.jit
     def roll(x):
-        def step(c, _):
-            ks = []
-            for i in range(len(b)):
-                xi = c
-                for j in range(i):
-                    if A[i, j] != 0.0:
-                        xi = xi + dt * A[i, j] * ks[j]
-                ks.append(system.f(0.0, xi))
-            nx = c + dt * sum(b[i] * ks[i] for i in range(len(b)))
-            return nx, nx
-
-        _, xs = jax.lax.scan(step, x, None, length=N)
+        _, xs = jax.lax.scan(lambda c, _: (step(c),) * 2, x, None, length=N)
         return jnp.vstack([x, xs])
 
     return roll
 
 
-def hull_area(pts2d):
-    return ConvexHull(onp.asarray(pts2d)).volume
+def true_vols(system, tableau, xs, vol0):
+    """True volume of the flowed set at every step, (N + 1,)."""
+    step = make_step(system, tableau)
+
+    def logdets(x):
+        def body(c, _):
+            return step(c), jnp.linalg.slogdet(jax.jacfwd(step)(c))[1]
+
+        _, ld = jax.lax.scan(body, x, None, length=N)
+        return jnp.concatenate([jnp.zeros(1), jnp.cumsum(ld)])
+
+    ld = jax.jit(jax.vmap(logdets))(xs)
+    return vol0 * onp.asarray(jnp.mean(jnp.exp(ld), axis=0))
 
 
 # Initial sets and embeddings, shared by all integrators.
@@ -178,7 +205,7 @@ kw_noadj = immutabledict({"adjoint": False, "perm": perm})
 kw_adj = immutabledict({"perm": perm})
 ILQR_ITERS = 50
 ILQR_W = 2.0  # running log-volume weight (per unit time)
-T_AREA = 2.0  # areas reported at this time (mid-transient)
+T_AREA = 2.0  # volumes reported at this time (mid-transient)
 kf = int(round(T_AREA / dt))
 
 
@@ -189,9 +216,13 @@ def logvol(pt):
 
 def run(solver, suffix):
     """All certified methods with one integrator: saves its figures and returns
-    the table rows (plain name, LaTeX name, runtime, area, bloat) for it."""
+    the table rows (plain name, LaTeX name, runtime, volume, bloat) for it."""
     mc_ell = onp.asarray(jax.vmap(make_roll(sys, SOLVERS[solver]))(ell_bnd))
     mc_box = onp.asarray(jax.vmap(make_roll(sys, SOLVERS[solver]))(box_bnd))
+    truth_t = {
+        "box": true_vols(sys, SOLVERS[solver], box_int, VOL0["box"]),
+        "ell": true_vols(sys, SOLVERS[solver], ell_int, VOL0["ell"]),
+    }
 
     # ------------------------------------------------------------ 1. interval
     t_box = timings(
@@ -272,8 +303,12 @@ def run(solver, suffix):
         Ez = float(nt.y) ** 2 * onp.linalg.inv(onp.asarray(nt.alpha.T @ nt.alpha))
         return onp.asarray(nt.ox[:2]), Ez[:2, :2]
 
-    def ellipse_area(E2):
-        return onp.pi * onp.sqrt(max(onp.linalg.det(E2), 0.0))
+    def poly_vol(p):  # parallelotope: widths in alpha coordinates / |det alpha|
+        y = onp.asarray(p.y)
+        return float(onp.prod(y[:4] + y[4:]) / abs(onp.linalg.det(p.alpha)))
+
+    def l2_vol(nt):  # unit 4-ball volume pi^2 / 2
+        return float(onp.pi**2 / 2 * nt.y**4 / abs(onp.linalg.det(nt.alpha)))
 
     def ellipse_boundary(c, E2, npts=200):
         th = onp.linspace(0, 2 * onp.pi, npts)
@@ -296,15 +331,14 @@ def run(solver, suffix):
     # --------------------------------------------------------------------- table
     # Each method's bloat is measured against the MC truth for ITS OWN initial
     # set: box flow for interval/polytope, ellipsoid flow for L2.
-    truth = {"box": hull_area(mc_box[:, kf, :2]), "ell": hull_area(mc_ell[:, kf, :2])}
-    # (plain name, LaTeX name, (runtime, jit), iover_at, area_at, truth key)
+    # (plain name, LaTeX name, (runtime, jit), iover_at, vol_at, truth key)
     methods = [
         (
             "Interval (adjoint off)",
             "Interval (adjoint off)",
             t_box,
             box_iover_at,
-            lambda k: float(onp.prod(box_ys[k, 4:6] - box_ys[k, :2])),
+            lambda k: float(onp.prod(box_ys[k, 4:] - box_ys[k, :4])),
             "box",
         ),
         (
@@ -312,7 +346,7 @@ def run(solver, suffix):
             "Polytope + adjoint",
             t_poly,
             poly_iover_at,
-            lambda k: hull_area(onp.asarray(poly_at(k).get_vertices())[:, :2]),
+            lambda k: poly_vol(poly_at(k)),
             "box",
         ),
         (
@@ -320,7 +354,7 @@ def run(solver, suffix):
             "L2 normotope (log-norm, no adjoint)",
             t_l2n,
             lambda k: l2_at(rs_l2n, k).iover(),
-            lambda k: ellipse_area(l2_proj(l2_at(rs_l2n, k))[1]),
+            lambda k: l2_vol(l2_at(rs_l2n, k)),
             "ell",
         ),
         (
@@ -328,7 +362,7 @@ def run(solver, suffix):
             "L2 normotope (log-norm + adjoint)",
             t_l2a,
             lambda k: l2_at(rs_l2a, k).iover(),
-            lambda k: ellipse_area(l2_proj(l2_at(rs_l2a, k))[1]),
+            lambda k: l2_vol(l2_at(rs_l2a, k)),
             "ell",
         ),
         (
@@ -336,20 +370,20 @@ def run(solver, suffix):
             f"L2 + adjoint + ReachiLQR ({ILQR_ITERS} iters)",
             t_ilqr,
             lambda k: ilqr_at(k).iover(),
-            lambda k: ellipse_area(l2_proj(ilqr_at(k))[1]),
+            lambda k: l2_vol(ilqr_at(k)),
             "ell",
         ),
     ]
 
     rows = []
-    for name, name_tex, rt, iover_at, area_at, ref in methods:
+    for name, name_tex, rt, iover_at, vol_at, ref in methods:
         td = death_time(iover_at)
         if td is not None and td <= T_AREA:
             a_s, b_s = f"inf (blows up t ~ {td:.2f})", "--"
             a_tex, b_tex = f"$\\infty$ (blows up $t \\approx {td:.2f}$)", "--"
         else:
-            a = area_at(kf)
-            bloat = 100.0 * (a / truth[ref] - 1.0)
+            a = vol_at(kf)
+            bloat = 100.0 * (a / truth_t[ref][kf] - 1.0)
             a_s = a_tex = f"{a:.3e}"
             b_s, b_tex = f"{bloat:+.1f}%", f"{bloat:+.1f}\\%"
         rows.append((name, name_tex, rt, (a_s, a_tex), (b_s, b_tex)))
@@ -481,7 +515,7 @@ def run(solver, suffix):
         print(f"saved {out}")
 
     # ------------------------------------------------------------ bloat over time
-    # Percent bloat = 100 (area / own-init MC truth area - 1), while alive.
+    # Percent bloat = 100 (volume / own-init true volume - 1), while alive.
     plot_ks = list(range(0, N + 1, 8))
     styles = {
         "Interval (adjoint off)": ("tab:purple", "interval"),
@@ -496,24 +530,20 @@ def run(solver, suffix):
             f"L2 + ReachiLQR ({ILQR_ITERS} iters)",
         ),
     }
-    truth_t = {
-        "box": onp.array([hull_area(mc_box[:, k, :2]) for k in plot_ks]),
-        "ell": onp.array([hull_area(mc_ell[:, k, :2]) for k in plot_ks]),
-    }
     fig2, axb = plt.subplots(figsize=(6, 4.5))
-    for name, name_tex, t, iover_at, area_at, ref in methods:
+    for name, name_tex, t, iover_at, vol_at, ref in methods:
         color, lab = styles[name]
         bl = []
-        for i, k in enumerate(plot_ks):
+        for k in plot_ks:
             if not alive(iover_at(k)):
                 break
-            bl.append(100.0 * (area_at(k) / truth_t[ref][i] - 1.0))
+            bl.append(100.0 * (vol_at(k) / truth_t[ref][k] - 1.0))
         tsb = onp.array(plot_ks[: len(bl)]) * dt
         axb.semilogy(
             tsb, onp.maximum(onp.array(bl), 1e-1), color=color, lw=1.2, label=lab
         )
     axb.set_xlabel("$t$")
-    axb.set_ylabel(r"bloat over own-init true area (\%)")
+    axb.set_ylabel(r"bloat over own-init true volume (\%)")
     axb.set_title(r"Certificate bloat over time (clipped below at 0.1\%)")
     axb.legend(fontsize=8)
     axb.grid(alpha=0.3, which="both")
@@ -534,8 +564,8 @@ def fmt_rt(rt):
     return f"{rt[0]:.4f} ({rt[1]:.1f})"
 
 
-# Runtimes for every integrator; area and bloat for symplectic Euler (the
-# per-integrator areas agree to ~1%; see each integrator's figures).
+# Runtimes for every integrator; volume and bloat for symplectic Euler (the
+# per-integrator volumes agree to ~1%; see each integrator's figures).
 base = results["symplectic"]
 rows, rows_tex = [], []
 for i, (name, name_tex, _, (a_s, a_tex), (b_s, b_tex)) in enumerate(base):
@@ -546,19 +576,19 @@ for i, (name, name_tex, _, (a_s, a_tex), (b_s, b_tex)) in enumerate(base):
 headers = [
     "Method",
     *(f"{lab} s (JIT s)" for _, lab, _ in INTEGRATORS),
-    f"Area at t={T_AREA:g}",
+    f"Vol at t={T_AREA:g}",
     "Bloat",
 ]
 headers_tex = [
     "Method",
     *(f"{lab} s (JIT s)" for _, lab, _ in INTEGRATORS),
-    f"Area at $t={T_AREA:g}$",
+    f"Vol at $t={T_AREA:g}$",
     "Bloat",
 ]
 print(
     f"\n% robot arm, box x0 +- {PERT:g} / its circumscribed ball "
     f"(radius {2 * PERT:g}), "
-    f"dt={dt}, tf={tf}; area and bloat (symplectic Euler) vs own-initial-set "
+    f"dt={dt}, tf={tf}; 4-D volume and bloat (symplectic Euler) vs own-initial-set "
     f"MC truth at t={T_AREA:g}"
 )
 try:
