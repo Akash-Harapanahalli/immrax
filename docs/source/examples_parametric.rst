@@ -53,7 +53,7 @@ Four certified methods from the same box, with the bloat over the true set.
 Robot arm
 ---------
 
-.. image:: examples/parametric/robot_arm/robot_arm.svg
+.. image:: examples/parametric/robot_arm/robot_arm_pert0.03.svg
 
 .. literalinclude:: examples/parametric/robot_arm/robot_arm.py
    :language: python

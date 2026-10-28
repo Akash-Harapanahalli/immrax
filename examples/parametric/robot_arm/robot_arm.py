@@ -1,9 +1,11 @@
-"""Robot arm reachability from the box x0 +- 0.03, four certified methods.
+"""Robot arm reachability from the box x0 +- pert, five certified methods.
 
 Benchmark: 2-link robot arm under PD control (parameters from
 https://bitbucket.org/hurricanesoff/emsoft-code/src), 4 states
-(q1, q2, q1dot, q2dot), initial box x0 +- 0.03 around
-x0 = (1.505, 1.505, 0.005, 0.005), dt = 0.01, tf = 10. The closed loop
+(q1, q2, q1dot, q2dot), initial box x0 +- pert around
+x0 = (1.505, 1.505, 0.005, 0.005), dt = 0.01, tf = 10; ``--pert`` sets the
+half-width (default 0.03; at 0.05 the plain L2 adjoint blows up and only
+ReachiLQR reaches tf). The closed loop
 contracts to the setpoint (2, 1, 0, 0), so a sound, tight method must track
 the transient and stabilize there.
 
@@ -13,21 +15,23 @@ gray), with the flow of the box inside it (darker gray) as the reference
 for the box-initialized methods (interval, polytope).
 
 Methods:
-  1. Interval           -- natural inclusion embedding (natemb)
+  1. Interval           -- Polytope + AdjointEmbedding, adjoint disabled
   2. Polytope adjoint   -- Polytope + AdjointEmbedding
   3. L2 log-norm        -- L2Normotope, mjacM log-norm, alpha frozen (no adjoint)
   4. L2 adjoint         -- L2Normotope, mjacM log-norm + adjoint
   5. L2 + ReachiLQR     -- method 4 plus ReachiLQR iterations on the
                            hypercontrol U (running + terminal log-volume cost)
 
-All adjoint methods are run with each symplectic integrator: Euler (the
+All methods are run with each symplectic integrator: Euler (the
 compute_reachset default), Heun and RK4. The MC truth for each uses the same
-explicit tableau. Produces robot_arm{,_heun,_rk4}.{pdf,svg} (snapshots on MC
-truth, full view + zoom at the setpoint), robot_arm_bloat{,_heun,_rk4}.{pdf,svg}
-(percent bloat over time), and a LaTeX table (method, runtime per integrator,
+explicit tableau. Produces robot_arm_pert<pert>{,_heun,_rk4}.{pdf,svg}
+(snapshots on MC truth, full view + zoom at the setpoint),
+robot_arm_bloat_pert<pert>{,_heun,_rk4}.{pdf,svg} (percent bloat over time),
+and a LaTeX table (method, runtime per integrator,
 symplectic Euler reach set area) on stdout.
 """
 
+import argparse
 import pathlib
 import shutil
 from time import perf_counter
@@ -70,12 +74,16 @@ class RobotArm(irx.System):
 
 
 sys = RobotArm()
-# Initial box x0 +- 0.03 (the EMSOFT level-0.04 ellipsoid has per-axis
-# extents ~0.028; rounded for clean reporting). Its minimal circumscribed
-# ellipsoid (semi-axes sqrt(n) pert, through the corners) is then simply the
-# ball ||x - x0|| <= 0.06 -- L2Normotope.from_interval.
+# Initial box x0 +- pert (EMSOFT uses ||P^1/2 (x - x0)|| <= 0.01, per-axis
+# extents ~0.007; the 0.03 box bounds its level-0.041 ellipsoid). Its minimal
+# circumscribed ellipsoid (semi-axes sqrt(n) pert, through the corners) is the
+# ball ||x - x0|| <= 2 pert -- L2Normotope.from_interval.
+_ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+_ap.add_argument("--pert", type=float, default=0.03, help="initial box half-width")
+PERT = _ap.parse_args().pert
+TAG = f"_pert{PERT:g}"  # figure name tag
 x0 = jnp.array([1.505, 1.505, 0.005, 0.005])
-pert = 0.03 * jnp.ones(4)
+pert = PERT * jnp.ones(4)
 ix0 = irx.icentpert(x0, pert)
 dt, tf = 0.01, 10.0
 N = int(round(tf / dt))
@@ -151,19 +159,17 @@ def hull_area(pts2d):
     return ConvexHull(onp.asarray(pts2d)).volume
 
 
-# ---------------------------------------------------------------- 1. interval
-natemb = irx.natemb(sys)
-z0 = jnp.concatenate([ix0.lower, ix0.upper])
-reach_box = jax.jit(
-    lambda z: natemb.compute_trajectory(0.0, tf, z, dt=dt, solver="euler").ys
-)
-t_box = timings(reach_box, z0)  # timings first: run 0 carries the compile
-box_ys = onp.asarray(reach_box(z0))
-
 # Initial sets and embeddings, shared by all integrators.
 pt0 = Polytope.from_interval(ix0)
 emb_poly = AdjointEmbedding(
     sys, jnp.linalg.pinv(pt0.alpha), jnp.zeros((0, 4)), permutation=perm
+)
+emb_box = AdjointEmbedding(  # alpha frozen at I: the interval embedding
+    sys,
+    jnp.linalg.pinv(pt0.alpha),
+    jnp.zeros((0, 4)),
+    permutation=perm,
+    disable_adjoint=True,
 )
 nt0 = irx.L2Normotope.from_interval(ix0)  # minimal circumscribed ellipsoid
 emb_l2 = irx.NormotopeEmbedding(sys)
@@ -186,6 +192,16 @@ def run(solver, suffix):
     the table rows (plain name, LaTeX name, runtime, area, bloat) for it."""
     mc_ell = onp.asarray(jax.vmap(make_roll(sys, SOLVERS[solver]))(ell_bnd))
     mc_box = onp.asarray(jax.vmap(make_roll(sys, SOLVERS[solver]))(box_bnd))
+
+    # ------------------------------------------------------------ 1. interval
+    t_box = timings(
+        lambda p: emb_box.compute_reachset(0.0, tf, p, dt=dt, solver=solver).ys[0].y,
+        pt0,
+    )
+    rs_box = emb_box.compute_reachset(0.0, tf, pt0, dt=dt, solver=solver)
+    # alpha = I, so the box is [ox - ly, ox + uy]; stored as (lower, upper).
+    oy, ox_ = onp.asarray(rs_box.ys[0].y), onp.asarray(rs_box.ys[0].ox)
+    box_ys = onp.concatenate([ox_ - oy[:, :4], ox_ + oy[:, 4:]], axis=1)
 
     # ---------------------------------------------------------------- 2. polytope
     t_poly = timings(
@@ -229,7 +245,8 @@ def run(solver, suffix):
     rr_ilqr = ilqr.run(R_schedule=20.0, iters=ILQR_ITERS)
     # One timed run of the full iLQR loop (not the repeated-run mean of timings()).
     t_ilqr = (perf_counter() - _t0, _tjit)
-    assert int(rr_ilqr.best.ifinal) == N, "ReachiLQR best iterate did not reach tf"
+    if int(rr_ilqr.best.ifinal) < N:  # the table reports its blow-up time
+        print(f"warning: {solver} ReachiLQR best iterate did not reach tf")
 
     # ------------------------------------------------------------- set accessors
     def poly_at(k):
@@ -283,8 +300,8 @@ def run(solver, suffix):
     # (plain name, LaTeX name, (runtime, jit), iover_at, area_at, truth key)
     methods = [
         (
-            "Interval (natural embedding)",
-            "Interval (natural embedding)",
+            "Interval (adjoint off)",
+            "Interval (adjoint off)",
             t_box,
             box_iover_at,
             lambda k: float(onp.prod(box_ys[k, 4:6] - box_ys[k, :2])),
@@ -446,6 +463,9 @@ def run(solver, suffix):
             if alive(io):
                 zlo.append(onp.asarray(io.lower)[:2])
                 zhi.append(onp.asarray(io.upper)[:2])
+    if not zlo:  # every certificate is dead by the zoom window: fit the truth
+        pts = mc_ell[:, zoom_ks, :2].reshape(-1, 2)
+        zlo, zhi = [pts.min(0)], [pts.max(0)]
     zlo, zhi = onp.min(zlo, axis=0), onp.max(zhi, axis=0)
     zpad = 0.08 * (zhi - zlo).max()
     axs[1].set_xlim(zlo[0] - zpad, zhi[0] + zpad)
@@ -456,7 +476,7 @@ def run(solver, suffix):
     axs[0].legend(loc="best", fontsize=9, framealpha=0.9)
     fig.tight_layout()
     for ext in ["pdf", "svg"]:
-        out = pathlib.Path(__file__).parent / f"robot_arm{suffix}.{ext}"
+        out = pathlib.Path(__file__).parent / f"robot_arm{TAG}{suffix}.{ext}"
         fig.savefig(out)
         print(f"saved {out}")
 
@@ -464,7 +484,7 @@ def run(solver, suffix):
     # Percent bloat = 100 (area / own-init MC truth area - 1), while alive.
     plot_ks = list(range(0, N + 1, 8))
     styles = {
-        "Interval (natural embedding)": ("tab:purple", "interval"),
+        "Interval (adjoint off)": ("tab:purple", "interval"),
         "Polytope + adjoint": ("tab:blue", "polytope + adjoint"),
         "L2 normotope (log-norm, no adjoint)": (
             "tab:olive",
@@ -499,7 +519,7 @@ def run(solver, suffix):
     axb.grid(alpha=0.3, which="both")
     fig2.tight_layout()
     for ext in ["pdf", "svg"]:
-        out = pathlib.Path(__file__).parent / f"robot_arm_bloat{suffix}.{ext}"
+        out = pathlib.Path(__file__).parent / f"robot_arm_bloat{TAG}{suffix}.{ext}"
         fig2.savefig(out)
         print(f"saved {out}")
 
@@ -519,12 +539,7 @@ def fmt_rt(rt):
 base = results["symplectic"]
 rows, rows_tex = [], []
 for i, (name, name_tex, _, (a_s, a_tex), (b_s, b_tex)) in enumerate(base):
-    # The interval method is the natural embedding (explicit Euler) under
-    # every integrator: one runtime, no symplectic variants.
-    rts = [
-        fmt_rt(results[s][i][2]) if (i > 0 or s == "symplectic") else "--"
-        for s, _, _ in INTEGRATORS
-    ]
+    rts = [fmt_rt(results[s][i][2]) for s, _, _ in INTEGRATORS]
     rows.append([name, *rts, a_s, b_s])
     rows_tex.append([name_tex, *rts, a_tex, b_tex])
 
@@ -541,7 +556,8 @@ headers_tex = [
     "Bloat",
 ]
 print(
-    f"\n% robot arm, box x0 +- 0.03 / its circumscribed ball (radius 0.06), "
+    f"\n% robot arm, box x0 +- {PERT:g} / its circumscribed ball "
+    f"(radius {2 * PERT:g}), "
     f"dt={dt}, tf={tf}; area and bloat (symplectic Euler) vs own-initial-set "
     f"MC truth at t={T_AREA:g}"
 )
