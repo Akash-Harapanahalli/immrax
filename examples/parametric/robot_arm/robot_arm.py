@@ -27,6 +27,8 @@ compute_reachset default), Heun and RK4. The MC truth for each uses the same
 explicit tableau. Produces robot_arm_pert<pert>{,_heun,_rk4}.{pdf,svg}
 (snapshots on MC truth, full view + zoom at the setpoint),
 robot_arm_bloat_pert<pert>{,_heun,_rk4}.{pdf,svg} (percent bloat over time),
+robot_arm_ilqr_pert<pert>{,_heun,_rk4}.{pdf,svg} (ReachiLQR volume ratio at the
+tube's last step and cumulative runtime per iteration),
 and a LaTeX table (method, runtime per integrator,
 symplectic Euler 4-D volume and bloat) on stdout.
 """
@@ -272,10 +274,23 @@ def run(solver, suffix):
     _t0 = perf_counter()
     ilqr.setup()
     _tjit = perf_counter() - _t0
+    # Per iterate: whether its tube reaches tf, its volume over the true volume
+    # at its last valid step, and the cumulative solver time with this
+    # host-side bookkeeping excluded.
+    it_log, skip = [], [0.0]
+
+    def record(i, R, res):
+        t_cb = perf_counter()
+        k = int(res.ifinal)
+        nt = ilqr._unflatten(res.pert_traj[k])[0]
+        v = onp.pi**2 / 2 * float(nt.y) ** 4 / abs(float(jnp.linalg.det(nt.alpha)))
+        it_log.append((k == N, v / truth_t["ell"][k], t_cb - _t0 - skip[0]))
+        skip[0] += perf_counter() - t_cb
+
     _t0 = perf_counter()
-    rr_ilqr = ilqr.run(R_schedule=20.0, iters=ILQR_ITERS)
+    rr_ilqr = ilqr.run(R_schedule=20.0, iters=ILQR_ITERS, on_iterate=record)
     # One timed run of the full iLQR loop (not the repeated-run mean of timings()).
-    t_ilqr = (perf_counter() - _t0, _tjit)
+    t_ilqr = (perf_counter() - _t0 - skip[0], _tjit)
     if int(rr_ilqr.best.ifinal) < N:  # the table reports its blow-up time
         print(f"warning: {solver} ReachiLQR best iterate did not reach tf")
 
@@ -551,6 +566,47 @@ def run(solver, suffix):
     for ext in ["pdf", "svg"]:
         out = pathlib.Path(__file__).parent / f"robot_arm_bloat{TAG}{suffix}.{ext}"
         fig2.savefig(out)
+        print(f"saved {out}")
+
+    # ------------------------------------------------ ReachiLQR per iteration
+    done = onp.array([d for d, _, _ in it_log])
+    ratio = onp.array([r for _, r, _ in it_log])
+    cum = onp.array([c for _, _, c in it_log])
+    its = onp.arange(1, len(it_log) + 1)
+    fig3, axv = plt.subplots(figsize=(6.5, 3))
+    axv.semilogy(its, ratio, color="tab:blue", lw=1.2)
+    axv.scatter(
+        its[done],
+        ratio[done],
+        marker="o",
+        s=18,
+        facecolors="none",
+        edgecolors="tab:blue",
+        label="reached $t_f$",
+    )
+    if (~done).any():
+        axv.scatter(
+            its[~done],
+            ratio[~done],
+            marker="x",
+            s=24,
+            color="tab:blue",
+            label="did not reach $t_f$",
+        )
+    axv.set_ylim(bottom=1.0)  # certified volume >= true volume
+    axv.set_xlabel("ReachiLQR iteration $i$")
+    axv.set_ylabel("certified / true volume", color="tab:blue")
+    axv.tick_params(axis="y", colors="tab:blue")
+    axr = axv.twinx()
+    axr.plot(its, cum, color="tab:red", marker=".", lw=1.2)
+    axr.set_ylim(bottom=0.0)
+    axr.set_ylabel("cumulative runtime (s)", color="tab:red")
+    axr.tick_params(axis="y", colors="tab:red")
+    axv.legend(loc="upper center", fontsize=9)
+    fig3.tight_layout()
+    for ext in ["pdf", "svg"]:
+        out = pathlib.Path(__file__).parent / f"robot_arm_ilqr{TAG}{suffix}.{ext}"
+        fig3.savefig(out)
         print(f"saved {out}")
 
     return rows
