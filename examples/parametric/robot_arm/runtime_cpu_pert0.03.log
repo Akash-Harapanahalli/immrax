@@ -1,0 +1,40 @@
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03_heun.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03_heun.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03_heun.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03_heun.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03_heun.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03_heun.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03_rk4.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_pert0.03_rk4.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03_rk4.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_bloat_pert0.03_rk4.svg
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03_rk4.pdf
+saved /home/akash/Research/immrax/examples/parametric/robot_arm/robot_arm_ilqr_pert0.03_rk4.svg
+
+% robot arm, box x0 +- 0.03 / its circumscribed ball (radius 0.06), dt=0.01, tf=10.0; 4-D volume and bloat (symplectic Euler) vs own-initial-set MC truth at t=2
+Method                               Symplectic Euler s (JIT s)    Symplectic Heun s (JIT s)    Symplectic RK4 s (JIT s)      Vol at t=2  Bloat
+-----------------------------------  ----------------------------  ---------------------------  --------------------------  ------------  -----------
+Interval (adjoint off)               0.0074 (0.4)                  0.0087 (0.6)                 0.0194 (1.4)                   0.01582    +2599175.2%
+Polytope + adjoint                   0.0084 (0.4)                  0.0105 (0.6)                 0.0235 (1.1)                   2.986e-06  +390.7%
+L2 normotope (log-norm, no adjoint)  0.0257 (0.4)                  0.0629 (0.5)                 0.1168 (1.0)                   0.0001279  +4153.1%
+L2 normotope (log-norm + adjoint)    0.0387 (0.4)                  0.0592 (0.6)                 0.1203 (1.2)                   1.237e-05  +311.5%
+L2 + adjoint + ReachiLQR (50 iters)  24.8120 (3.4)                 47.4229 (5.8)                156.0725 (12.8)                7.019e-06  +133.5%
+
+\begin{tabular}{llllrl}
+\hline
+ Method                              & Symplectic Euler s (JIT s)   & Symplectic Heun s (JIT s)   & Symplectic RK4 s (JIT s)   &   Vol at $t=2$ & Bloat        \\
+\hline
+ Interval (adjoint off)              & 0.0074 (0.4)                 & 0.0087 (0.6)                & 0.0194 (1.4)               &      0.01582   & +2599175.2\% \\
+ Polytope + adjoint                  & 0.0084 (0.4)                 & 0.0105 (0.6)                & 0.0235 (1.1)               &      2.986e-06 & +390.7\%     \\
+ L2 normotope (log-norm, no adjoint) & 0.0257 (0.4)                 & 0.0629 (0.5)                & 0.1168 (1.0)               &      0.0001279 & +4153.1\%    \\
+ L2 normotope (log-norm + adjoint)   & 0.0387 (0.4)                 & 0.0592 (0.6)                & 0.1203 (1.2)               &      1.237e-05 & +311.5\%     \\
+ L2 + adjoint + ReachiLQR (50 iters) & 24.8120 (3.4)                & 47.4229 (5.8)               & 156.0725 (12.8)            &      7.019e-06 & +133.5\%     \\
+\hline
+\end{tabular}
+
