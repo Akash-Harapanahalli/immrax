@@ -207,8 +207,8 @@ kw_noadj = immutabledict({"adjoint": False, "perm": perm})
 kw_adj = immutabledict({"perm": perm})
 ILQR_ITERS = 50
 ILQR_W = 2.0  # running log-volume weight (per unit time)
-T_AREA = 2.0  # volumes reported at this time (mid-transient)
-kf = int(round(T_AREA / dt))
+T_VOL = tf  # volumes reported at this time
+kf = int(round(T_VOL / dt))
 
 
 def logvol(pt):
@@ -393,7 +393,7 @@ def run(solver, suffix):
     rows = []
     for name, name_tex, rt, iover_at, vol_at, ref in methods:
         td = death_time(iover_at)
-        if td is not None and td <= T_AREA:
+        if td is not None and td <= T_VOL:
             a_s, b_s = f"inf (blows up t ~ {td:.2f})", "--"
             a_tex, b_tex = f"$\\infty$ (blows up $t \\approx {td:.2f}$)", "--"
         else:
@@ -632,20 +632,20 @@ for i, (name, name_tex, _, (a_s, a_tex), (b_s, b_tex)) in enumerate(base):
 headers = [
     "Method",
     *(f"{lab} s (JIT s)" for _, lab, _ in INTEGRATORS),
-    f"Vol at t={T_AREA:g}",
+    "Vol at tf",
     "Bloat",
 ]
 headers_tex = [
     "Method",
     *(f"{lab} s (JIT s)" for _, lab, _ in INTEGRATORS),
-    f"Vol at $t={T_AREA:g}$",
+    "Vol at $t_f$",
     "Bloat",
 ]
 print(
     f"\n% robot arm, box x0 +- {PERT:g} / its circumscribed ball "
     f"(radius {2 * PERT:g}), "
     f"dt={dt}, tf={tf}; 4-D volume and bloat (symplectic Euler) vs own-initial-set "
-    f"MC truth at t={T_AREA:g}"
+    f"MC truth at t={T_VOL:g}"
 )
 try:
     from tabulate import tabulate
